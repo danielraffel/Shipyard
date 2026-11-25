@@ -32,7 +32,7 @@ const CONFIG: &str = r#"printf '%s\n' '[auto_merge]' 'arm_requires_head_approval
 
 fn verdict_comment(id: u64, at: &str, verdict: &str, head: &str) -> String {
     format!(
-        r#"{{"id":{id},"login":"shipyard-review[bot]","type":"Bot","at":"{at}","body":"verdict: {verdict} head:{head}","performed_via_github_app_id":99}}"#
+        r#"{{"id":{id},"login":"shipyard-review[bot]","type":"Bot","at":"{at}","updated_at":"{at}","node_id":"IC_{id}","body":"verdict: {verdict} head:{head}","performed_via_github_app_id":99}}"#
     )
 }
 
@@ -128,6 +128,7 @@ case "$*" in
   "pr view "*) printf '%s' '__PR_VIEW__' ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '__COMMENTS__' ;;
+  *"lastEditedAt"*) printf '%s' '{"data":{"node":{"lastEditedAt":null}}}' ;;
   *"commits/__HEAD__"*) printf '%s' '2026-10-31T00:00:00Z' ;;
   *"repos/owner/repo/pulls/42") printf '%s' '{"base":{"ref":"main"}}' ;;
   *"rules/branches/main"*) printf '%s' '[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"macos"}]}}]' ;;

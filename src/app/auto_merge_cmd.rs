@@ -4258,16 +4258,17 @@ else:
             "timelineItems": {"pageInfo": {"hasPreviousPage": false}, "nodes": []},
         });
         let answers = serde_json::json!([
-            ["contents/.shipyard/config.toml",
-             {"text": "[auto_merge]\nreviewer_signers = [\"pulp-review\", \"infra-review2\"]\n"}],
-            ["/reviews", {"pages": [[]]}],
-            ["/comments", {"pages": [comments]}],
-            ["mergeQueue(branch", {"json": {"data": {"repository": {"mergeQueue": {"id": "MQ_1"}}}}}],
-            ["node(id:", {"json": {"data": {"node": node}}}],
-            ["pullRequest(number", {"json": {"data": {"repository": {"pullRequest": node}}}}],
-            ["/pulls/42", {"json": {"number": 42, "base": {"ref": "main"},
-                "head": {"sha": GATE_HEAD}, "user": {"login": "shipyard-local[bot]", "type": "Bot"}}}],
-        ]);
+                    ["contents/.shipyard/config.toml",
+                     {"text": "[auto_merge]\nreviewer_signers = [\"pulp-review\", \"infra-review2\"]\n"}],
+                    ["/reviews", {"pages": [[]]}],
+                    ["/comments", {"pages": [comments]}],
+                    ["mergeQueue(branch", {"json": {"data": {"repository": {"mergeQueue": {"id": "MQ_1"}}}}}],
+        ["lastEditedAt", {"json": {"data": {"node": {"lastEditedAt": null}}}}],
+                                ["node(id:", {"json": {"data": {"node": node}}}],
+                    ["pullRequest(number", {"json": {"data": {"repository": {"pullRequest": node}}}}],
+                    ["/pulls/42", {"json": {"number": 42, "base": {"ref": "main", "repo": {"default_branch": "main"}},
+                        "head": {"sha": GATE_HEAD}, "user": {"login": "shipyard-local[bot]", "type": "Bot"}}}],
+                ]);
         let table = dir.join("answers.json");
         std::fs::write(&table, answers.to_string()).expect("answers");
         let gh = dir.join("gh");
@@ -4370,6 +4371,7 @@ sys.exit(3)
         let approved = serde_json::json!([{
             "id": 7, "user": {"login": "shipyard-local[bot]", "type": "Bot"},
             "author_association": "CONTRIBUTOR", "created_at": "2026-10-24T22:53:36Z",
+            "updated_at": "2026-10-24T22:53:36Z", "node_id": "IC_7",
             "body": format!(
                 "Reviewed.\nreviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/08fb81d8 -->\nverdict: APPROVE head:{GATE_HEAD}"
             ),

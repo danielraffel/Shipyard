@@ -20,7 +20,7 @@ fn guard_script() -> PathBuf {
 
 fn approval_for(head: &str) -> String {
     format!(
-        r#"{{"id":12345,"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-30T12:00:00Z","body":"LGTM\nreviewed: {head}","performed_via_github_app_id":99}}"#
+        r#"{{"id":12345,"login":"shipyard-review[bot]","type":"Bot","at":"2026-10-30T12:00:00Z","updated_at":"2026-10-30T12:00:00Z","node_id":"IC_12345","body":"LGTM\nreviewed: {head}","performed_via_github_app_id":99}}"#
     )
 }
 
@@ -229,6 +229,7 @@ case "$*" in
   *"/pulls/4"[0-9]" "*) printf 'feature\nmain\n' ;;
   *"query=query("*"mergeQueue(branch"*) printf '%s' '{merge_queue}' ;;
   *"/comments"*) {comments} ;;
+  *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"/commits/"*) printf '%s' '2026-10-30T00:00:00Z' ;;
   *"/branches/main"*) printf 'main\n' ;;
   *"contents/.shipyard?ref="*) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;

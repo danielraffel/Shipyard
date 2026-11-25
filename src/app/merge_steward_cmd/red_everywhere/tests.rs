@@ -104,6 +104,7 @@ fn report(number: u64) -> PrReport {
             }),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     }
 }
 

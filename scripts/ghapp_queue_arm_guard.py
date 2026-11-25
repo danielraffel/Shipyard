@@ -307,6 +307,43 @@ TOKEN_PERMISSIONS_HEADER = "GITHUB_TOKEN Permissions"
 # (refs/pull/<n>/merge) the full lane checks out.
 FULL_LANE_PR_INPUT = "pr_number"
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+# Every ``author_association`` GitHub documents. Any other value is
+# unreadable: read as untrusted, a HOLD from a trusted account would be dropped.
+AUTHOR_ASSOCIATIONS = frozenset({
+    "COLLABORATOR", "CONTRIBUTOR", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN",
+    "MEMBER", "NONE", "OWNER"})
+# Every ``user.type`` GitHub documents. A missing type would read the fleet
+# App as a user account and drop its HOLD.
+USER_TYPES = frozenset({"Bot", "Organization", "User"})
+# Every pull request review state the REST API documents, exactly as it
+# spells them.
+REVIEW_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"})
+# A GitHub login: alphanumerics and hyphens, at most 39 characters, starting
+# with an alphanumeric; an App's bot user adds ``[bot]``, and GraphQL names
+# an App ``app/<slug>``. Same as
+# scripts/review_verdict_status.py LOGIN.
+LOGIN = re.compile(r"(?:app/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?")
+# A commit sha as GitHub's REST API answers it: 40 lowercase hex.
+API_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def is_login(value: Any) -> bool:
+    """A canonical GitHub login: a string matching ``LOGIN`` exactly (never
+    empty, padded, or carrying any other character)."""
+    return isinstance(value, str) and LOGIN.fullmatch(value) is not None
+
+
+def in_enum(value: Any, allowed: frozenset[str]) -> bool:
+    """One of ``allowed`` exactly: a string, so an unhashable value refuses
+    rather than raising ``TypeError``."""
+    return isinstance(value, str) and value in allowed
+
+
+def is_api_sha(value: Any) -> bool:
+    """A commit sha as the REST API answers it: 40 lowercase hex characters."""
+    return isinstance(value, str) and API_SHA.fullmatch(value) is not None
+
+
 MERGE_MUTATIONS = ("mergepullrequest",)
 # Same pattern as src/head_approval.rs marker_verdict.
 _MARKER = re.compile(
@@ -1779,6 +1816,29 @@ def _reviewer_counts(
     )
 
 
+EDITED_REFUSAL = "it was edited after it was posted"
+
+
+def comment_edited(comment: dict[str, Any]) -> bool:
+    """Whether a comment's text changed after it was posted.
+
+    Any token with ``pull-requests: write`` (a pull request's own workflow
+    included) can edit any comment in the repository, and the author stays
+    who posted it (merge-queue-rehearsal#47 proved it on an App comment). So
+    an edited body says nothing about what its author wrote. GitHub moves
+    ``updated_at`` on an edit and not on a reaction. Anything but two valid,
+    comparable, equal times (a missing, null or malformed one) counts as
+    edited."""
+    created = _timestamp(comment.get("created_at"))
+    updated = _timestamp(comment.get("updated_at"))
+    # Only two valid, comparable RFC 3339 times that are equal read as never
+    # edited; a missing, null or malformed one counts as edited.
+    if (created is None or updated is None
+            or created.tzinfo is None or updated.tzinfo is None):
+        return True
+    return updated != created
+
+
 def counting_verdicts(
     author: str | None,
     comments: list[dict[str, Any]],
@@ -1809,6 +1869,11 @@ def counting_verdicts(
         found = marker_verdict(body) if isinstance(body, str) else None
         if not isinstance(login, str) or found is None:
             continue
+        if found[0] == "APPROVE" and comment_edited(comment):
+            # An edited APPROVE never counts. An edited HOLD still holds: it
+            # can only refuse more.
+            EXCLUDED_APPROVALS.append(f"{login} ({EDITED_REFUSAL})")
+            continue
         if _reviewer_counts(login, comment.get("author_association"), policy, author, found[0],
                             (comment.get("user") or {}).get("type") == "Bot", body):
             verdict, named = found
@@ -1824,6 +1889,58 @@ def _held_by(login: str, body: Any, kind: str, record_id: Any) -> str:
     signed = _SIGNER_LINE.findall(body) if isinstance(body, str) else []
     signer = signed[-1].lower() if signed else login
     return f"held by {signer} at {kind} {record_id if record_id is not None else '(no id)'}"
+
+
+# The verdict hold hook's own record of every HOLD this host posted
+# (scripts/ghapp_verdict_hold_hook.py), in the guards directory.
+HOLDS_LOG = "holds.jsonl"
+
+
+def recorded_hold(repo: str, number: int, head: str) -> str | None:
+    """When this host's hold hook recorded a HOLD of ``head`` on ``repo#number``.
+
+    A pull request's own workflow can delete or edit the HOLD comment
+    (merge-queue-rehearsal#47); this record lives on the host, where no pull
+    request's code reaches. It knows only HOLDs posted through ``ghapp`` on
+    this host. No file is no record; a file that exists but cannot be read
+    raises, so the landing is refused rather than judged without it."""
+    path = _guards_dir() / HOLDS_LOG
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise GuardError(f"the hold record {path} is unreadable: {error}") from error
+    for number_line, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as error:
+            raise GuardError(f"the hold record {path} line {number_line} is malformed: "
+                             f"{error}") from error
+        if not isinstance(row, dict):
+            raise GuardError(f"the hold record {path} line {number_line} is not an object")
+        # Every row the hold hook writes carries all four; a row missing one
+        # could be the HOLD of this head, so it refuses rather than being
+        # skipped as "no record".
+        # The hold hook writes hold_head from the verdict marker (40
+        # lowercase hex): a padded, short or upper-case one matches no head,
+        # so it refuses rather than being skipped.
+        if (not isinstance(row.get("repo"), str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", row["repo"]) is None
+                or not isinstance(row.get("pr"), int) or isinstance(row.get("pr"), bool)
+                or not 0 < row["pr"] < 2 ** 63
+                or not is_api_sha(row.get("hold_head"))
+                or _timestamp(row.get("at")) is None):
+            raise GuardError(f"the hold record {path} line {number_line} is malformed: it "
+                             "needs an owner/name repo, a 40-hex hold_head, an ISO 8601 at and "
+                             "a positive integer pr")
+        if (row["repo"].lower() == repo.lower()
+                and row["pr"] == number
+                and row["hold_head"].lower() == head.lower()):
+            return row["at"]
+    return None
 
 
 def _latest_on(
@@ -1914,6 +2031,7 @@ def _deciding_approval_comment(
         body = comment.get("body")
         if (isinstance(login, str) and isinstance(body, str)
                 and marker_verdict(body) == ("APPROVE", head)
+                and not comment_edited(comment)
                 and _timestamp(comment.get("created_at")) == latest[0]
                 and _reviewer_counts(login, comment.get("author_association"), policy, author,
                                      "APPROVE", (comment.get("user") or {}).get("type") == "Bot",
@@ -1966,6 +2084,10 @@ def deciding_approval(
     if comment is not None:
         signed = _SIGNER_LINE.findall(comment.get("body") or "")
         return {"verdict_comment_id": comment.get("id"),
+                "verdict_node_id": comment.get("node_id"),
+                # Only a comment read from the API carries updated_at (as
+                # src/head_approval.rs `edit_checked`); only that is checked.
+                "verdict_from_api": "updated_at" in comment,
                 "signer": signed[-1].lower() if signed else None, "approved_head": head,
                 "approved_at": _comment_effective_time(comment)}
     for review in reviews:
@@ -2411,9 +2533,10 @@ def member_review(repo: str, number: int, head: str, policy: dict[str, Any],
     if not isinstance(pull, dict):
         raise GuardError(f"member #{number} is unreadable")
     author = (pull.get("user") or {}).get("login")
-    author = author if isinstance(author, str) else None
-    comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
-    reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    # No author is never "nobody to exclude": the self-approval rule needs it.
+    if not is_login(author):
+        raise GuardError(f"member #{number} names no canonical author login")
+    comments, reviews = verdict_listing(repo, number)
     allowed, why = review_verdict(head, author, comments, reviews, policy)
     approved = head
     if not allowed:
@@ -2430,6 +2553,16 @@ def member_review(repo: str, number: int, head: str, policy: dict[str, Any],
     own = self_approval(approved, author, comments, reviews, policy)
     if own is not None:
         return f"member #{number}: {own}"
+    # The same GraphQL edit rule as any landing (`_edit_checked`).
+    deciding = deciding_approval(approved, author, comments, reviews, policy)
+    if deciding.get("verdict_comment_id") is not None and deciding.get("verdict_from_api"):
+        node_id = deciding.get("verdict_node_id")
+        if not isinstance(node_id, str) or not node_id:
+            raise GuardError(f"member #{number}'s approval comment carries no node id")
+        edited = comment_last_edited(node_id)
+        if edited is not None:
+            return (f"member #{number}: its approval comment {deciding['verdict_comment_id']} "
+                    f"was edited at {edited}, so it does not count")
     return None
 
 
@@ -3411,8 +3544,79 @@ def _rest_pages(path: str) -> list[dict[str, Any]]:
     for page in pages:
         if not isinstance(page, list):
             raise GuardError(f"{path} did not answer a list")
-        records.extend(item for item in page if isinstance(item, dict))
+        # A row that is not an object could be the verdict that decides, so
+        # it refuses the listing rather than being dropped from it.
+        if not all(isinstance(item, dict) for item in page):
+            raise GuardError(f"{path} answered a row that is not an object")
+        records.extend(page)
     return records
+
+
+def verdict_records_refusal(comments: list[dict[str, Any]],
+                            reviews: list[dict[str, Any]]) -> str | None:
+    """Why a comment or review that carries a verdict cannot be read, or None.
+
+    ``counting_verdicts`` judges a verdict by who posted it, so every field
+    that judgment reads must be canonical on any record that carries one:
+    a login that is empty or malformed, an association or user type outside
+    GitHub's enums, an unknown review state, or a review sha that is not 40
+    lowercase hex would otherwise drop a HOLD as untrusted or naming nothing.
+    A record with no verdict is never judged, so it is not checked."""
+    def identity(record: dict[str, Any], what: str) -> str | None:
+        user = record.get("user")
+        if not isinstance(user, dict) or not is_login(user.get("login")):
+            return f"{what} carries no canonical author login"
+        if not in_enum(user.get("type"), USER_TYPES):
+            return f"{what} carries an unknown user type {user.get('type')!r}"
+        if not in_enum(record.get("author_association"), AUTHOR_ASSOCIATIONS):
+            return (f"{what} carries an unknown author association "
+                    f"{record.get('author_association')!r}")
+        return None
+
+    for comment in comments:
+        body = comment.get("body")
+        what = f"comment {comment.get('id')}"
+        if not isinstance(body, str):
+            return f"{what} carries no readable body"
+        if marker_verdict(body) is not None:
+            refusal = identity(comment, what)
+            if refusal is not None:
+                return refusal
+    for review in reviews:
+        state = review.get("state")
+        what = f"review {review.get('id')}"
+        if not in_enum(state, REVIEW_STATES):
+            return f"{what} carries an unknown state {state!r}"
+        if state in ("APPROVED", "CHANGES_REQUESTED"):
+            refusal = identity(review, what)
+            if refusal is not None:
+                return refusal
+            if not is_api_sha(review.get("commit_id")):
+                return f"{what} names no canonical commit sha"
+    return None
+
+
+def verdict_listing(repo: str, number: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Every comment and review of ``repo#number``, each verdict-carrying
+    record canonical (``verdict_records_refusal``), or ``GuardError``."""
+    comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    refusal = verdict_records_refusal(comments, reviews)
+    if refusal is not None:
+        raise GuardError(f"PR #{number}'s verdicts are unreadable: {refusal}")
+    return comments, reviews
+
+
+def default_branch(pull: Any) -> str:
+    """The repository's default branch, as the pull request's own answer
+    names it (``base.repo.default_branch``). Raises when it is missing: the
+    policy is never read from a branch the pull request chose."""
+    branch: Any = pull
+    for key in ("base", "repo", "default_branch"):
+        branch = branch.get(key) if isinstance(branch, dict) else None
+    if not isinstance(branch, str) or not branch:
+        raise GuardError("the pull request does not name its repository's default branch")
+    return branch
 
 
 def base_config_text(repo: str, base: str) -> str | None:
@@ -3479,6 +3683,8 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
     EXCLUDED_APPROVALS.clear()
     HELD_EXCLUSIONS.clear()
     result = _review_gate(classification, repo, dry_run)
+    if result[0]:
+        result = _edit_checked(classification, repo, result)
     if HELD_EXCLUSIONS:
         classification["held_exclusions"] = sorted(set(HELD_EXCLUSIONS))
         print(f"queue-arm-guard: note: PR #{classification.get('pr')}: "
@@ -3492,6 +3698,67 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
               "reviewer where the host lists signers), or a login the base lists in "
               "`[auto_merge] human_reviewers`, approves", file=sys.stderr)
     return result
+
+
+COMMENT_EDIT_QUERY = "query($id: ID!) { node(id: $id) { ... on IssueComment { lastEditedAt } } }"
+
+
+def comment_last_edited(node_id: str) -> str | None:
+    """The comment's GraphQL ``lastEditedAt``: ``None`` when it was never
+    edited. REST ``updated_at`` has one-second resolution, so an edit made in
+    the second the comment was posted leaves it equal to ``created_at``;
+    ``lastEditedAt`` is set by any edit. Raises when it cannot be read."""
+    answer = graphql(COMMENT_EDIT_QUERY, {"id": node_id})
+    # Partial data next to errors is not an answer: any non-null ``errors``,
+    # an empty or malformed one included, refuses (as src/head_approval.rs).
+    if not isinstance(answer, dict) or answer.get("errors") is not None:
+        raise GuardError(f"comment {node_id} edit history is unreadable "
+                         f"({answer.get('errors') if isinstance(answer, dict) else answer})")
+    data = answer.get("data")
+    node = data.get("node") if isinstance(data, dict) else None
+    if not isinstance(node, dict) or "lastEditedAt" not in node:
+        raise GuardError(f"comment {node_id} edit history is unreadable")
+    edited = node["lastEditedAt"]
+    if edited is not None and not isinstance(edited, str):
+        raise GuardError(f"comment {node_id} edit history is malformed")
+    return edited
+
+
+def _edit_checked(classification: dict[str, Any], repo: str | None,
+                  result: tuple[bool, str, dict[str, Any] | None]
+                  ) -> tuple[bool, str, dict[str, Any] | None]:
+    """``result``, refused when the APPROVE comment deciding it was ever
+    edited (GraphQL ``lastEditedAt``), or when that cannot be read."""
+    approval = classification.get("approval")
+    if (not isinstance(approval, dict) or approval.get("verdict_comment_id") is None
+            or not approval.get("verdict_from_api")):
+        return result
+    repo = classification.get("repo") or repo
+    number = classification.get("pr")
+    head = str(classification.get("head") or "")
+    label = f"PR #{number}"
+    node_id = approval.get("verdict_node_id")
+    read_pull = f"ghapp api repos/{repo}/pulls/{number} --jq .head.sha"
+    try:
+        if not isinstance(node_id, str) or not node_id:
+            raise GuardError(f"comment {approval['verdict_comment_id']} carries no node id")
+        edited = comment_last_edited(node_id)
+    except GuardError as error:
+        return False, (f"{label} ({repo}): cannot read whether its approval comment was "
+                       f"edited ({error}); refusing to land it"), review_fix(
+            "unreadable", f"the approval comment of {label} could not be checked: {error}",
+            str(repo), int(number) if isinstance(number, int) else 0, head, read_pull, True)
+    if edited is None:
+        return result
+    EXCLUDED_APPROVALS.append(f"comment {approval['verdict_comment_id']} ({EDITED_REFUSAL})")
+    classification.pop("approval", None)
+    return False, (f"{label} ({repo}): no reviewer verdict names head {head[:12]}: its "
+                   f"approval comment {approval['verdict_comment_id']} was edited at {edited}, "
+                   "so it does not count"), review_fix(
+        "unreviewed", f"the approval of {label} was edited after it was posted",
+        str(repo), int(number) if isinstance(number, int) else 0, head,
+        f"a reviewer posts a new `verdict: APPROVE head:{head}` comment on "
+        f"https://github.com/{repo}/pull/{number}", False)
 
 
 def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool = False
@@ -3517,7 +3784,23 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         base = ((pull.get("base") or {}).get("ref")) if isinstance(pull, dict) else None
         if not isinstance(base, str) or not base:
             raise GuardError("the pull request carries no base branch")
-        config_text = base_config_text(repo, base)
+        # The policy comes from the default branch, never the pull request's
+        # base: a pull request chooses its base, and a branch no ruleset
+        # protects can carry a config that turns review off or names any
+        # reviewer (verdict-App review N4).
+        default = default_branch(pull)
+        if base != default:
+            # The same refusal as the status and `shipyard review-verdict`: a
+            # pull request chooses its base, and only the default branch is
+            # protected, so a review is judged only for a pull request into it.
+            # It comes before the policy's opt-out below, so a policy that
+            # turns review off never lets a pull request into another base land.
+            what = (f"its base {base} is not the default branch {default}; only a pull "
+                    f"request into {default} is judged")
+            return False, f"{label} ({repo}): {what}", review_fix(
+                "wrong_base", f"{label}: {what}", repo, number, head,
+                f"retarget https://github.com/{repo}/pull/{number} to {default}", False)
+        config_text = base_config_text(repo, default)
         policy = review_policy(config_text, repo, True)
         if not policy["required"] and not host_requires_guard():
             # A host that requires guard admission never takes this early
@@ -3532,9 +3815,10 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
             ), review_fix("head_moved", f"{label} moved from {head[:12]} to {live_head[:12]}",
                           repo, number, live_head, read_pull, True)
         author = (pull.get("user") or {}).get("login")
-        author = author if isinstance(author, str) else None
-        comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
-        reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+        # No author is never "nobody to exclude": the self-approval rule needs it.
+        if not is_login(author):
+            raise GuardError("the pull request names no canonical author login")
+        comments, reviews = verdict_listing(repo, number)
     except GuardError as error:
         return False, (
             f"{label}: cannot read what its review requires ({error}); refusing to land it unreviewed"
@@ -3551,6 +3835,19 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
     if admitted is not None:
         return admitted
     allowed, why = review_verdict(head, author, comments, reviews, policy)
+    if allowed:
+        try:
+            held_at = recorded_hold(repo, number, head)
+        except GuardError as error:
+            return False, f"{label} ({repo}): {error}", review_fix(
+                "unreadable", f"the hold record for {label} could not be read: {error}",
+                repo, number, head, read_pull, True)
+        if held_at is not None:
+            allowed = False
+            why = (f"a HOLD naming head {head[:12]} makes it un-approvable (held by this "
+                   f"host's hold record at {held_at}; its comment is gone or no longer "
+                   "reads as a HOLD); push a new head that addresses the HOLD and have it "
+                   "reviewed")
     if allowed:
         own = self_approval(head, author, comments, reviews, policy)
         if own is not None:
@@ -3601,6 +3898,18 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         limited = (f"the base's carry configuration is refused ({policy['carry_error']})"
                    if policy.get("carry_error")
                    else carry_limits(approved, author, comments, reviews, policy))
+        if limited is None:
+            # A head this host's hold record holds passes no approval on: with
+            # the HOLD comment deleted, a merge of the base would otherwise
+            # carry the held head's approval to the new head.
+            try:
+                carried_hold = recorded_hold(repo, number, approved)
+            except GuardError as error:
+                limited = f"its hold record cannot be read ({error})"
+            else:
+                if carried_hold is not None:
+                    limited = (f"head {approved[:12]} was held (this host's hold record at "
+                               f"{carried_hold}), and a held head's approval never carries")
         merge_record: dict[str, Any] = {}
         refusal = limited or merge_only_carry(repo, base, approved, head, excluded, merge_record)
         own = self_approval(approved, author, comments, reviews, policy)

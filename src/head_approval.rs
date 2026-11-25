@@ -232,6 +232,135 @@ pub const SESSION_ENVS: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_
 /// `author_association` values whose verdicts count when no reviewer is
 /// listed (besides the fleet App's).
 pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+/// Every `author_association` GitHub documents. A record outside it is
+/// unreadable: read as untrusted, a trusted account's HOLD would be dropped.
+const AUTHOR_ASSOCIATIONS: [&str; 8] = [
+    "COLLABORATOR",
+    "CONTRIBUTOR",
+    "FIRST_TIMER",
+    "FIRST_TIME_CONTRIBUTOR",
+    "MANNEQUIN",
+    "MEMBER",
+    "NONE",
+    "OWNER",
+];
+/// Every `user.type` GitHub documents. A missing type would read the fleet
+/// App as a user account and drop its HOLD.
+const USER_TYPES: [&str; 3] = ["Bot", "Organization", "User"];
+/// Every pull request review state the REST API documents, as it spells them.
+const REVIEW_STATES: [&str; 5] = [
+    "APPROVED",
+    "CHANGES_REQUESTED",
+    "COMMENTED",
+    "DISMISSED",
+    "PENDING",
+];
+
+/// A canonical GitHub login: alphanumerics and hyphens, at most 39
+/// characters, starting with an alphanumeric, an App's bot user adding
+/// `[bot]`, and GraphQL naming an App `app/<slug>`. Never empty, padded or
+/// carrying any other character. Same rule as `LOGIN` in
+/// `scripts/ghapp_queue_arm_guard.py`.
+#[must_use]
+pub(crate) fn is_login(value: &str) -> bool {
+    let value = value.strip_prefix("app/").unwrap_or(value);
+    let name = value.strip_suffix("[bot]").unwrap_or(value);
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && name.len() <= 39
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// A commit sha as GitHub's REST API answers it: 40 lowercase hex.
+#[must_use]
+pub(crate) fn is_api_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Why a review or comment record carrying a verdict cannot be judged under
+/// `policy`, or `Ok` when every one can.
+///
+/// The gate judges a verdict by who posted it, so every field that judgment
+/// reads must be canonical on a record that carries one, or a HOLD would be
+/// dropped as untrusted or naming nothing: the login (always read), the user
+/// type (read for the fleet App's login, which counts only as a Bot), the
+/// author association (read under the default rule, for any other login), a
+/// review's state (an enum GitHub documents, exactly), and a review's sha
+/// (40 lowercase hex). A record with no verdict is never judged, so it is
+/// not checked; a field the policy never reads is not either.
+///
+/// # Errors
+///
+/// Naming the first record that cannot be judged.
+pub(crate) fn verdict_records_checked(
+    reviews: &[Value],
+    comments: &[Value],
+    policy: &ApprovalPolicy,
+) -> Result<(), String> {
+    let default_rule = policy.any_reviewer_but_author && policy.reviewer_logins.is_empty();
+    let identity = |record: &Value, what: &str| -> Result<(), String> {
+        let Some(login) = record
+            .get("login")
+            .and_then(Value::as_str)
+            .filter(|login| is_login(login))
+        else {
+            return Err(format!("{what} carries no canonical author login"));
+        };
+        if is_fleet_author(login)
+            && !record
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| USER_TYPES.contains(&kind))
+        {
+            return Err(format!("{what} carries an unknown user type"));
+        }
+        if default_rule
+            && !is_fleet_author(login)
+            && !record
+                .get("association")
+                .and_then(Value::as_str)
+                .is_some_and(|association| AUTHOR_ASSOCIATIONS.contains(&association))
+        {
+            return Err(format!("{what} carries an unknown author association"));
+        }
+        Ok(())
+    };
+    for comment in comments {
+        let what = format!("comment {}", comment.get("id").unwrap_or(&Value::Null));
+        let Some(body) = comment.get("body").and_then(Value::as_str) else {
+            return Err(format!("{what} carries no readable body"));
+        };
+        if marker_verdict(body).is_some() {
+            identity(comment, &what)?;
+        }
+    }
+    for review in reviews {
+        let what = format!("review {}", review.get("id").unwrap_or(&Value::Null));
+        let Some(state) = review
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|state| REVIEW_STATES.contains(state))
+        else {
+            return Err(format!("{what} carries an unknown state"));
+        };
+        if matches!(state, "APPROVED" | "CHANGES_REQUESTED") {
+            identity(review, &what)?;
+            if !review
+                .get("commit_id")
+                .and_then(Value::as_str)
+                .is_some_and(is_api_sha)
+            {
+                return Err(format!("{what} names no canonical commit sha"));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 thread_local! {
@@ -1473,7 +1602,7 @@ fn normalized_login(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_fleet_author(login: &str) -> bool {
+pub(crate) fn is_fleet_author(login: &str) -> bool {
     normalized_login(login) == "shipyard-local"
 }
 
@@ -1525,11 +1654,72 @@ fn reviewer_allowed(record: &Value, policy: &ApprovalPolicy, author: Option<&str
         && author.is_none_or(|author| normalized_login(author) != reviewer)
 }
 
+/// Why an approval counts for nothing once its comment was edited.
+pub(crate) const EDITED_REFUSAL: &str = "it was edited after it was posted";
+
+/// Whether a comment record's text changed after it was posted: its
+/// `updated_at` differs from its `at` (`created_at`).
+///
+/// Any token with `pull-requests: write`, a pull request's own workflow
+/// included, can edit any comment in the repository, and the author stays
+/// who posted it (merge-queue-rehearsal#47 proved it on an App comment). An
+/// edited body says nothing about what its author wrote, so an edited APPROVE
+/// never counts; an edited HOLD still holds, since it can only refuse more.
+/// GitHub moves `updated_at` on an edit, not on a reaction. A record with no
+/// `updated_at` key is a review (reviews have none); every comment reader's
+/// jq carries it ([`COMMENT_RECORD_JQ`]), so a comment whose `updated_at`
+/// is null, or any other non-string, cannot show it was not edited and counts
+/// as edited. Times that cannot be compared count as edited, identical
+/// malformed strings included ([`comment_edit_stamps`]).
+pub(crate) fn comment_edited(record: &Value) -> bool {
+    match comment_edit_stamps(record) {
+        Ok(None) => false,
+        Ok(Some((created, updated))) => created != updated,
+        Err(_) => true,
+    }
+}
+
+/// A comment's posted and last-updated times.
+pub(crate) type EditStamps = (DateTime<Utc>, DateTime<Utc>);
+
+/// A comment record's two edit stamps, validated: the only reader of `at`
+/// and `updated_at` for the edit rule.
+///
+/// `Ok(None)` for a record with no `updated_at` key (a review);
+/// `Ok(Some((posted, updated)))` only when both are strings that parse as
+/// RFC 3339. Both are parsed before they are compared, so two identical
+/// malformed strings are an error, never "not edited".
+///
+/// # Errors
+///
+/// When either time is missing, not a string, or not an RFC 3339 time.
+pub(crate) fn comment_edit_stamps(record: &Value) -> Result<Option<EditStamps>, String> {
+    let Some(updated) = record.get("updated_at") else {
+        return Ok(None);
+    };
+    let parse = |field: &str, value: Option<&Value>| {
+        let text = value
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("comment `{field}` is not a string"))?;
+        DateTime::parse_from_rfc3339(text)
+            .map(|at| at.with_timezone(&Utc))
+            .map_err(|_| format!("comment `{field}` is not an RFC 3339 time"))
+    };
+    Ok(Some((
+        parse("at", record.get("at"))?,
+        parse("updated_at", Some(updated))?,
+    )))
+}
+
 /// Whether an approval by `record`'s login counts, beyond
-/// [`reviewer_allowed`]: under the default rule (no reviewer listed) only the
+/// [`reviewer_allowed`]: an edited comment never approves
+/// ([`comment_edited`]); under the default rule (no reviewer listed) only the
 /// fleet App or a listed human reviewer approves. A repository that lists
 /// `reviewer_identities` decides by that list alone.
 fn approver_allowed(record: &Value, policy: &ApprovalPolicy) -> bool {
+    if comment_edited(record) {
+        return false;
+    }
     if !(policy.any_reviewer_but_author && policy.reviewer_logins.is_empty()) {
         return true;
     }
@@ -1736,7 +1926,9 @@ pub fn verdict_audit_events(
             && !approver_allowed(record, policy)
             && let Some(login) = login(record)
         {
-            events.push(if is_fleet_author(login) {
+            events.push(if comment_edited(record) {
+                format!("excluded_edited_approval:{login}")
+            } else if is_fleet_author(login) {
                 format!(
                     "excluded_app_approval:{}",
                     app_approval_refusal(record, policy).unwrap_or_default()
@@ -2479,7 +2671,9 @@ pub fn read_policy_required(
 /// A review as the gate reads it.
 const REVIEW_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 /// A comment as the gate reads it.
-const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
+/// `updated_at` is load-bearing: without it [`comment_edited`] cannot see an
+/// edit.
+pub(crate) const COMMENT_RECORD_JQ: &str = ".[] | {id: .id, node_id: .node_id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, updated_at: .updated_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}";
 
 fn read_records(run_gh: RunGh<'_>, path: &str, jq: &str) -> Result<Vec<Value>, String> {
     let raw = run_gh(&[
@@ -2588,6 +2782,8 @@ pub fn evaluate_excusing_with_policy(
         &format!("repos/{repo}/issues/{pr}/comments"),
         COMMENT_RECORD_JQ,
     )?;
+    verdict_records_checked(&reviews, &comments, policy)
+        .map_err(|error| format!("PR #{pr}'s verdicts are unreadable: {error}"))?;
     let gate = decide_for_author(
         policy,
         head,
@@ -2608,7 +2804,90 @@ pub fn evaluate_excusing_with_policy(
     };
     let gate = with_carry(run_gh, &input, gate);
     let gate = with_rollup(run_gh, &input, gate);
+    let gate = edit_checked(run_gh, head, &comments, gate)?;
     trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate)
+}
+
+/// The GraphQL query for one comment's edit history.
+const COMMENT_EDIT_QUERY: &str =
+    "query($id: ID!) { node(id: $id) { ... on IssueComment { lastEditedAt } } }";
+
+/// `gate`, refused when the comment whose APPROVE decides it (directly or
+/// carried) was ever edited by GraphQL's `lastEditedAt`.
+///
+/// REST times have one-second resolution, so an edit in the second the
+/// comment was posted leaves `updated_at == created_at` ([`comment_edited`]);
+/// `lastEditedAt` is set by any edit. The deciding record is a comment, read
+/// through [`COMMENT_RECORD_JQ`], so it must carry a string `updated_at` and a
+/// `node_id`: a record without either, or an unreadable answer, is an error,
+/// never an approval.
+fn edit_checked(
+    run_gh: RunGh<'_>,
+    head: &str,
+    comments: &[Value],
+    gate: HeadGate,
+) -> Result<HeadGate, String> {
+    let HeadGate::Approved { approval } = &gate else {
+        return Ok(gate);
+    };
+    let mut deciding = approval;
+    while let Approval::Carried {
+        approval: inner, ..
+    } = deciding
+    {
+        deciding = inner;
+    }
+    let Approval::Marker {
+        comment_id: Some(id),
+        ..
+    } = deciding
+    else {
+        return Ok(gate);
+    };
+    let Some(record) = comments
+        .iter()
+        .find(|comment| comment.get("id").and_then(Value::as_u64) == Some(*id))
+    else {
+        return Err(format!(
+            "approval comment {id} is not among the comments read"
+        ));
+    };
+    if !matches!(comment_edit_stamps(record), Ok(Some(_))) {
+        return Err(format!(
+            "approval comment {id} carries no readable edit metadata (at, updated_at)"
+        ));
+    }
+    let node_id = record
+        .get("node_id")
+        .and_then(Value::as_str)
+        .filter(|node| !node.is_empty())
+        .ok_or_else(|| format!("approval comment {id} carries no node id"))?;
+    let answer = gh_json(
+        run_gh,
+        &[
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={COMMENT_EDIT_QUERY}"),
+            "-f".to_owned(),
+            format!("id={node_id}"),
+        ],
+    )
+    .map_err(|error| format!("approval comment {id} edit history unreadable: {error}"))?;
+    // Partial data next to errors is not an answer.
+    if answer.get("errors").is_some_and(|errors| !errors.is_null()) {
+        return Err(format!(
+            "approval comment {id} edit history unreadable: {}",
+            answer["errors"]
+        ));
+    }
+    match answer.pointer("/data/node/lastEditedAt") {
+        Some(Value::Null) => Ok(gate),
+        Some(Value::String(_)) => Ok(HeadGate::NotApproved {
+            head: head.to_owned(),
+        }),
+        _ => Err(format!("approval comment {id} edit history unreadable")),
+    }
 }
 
 /// The pull request's author, read when the policy turns on it: with no
@@ -2620,6 +2899,11 @@ fn pr_author(
     policy: &ApprovalPolicy,
     known: Option<&str>,
 ) -> Result<Option<String>, String> {
+    if let Some(known) = known
+        && !is_login(known)
+    {
+        return Err(format!("PR #{pr} carried no canonical author login"));
+    }
     if known.is_some() || !policy.any_reviewer_but_author || !policy.reviewer_logins.is_empty() {
         return Ok(known.map(str::to_owned));
     }
@@ -2629,9 +2913,10 @@ fn pr_author(
         "--jq".to_owned(),
         ".user.login".to_owned(),
     ])?;
-    let login = login.trim();
-    if login.is_empty() {
-        return Err(format!("PR #{pr} carried no author"));
+    // `gh --jq` ends its answer with a newline; anything else is not a login.
+    let login = login.strip_suffix('\n').unwrap_or(&login);
+    if !is_login(login) {
+        return Err(format!("PR #{pr} carried no canonical author login"));
     }
     Ok(Some(login.to_owned()))
 }
@@ -2751,6 +3036,8 @@ fn evaluate_events_by_source(
         &format!("repos/{repo}/issues/{pr}/comments"),
         COMMENT_RECORD_JQ,
     )?;
+    verdict_records_checked(&reviews, &comments, policy)
+        .map_err(|error| format!("PR #{pr}'s verdicts are unreadable: {error}"))?;
     let all_comments = comments.clone();
     let comments = if comments.iter().any(|comment| {
         comment
@@ -2792,6 +3079,9 @@ fn evaluate_events_by_source(
     } else {
         gate
     };
+    let allowed_by_comments = gate.allows();
+    let gate = edit_checked(run_gh, head, &comments, gate)?;
+    let edited_away = allowed_by_comments && !gate.allows();
     let blocker = blocker::diagnose(
         &gate,
         &blocker::Records {
@@ -2803,6 +3093,16 @@ fn evaluate_events_by_source(
         policy,
         author,
     );
+    let blocker = if edited_away {
+        Some(ApprovalBlocker::Excluded {
+            reason: "edited",
+            detail: format!("{EDITED_REFUSAL} (GraphQL `lastEditedAt`)"),
+            id: None,
+            at: None,
+        })
+    } else {
+        blocker
+    };
     Ok((gate, events, blocker))
 }
 

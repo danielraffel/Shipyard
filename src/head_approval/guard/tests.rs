@@ -504,6 +504,9 @@ fn comment_mode_github<'a>(
         if joined.contains("contents/.shipyard/config.toml") {
             return Ok(config.to_owned());
         }
+        if joined.contains("lastEditedAt") {
+            return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+        }
         if joined.contains("/check-runs") {
             return Ok(run(10).to_string());
         }
@@ -533,7 +536,8 @@ fn an_unconfigured_base_behaves_exactly_as_the_comment_rule() {
     let reviewer = "shipyard-review[bot]";
     let comment = |verdict: &str| {
         json!({"id": 5, "login": reviewer, "type": "Bot", "association": "NONE",
-            "at": "2026-11-02T00:00:00Z", "body": format!("verdict: {verdict} head:{HEAD}"),
+            "at": "2026-11-02T00:00:00Z", "updated_at": "2026-11-02T00:00:00Z", "node_id": "IC_5",
+            "body": format!("verdict: {verdict} head:{HEAD}"),
             "performed_via_github_app_id": 99})
     };
     let base = "[auto_merge]\narm_requires_head_approval = true\nreviewer_identities = [\"shipyard-review[bot]\"]\n";

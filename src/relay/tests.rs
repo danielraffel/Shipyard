@@ -1338,8 +1338,14 @@ fn an_outsiders_verdict_or_claim_is_not_relayed() {
         Some("2026-11-09T12:01:00Z"),
         "still activity"
     );
-    // A GitHub App (the fleet's reviewer) is trusted.
-    node["comments"]["nodes"][0]["author"]["__typename"] = json!("Bot");
+    // Another Bot is not: a pull request's own workflow posts as
+    // `github-actions` with its GITHUB_TOKEN.
+    node["comments"]["nodes"][0]["author"] =
+        json!({"__typename": "Bot", "login": "github-actions"});
+    assert_eq!(summarize(Some(&node), "main", &gates()).verdict, None);
+    // The fleet App (the fleet's reviewer) is trusted.
+    node["comments"]["nodes"][0]["author"] =
+        json!({"__typename": "Bot", "login": "shipyard-local"});
     assert_eq!(
         summarize(Some(&node), "main", &gates()).verdict.as_deref(),
         Some("APPROVE")
@@ -2284,5 +2290,34 @@ fn an_approved_stuck_row_is_relayed_with_its_blocking_reason() {
     assert_eq!(
         event.key(REPO, 69),
         format!("{REPO}#69:overdue:{HEAD_A}:approved_stuck:1")
+    );
+}
+
+/// Any token with `pull-requests: write` can edit a comment and keep its
+/// author (merge-queue-rehearsal#47): an edited APPROVE is not relayed, an
+/// edited HOLD still is.
+#[test]
+fn an_edited_approve_is_not_relayed_and_an_edited_hold_is() {
+    let mut node = Pr::open(1).node();
+    let comment = |kind: &str, edited: Option<&str>| {
+        json!({"body": format!("verdict: {kind} head:{HEAD_A}"), "createdAt": "2026-11-09T12:00:00Z",
+               "lastEditedAt": edited,
+               "authorAssociation": "NONE", "author": {"__typename": "Bot", "login": "shipyard-local"}})
+    };
+    node["comments"]["nodes"] = json!([comment("APPROVE", None)]);
+    assert_eq!(
+        summarize(Some(&node), "main", &gates()).verdict.as_deref(),
+        Some("APPROVE"),
+        "control: unedited, it is relayed"
+    );
+    node["comments"]["nodes"] = json!([comment("APPROVE", Some("2026-11-09T12:05:00Z"))]);
+    assert_eq!(summarize(Some(&node), "main", &gates()).verdict, None);
+    // The verdict pattern is case-blind, so the edit rule must be too.
+    node["comments"]["nodes"] = json!([comment("approve", Some("2026-11-09T12:05:00Z"))]);
+    assert_eq!(summarize(Some(&node), "main", &gates()).verdict, None);
+    node["comments"]["nodes"] = json!([comment("HOLD", Some("2026-11-09T12:05:00Z"))]);
+    assert_eq!(
+        summarize(Some(&node), "main", &gates()).verdict.as_deref(),
+        Some("HOLD")
     );
 }

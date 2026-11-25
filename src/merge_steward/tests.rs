@@ -1775,3 +1775,118 @@ fn review_status_descriptions_that_only_wait_on_reviewers() {
     assert!(is_review_gate("custom-approval", "custom-approval"));
     assert!(!is_review_gate("macos", "review-verdict"));
 }
+
+/// The dedicated `review-verdict` App's bot, as a rollout would configure it.
+fn verdict_app() -> StatusApp {
+    StatusApp {
+        id: 4_242_424,
+        bot_login: "fleet-verdict[bot]".to_owned(),
+        bot_user_id: 9_191_919,
+    }
+}
+
+/// The App's `review-verdict` status as the steward reads one.
+fn app_status(app_id: Option<u64>) -> StewardCheck {
+    StewardCheck {
+        name: "review-verdict".to_owned(),
+        source: StewardCheckSource::StatusContext,
+        app_id,
+        status: "COMPLETED".to_owned(),
+        conclusion: Some("SUCCESS".to_owned()),
+        run_id: None,
+        observed_at: Some("2026-11-24T00:00:00Z".to_owned()),
+        check_id: Some(1),
+        description: None,
+    }
+}
+
+#[test]
+fn the_verdict_apps_status_maps_to_its_app_only_when_configured() {
+    let login = Some("fleet-verdict[bot]");
+    let user = Some(9_191_919);
+    with_status_app(None, || {
+        assert_eq!(status_creator_app_id(login, user), None);
+        // GitHub Actions maps whatever is configured.
+        assert_eq!(
+            status_creator_app_id(
+                Some("github-actions[bot]"),
+                Some(GITHUB_ACTIONS_BOT_USER_ID)
+            ),
+            Some(GITHUB_ACTIONS_APP_ID)
+        );
+    });
+    with_status_app(Some(verdict_app()), || {
+        assert_eq!(status_creator_app_id(login, user), Some(4_242_424));
+        // Login and user id must both match.
+        assert_eq!(status_creator_app_id(login, Some(1)), None);
+        assert_eq!(status_creator_app_id(Some("someone[bot]"), user), None);
+        assert_eq!(
+            status_creator_app_id(
+                Some("github-actions[bot]"),
+                Some(GITHUB_ACTIONS_BOT_USER_ID)
+            ),
+            Some(GITHUB_ACTIONS_APP_ID)
+        );
+    });
+}
+
+#[test]
+fn a_rule_bound_to_the_verdict_app_selects_its_status_only_when_configured() {
+    let mut policy = queue_policy();
+    policy.required_checks = vec![RequiredCheck {
+        context: "review-verdict".to_owned(),
+        app_id: Some(4_242_424),
+    }];
+    let selection = |pr: &StewardPullRequest| required_selections(pr, &policy);
+    with_status_app(None, || {
+        let mut pr = green_pr();
+        pr.checks = vec![app_status(status_creator_app_id(
+            Some("fleet-verdict[bot]"),
+            Some(9_191_919),
+        ))];
+        let selected = selection(&pr);
+        assert_eq!(selected[0].selected_source, None, "{selected:?}");
+    });
+    with_status_app(Some(verdict_app()), || {
+        let mut pr = green_pr();
+        pr.checks = vec![app_status(status_creator_app_id(
+            Some("fleet-verdict[bot]"),
+            Some(9_191_919),
+        ))];
+        let selected = selection(&pr);
+        assert_eq!(
+            selected,
+            vec![RequiredSelection {
+                context: "review-verdict".to_owned(),
+                required_app_id: Some(4_242_424),
+                selected_source: Some("status"),
+                selected_app_id: Some(4_242_424),
+                selected_state: Some("SUCCESS".to_owned()),
+            }]
+        );
+    });
+}
+
+#[test]
+fn the_status_app_setting_refuses_github_actions_and_malformed_tables() {
+    let parse = |text: &str| {
+        let table: toml::Table = text.parse().expect("toml");
+        StatusApp::from_value(table.get("app"))
+    };
+    assert_eq!(StatusApp::from_value(None), Ok(None));
+    assert_eq!(
+        parse("app = { id = 4242424, bot_login = \"fleet-verdict[bot]\", bot_user_id = 9191919 }"),
+        Ok(Some(verdict_app()))
+    );
+    for bad in [
+        "app = { id = 15368, bot_login = \"fleet-verdict[bot]\", bot_user_id = 9191919 }",
+        "app = { id = 1, bot_login = \"github-actions[bot]\", bot_user_id = 9191919 }",
+        "app = { id = 1, bot_login = \"fleet-verdict[bot]\", bot_user_id = 41898282 }",
+        "app = { id = 1, bot_login = \"fleet-verdict\", bot_user_id = 2 }",
+        "app = { id = 0, bot_login = \"fleet-verdict[bot]\", bot_user_id = 2 }",
+        "app = { id = 1, bot_login = \"fleet-verdict[bot]\", bot_user_id = 2, extra = 1 }",
+        "app = 5",
+    ] {
+        assert!(parse(bad).is_err(), "{bad}");
+    }
+}

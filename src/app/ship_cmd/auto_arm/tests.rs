@@ -633,6 +633,10 @@ fn reenqueue_8678(comments: &str) -> FakeGh {
     let runs = r#"{"total_count":1,"check_runs":[{"id":7,"name":"macos","status":"completed","conclusion":"cancelled","app":{"slug":"github-actions"}}]}"#;
     let job = r#"{"id":7,"status":"completed","conclusion":"cancelled","created_at":"2026-09-23T03:30:00Z","completed_at":"2026-09-23T03:46:00Z","runner_name":"","steps":[]}"#;
     FakeGh::new(vec![
+        (
+            "lastEditedAt",
+            Ok(r#"{"data":{"node":{"lastEditedAt":null}}}"#.to_owned()),
+        ),
         ("pr view", Ok(pr_view("PR_node8678", false))),
         ("pulls/8678/reviews", Ok(String::new())),
         ("issues/8678/comments", Ok(comments.to_owned())),
@@ -663,7 +667,7 @@ fn reenqueue_8678(comments: &str) -> FakeGh {
 
 #[test]
 fn a_same_head_reenqueue_from_ship_is_bound_to_the_exact_head() {
-    let approval = r#"{"id":1,"login":"shipyard-local[bot]","type":"Bot","association":"CONTRIBUTOR","at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
+    let approval = r#"{"id":1,"node_id":"IC_1","login":"shipyard-local[bot]","type":"Bot","association":"CONTRIBUTOR","at":"2026-09-23T04:00:00Z","updated_at":"2026-09-23T04:00:00Z","body":"verdict: APPROVE head:f0fb2fb38ef5c900efad7ea0630906f081db53a9"}"#;
     let gh = reenqueue_8678(approval);
     let outcome = crate::head_approval::with_host_review_default(true, || {
         arm_native_auto_merge(&|args| gh.run(args), "Generous-Corp/pulp", 8678, true)

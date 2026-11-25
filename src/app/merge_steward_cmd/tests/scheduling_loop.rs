@@ -307,6 +307,7 @@ fn row(
             since: since.map(|at| at.to_rfc3339()),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     }
 }
 

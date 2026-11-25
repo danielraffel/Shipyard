@@ -181,6 +181,7 @@ pub(super) fn deferred_report(pr: &ObservedPr, decision: StewardDecision, why: &
             next_action: Some(NextAction::deferred_pass_budget()),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     }
 }
 

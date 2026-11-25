@@ -71,7 +71,9 @@ pub fn review_verdict(
             "api".to_owned(),
             format!("repos/{repo}/pulls/{pr}"),
             "--jq".to_owned(),
-            "{head: .head.sha, base: .base.ref, author: .user.login}".to_owned(),
+            "{head: .head.sha, base: .base.ref, default_branch: .base.repo.default_branch, \
+             author: .user.login}"
+                .to_owned(),
         ])?
         .trim(),
     )
@@ -82,10 +84,44 @@ pub fn review_verdict(
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
     };
-    let live = text("head").ok_or_else(|| format!("PR #{pr} carries no head"))?;
+    let live = text("head")
+        .filter(|head| head_approval::is_api_sha(head))
+        .ok_or_else(|| format!("PR #{pr} carries no canonical head sha"))?;
+    // No author is never "nobody to exclude": the self-approval rule needs it.
+    let author = text("author")
+        .filter(|author| head_approval::is_login(author))
+        .ok_or_else(|| format!("PR #{pr} carries no canonical author login"))?;
     let base = text("base").ok_or_else(|| format!("PR #{pr} carries no base branch"))?;
+    let default_branch = text("default_branch")
+        .ok_or_else(|| format!("PR #{pr} does not name its repository's default branch"))?;
     let head = head.map_or_else(|| live.clone(), str::to_ascii_lowercase);
-    let mut policy = head_approval::read_policy_repository_side(run_gh, repo, &base)?;
+    // The policy comes from the default branch, never the pull request's
+    // base: a pull request chooses its base, and a branch no ruleset protects
+    // can carry a config that turns review off. A pull request into any
+    // other branch is not judged at all (verdict-App review N4).
+    let mut policy = head_approval::read_policy_repository_side(run_gh, repo, &default_branch)?;
+    if base != default_branch {
+        return Ok(Verdict {
+            repo: repo.to_owned(),
+            pr,
+            live_head: (!live.eq_ignore_ascii_case(&head)).then(|| live.clone()),
+            head,
+            verdict: "refused",
+            required: policy.required,
+            reason: format!(
+                "its base {base} is not the default branch {default_branch}; only a pull \
+                 request into {default_branch} is judged"
+            ),
+            base,
+            approval: None,
+            excluded_approvals: Vec::new(),
+            audit_events: Vec::new(),
+            fix: Some(format!(
+                "retarget https://github.com/{repo}/pull/{pr} to {default_branch}; the \
+                 verdict is then judged there"
+            )),
+        });
+    }
     policy.rebase_carry = rebase_carry;
     // A status is read-only: it judges a carry but never logs one.
     policy.dry_run = true;
@@ -96,7 +132,7 @@ pub fn review_verdict(
         &head,
         &policy,
         &json!({}),
-        text("author").as_deref(),
+        Some(author.as_str()),
     )?;
     Ok(verdict_for(
         repo, pr, &head, &live, base, &policy, gate, events,

@@ -130,6 +130,8 @@ struct PrReport {
     error: Option<String>,
     /// Why this pull request is not merging, and since when.
     blocked: blocked_on::Stall,
+    /// Which check or status the steward selects for each required rule.
+    required_checks: Vec<crate::merge_steward::RequiredSelection>,
 }
 
 /// Whether a pull request's `error` is a failed read this pass could not
@@ -181,6 +183,8 @@ struct PrReportWire {
     error_kind: Option<ErrorKind>,
     #[serde(flatten)]
     blocked: blocked_on::Stall,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    required_checks: Vec<crate::merge_steward::RequiredSelection>,
 }
 
 impl From<PrReport> for PrReportWire {
@@ -193,6 +197,7 @@ impl From<PrReport> for PrReportWire {
             mutation: report.mutation,
             error: report.error,
             blocked: report.blocked,
+            required_checks: report.required_checks,
         }
     }
 }
@@ -404,6 +409,10 @@ struct StewardLedger {
     /// with a solo-entry setting. See `solo_entry`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     solo_entry_native_arms: BTreeMap<String, BTreeMap<u64, String>>,
+    /// Heads a pass found held, keyed `repo#pr`, so a HOLD whose comment was
+    /// later deleted or edited still holds. See `held_ledger`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    held_heads: held_ledger::HeldHeads,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2310,6 +2319,7 @@ mod fix_reorder;
 mod flake_requeue;
 mod generated_paths;
 mod head_rollup;
+mod held_ledger;
 pub(super) mod infra_rerun;
 pub(super) mod invariants;
 mod ledger;

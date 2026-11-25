@@ -14,9 +14,26 @@ fn gh(
     reviews: Vec<Value>,
     comments: Vec<Value>,
 ) -> impl Fn(&[String]) -> Result<String, String> {
+    gh_into("main", live, config, reviews, comments)
+}
+
+/// [`gh`] for a pull request into `base` of a repository whose default
+/// branch is `main`; the config is answered only from `main`.
+fn gh_into(
+    base: &'static str,
+    live: &'static str,
+    config: Option<&'static str>,
+    reviews: Vec<Value>,
+    comments: Vec<Value>,
+) -> impl Fn(&[String]) -> Result<String, String> {
     move |args: &[String]| {
         let joined = args.join(" ");
         if joined.contains("contents/.shipyard/config.toml") {
+            if !joined.contains("?ref=main") {
+                return Err(format!(
+                    "config read from a branch other than main: {joined}"
+                ));
+            }
             return config
                 .map(str::to_owned)
                 .ok_or_else(|| "gh: Not Found (HTTP 404)".to_owned());
@@ -28,6 +45,9 @@ fn gh(
                 .collect::<Vec<_>>()
                 .join("\n"));
         }
+        if joined.contains("lastEditedAt") {
+            return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+        }
         if joined.contains("/comments") {
             return Ok(comments
                 .iter()
@@ -36,9 +56,9 @@ fn gh(
                 .join("\n"));
         }
         if joined.contains("pulls/7 --jq {head") {
-            return Ok(
-                json!({"head": live, "base": "main", "author": "shipyard-local[bot]"}).to_string(),
-            );
+            return Ok(json!({"head": live, "base": base, "default_branch": "main",
+                       "author": "shipyard-local[bot]"})
+            .to_string());
         }
         if joined.contains("/commits/") && joined.contains(".commit.committer.date") {
             return Ok("2026-10-14T16:00:00Z\n".to_owned());
@@ -62,7 +82,8 @@ fn app_approval(head: &str, signer: Option<&str>) -> Value {
 
 fn app_comment(body: &str) -> Value {
     json!({"id": 5, "login": "shipyard-local[bot]", "type": "Bot", "association": "CONTRIBUTOR",
-           "at": "2026-10-14T17:00:00Z", "body": body})
+           "at": "2026-10-14T17:00:00Z", "updated_at": "2026-10-14T17:00:00Z",
+           "node_id": "IC_5", "body": body})
 }
 
 fn owner_review(head: &str) -> Value {
@@ -247,4 +268,129 @@ fn a_hold_then_a_later_approve_of_the_same_head_is_refused() {
     );
     let fix = verdict.fix.as_deref().expect("a refusal names its fix");
     assert!(fix.contains("pushes a new head"), "{fix}");
+}
+
+/// A pull request chooses its base, and only the default branch is
+/// protected: the policy is read from the default branch, and a pull request
+/// into any other branch is refused even with a counted approval
+/// (verdict-App review N4).
+#[test]
+fn a_pull_request_into_another_branch_is_refused_and_policy_comes_from_main() {
+    let approved = || vec![app_approval(HEAD, Some("pulp-review"))];
+    // Control: into main, the same approval allows the head.
+    let into_main = gh_into("main", HEAD, Some(SIGNED), vec![], approved());
+    let verdict =
+        review_verdict(&into_main, "danielraffel/tartci", 7, None, false).expect("judged");
+    assert!(verdict.allowed(), "{verdict:?}");
+    let stacked = gh_into("b0", HEAD, Some(SIGNED), vec![], approved());
+    let verdict = review_verdict(&stacked, "danielraffel/tartci", 7, None, false).expect("judged");
+    assert!(!verdict.allowed(), "{verdict:?}");
+    assert_eq!(verdict.base, "b0");
+    assert!(
+        verdict.reason.contains("not the default branch main"),
+        "{verdict:?}"
+    );
+}
+
+/// The pull request's head and author must be canonical: an empty author
+/// would read as "nobody to exclude" from self-approval, and a non-canonical
+/// head as a head nothing names.
+#[test]
+fn a_pull_request_with_a_non_canonical_head_or_author_is_unreadable() {
+    let answer = |head: Value, author: Value| {
+        move |args: &[String]| -> Result<String, String> {
+            let joined = args.join(" ");
+            if joined.contains("pulls/7 --jq {head") {
+                return Ok(
+                    json!({"head": head, "base": "main", "default_branch": "main",
+                                 "author": author})
+                    .to_string(),
+                );
+            }
+            gh("x", None, Vec::new(), Vec::new())(args)
+        }
+    };
+    assert!(
+        review_verdict(
+            &answer(json!(HEAD), json!("someone")),
+            "o/r",
+            7,
+            None,
+            false
+        )
+        .is_ok(),
+        "control"
+    );
+    for author in [
+        json!(""),
+        json!(" "),
+        json!(" someone"),
+        json!("some one"),
+        json!(5),
+        json!(null),
+    ] {
+        let error = review_verdict(&answer(json!(HEAD), author.clone()), "o/r", 7, None, false)
+            .expect_err("a non-canonical author is unreadable");
+        assert!(error.contains("author login"), "{author}: {error}");
+    }
+    for head in [
+        json!(" "),
+        json!(HEAD.to_ascii_uppercase()),
+        json!(&HEAD[..39]),
+        json!(format!(" {HEAD}")),
+        json!(5),
+    ] {
+        let error = review_verdict(
+            &answer(head.clone(), json!("someone")),
+            "o/r",
+            7,
+            None,
+            false,
+        )
+        .expect_err("a non-canonical head is unreadable");
+        assert!(error.contains("head sha"), "{head}: {error}");
+    }
+}
+
+/// A HOLD whose author cannot be read refuses the verdict, never drops out
+/// of it as an untrusted account's and leaves the earlier APPROVE standing.
+#[test]
+fn a_hold_with_a_non_canonical_author_refuses_the_verdict() {
+    let approve = app_approval(HEAD, Some("pulp-review"));
+    let hold = |login: Value| {
+        let mut hold = app_comment(&format!(
+            "Findings.\nreviewer: pulp-review\n{STAMP}\nverdict: HOLD head:{HEAD}"
+        ));
+        hold["id"] = json!(6);
+        hold["at"] = json!("2026-10-14T18:00:00Z");
+        hold["updated_at"] = json!("2026-10-14T18:00:00Z");
+        hold["login"] = login;
+        hold
+    };
+    let verdict = |comments: Vec<Value>| {
+        review_verdict(
+            &gh(HEAD, Some(SIGNED), Vec::new(), comments),
+            "danielraffel/tartci",
+            7,
+            None,
+            false,
+        )
+    };
+    let control = verdict(vec![approve.clone(), hold(json!("shipyard-local[bot]"))])
+        .expect("control: a canonical HOLD is judged");
+    assert_eq!(control.verdict, "refused", "control: the HOLD holds");
+    for login in [
+        json!(""),
+        json!(" "),
+        json!("some one"),
+        json!(null),
+        json!(5),
+    ] {
+        let error = verdict(vec![approve.clone(), hold(login.clone())])
+            .expect_err("a HOLD with a non-canonical author is unreadable");
+        assert!(
+            error.contains("verdicts are unreadable"),
+            "{login}: {error}"
+        );
+    }
 }

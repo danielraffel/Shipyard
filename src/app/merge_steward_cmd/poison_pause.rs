@@ -174,6 +174,7 @@ pub(super) fn pause_pr(
         mutation,
         error,
         blocked: super::blocked_on::Stall::default(),
+        required_checks: Vec::new(),
     };
     if !apply {
         return Some(report(
@@ -319,6 +320,7 @@ pub(super) fn waiting_report(
         mutation: Some(format!("paused_awaiting_pass:{}", entry.contexts)),
         error: None,
         blocked: super::blocked_on::Stall::default(),
+        required_checks: Vec::new(),
     })
 }
 

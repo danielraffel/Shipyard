@@ -55,6 +55,15 @@ pub(super) fn repair_check_command<W: Write>(
         .ok_or_else(|| CliFailure::new(2, "PR has no readable head sha"))?
         .to_owned();
     let comments = read_comments(&read, &repo, args.pr)?;
+    if let Some(id) = edited_latest_verdict(&comments) {
+        return Err(CliFailure::new(
+            2,
+            format!(
+                "the newest bot verdict (comment {id}) was edited after it was posted, so its \
+                 text is not the reviewer's; refusing to judge the HOLD from it"
+            ),
+        ));
+    }
     let Some((hold_head, hold_body)) = latest_hold(&comments) else {
         return render_no_hold(json_output, stdout);
     };
@@ -104,6 +113,56 @@ fn read_comments(
         2,
         "HOLD comments exceeded the 10000-comment safety bound",
     ))
+}
+
+/// The id of the newest bot verdict comment unless it is provably unedited:
+/// its `created_at` and `updated_at` are both readable RFC 3339 times and
+/// equal. Any token with `pull-requests: write` can edit a comment and keep its
+/// author, so an edited HOLD can hide or rewrite findings and an edited APPROVE
+/// can read as no HOLD. Missing, null, non-string or unparseable edit metadata
+/// cannot show the text is the reviewer's, so it is refused the same way; a bot
+/// verdict with no readable `created_at` is refused too, because the newest
+/// verdict cannot be chosen past it.
+fn edited_latest_verdict(comments: &[Value]) -> Option<u64> {
+    let id = |comment: &Value| {
+        comment
+            .get("id")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    };
+    let time = |comment: &Value, key: &str| {
+        comment
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+    };
+    let verdicts: Vec<&Value> = comments
+        .iter()
+        .filter(|comment| {
+            comment.pointer("/user/login").and_then(Value::as_str) == Some("shipyard-local[bot]")
+                && comment
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .and_then(|body| body.lines().rev().find(|line| !line.trim().is_empty()))
+                    .is_some_and(|last| last.trim().starts_with("verdict: "))
+        })
+        .collect();
+    if let Some(unreadable) = verdicts.iter().find(|c| time(c, "created_at").is_none()) {
+        return Some(id(unreadable));
+    }
+    // The same choice `latest_hold` makes: the newest by `created_at`.
+    let newest = verdicts.into_iter().max_by(|a, b| {
+        let at = |c: &Value| {
+            c.get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        at(a).cmp(&at(b))
+    })?;
+    let created = time(newest, "created_at");
+    let updated = time(newest, "updated_at");
+    (created.is_none() || updated != created).then(|| id(newest))
 }
 
 /// The newest bot verdict decides: a HOLD followed by an APPROVE (or any later
@@ -247,6 +306,76 @@ fn status_label(status: &Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Any token with `pull-requests: write` can edit a comment and keep its
+    /// author (merge-queue-rehearsal#47), so an edited newest verdict is not
+    /// judged: an APPROVE edited over a HOLD would read as no HOLD.
+    #[test]
+    fn an_edited_newest_verdict_is_refused() {
+        let hold = serde_json::json!({"id": 1, "user":{"login":"shipyard-local[bot]"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z",
+            "body":"Findings:\n- [blocking] a.rs 3 r p\nverdict: HOLD head:old"});
+        assert_eq!(edited_latest_verdict(std::slice::from_ref(&hold)), None);
+        let mut forged = hold.clone();
+        forged["body"] = serde_json::json!("ok\nverdict: APPROVE head:old");
+        forged["updated_at"] = serde_json::json!("2026-01-01T00:05:00Z");
+        assert_eq!(
+            latest_hold(std::slice::from_ref(&forged)),
+            None,
+            "it reads as no HOLD"
+        );
+        assert_eq!(edited_latest_verdict(&[forged.clone()]), Some(1));
+        // The newest verdict decides: an older edited one does not refuse a
+        // newer unedited one, and a newer edited one refuses an older one.
+        let mut newer = hold.clone();
+        newer["id"] = serde_json::json!(2);
+        newer["created_at"] = serde_json::json!("2026-01-02T00:00:00Z");
+        newer["updated_at"] = serde_json::json!("2026-01-02T00:00:00Z");
+        assert_eq!(
+            edited_latest_verdict(&[forged.clone(), newer.clone()]),
+            None
+        );
+        let mut newer_edited = newer;
+        newer_edited["updated_at"] = serde_json::json!("2026-01-02T00:05:00Z");
+        assert_eq!(edited_latest_verdict(&[hold, newer_edited]), Some(2));
+    }
+
+    /// Edit metadata that cannot prove the newest verdict is unedited refuses
+    /// it: a forged APPROVE whose `updated_at` is missing, null, not a string or
+    /// not a time must not read as a closed HOLD.
+    #[test]
+    fn incomplete_edit_metadata_refuses_the_newest_verdict() {
+        let forged = serde_json::json!({"id": 7, "user":{"login":"shipyard-local[bot]"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z",
+            "body":"ok\nverdict: APPROVE head:old"});
+        assert_eq!(
+            edited_latest_verdict(std::slice::from_ref(&forged)),
+            None,
+            "control"
+        );
+        for updated in [
+            serde_json::Value::Null,
+            serde_json::json!(5),
+            serde_json::json!("not a time"),
+            serde_json::json!(""),
+        ] {
+            let mut bad = forged.clone();
+            bad["updated_at"] = updated.clone();
+            assert_eq!(edited_latest_verdict(&[bad]), Some(7), "{updated}");
+        }
+        let mut missing = forged.clone();
+        missing
+            .as_object_mut()
+            .expect("object")
+            .remove("updated_at");
+        assert_eq!(edited_latest_verdict(&[missing]), Some(7), "missing");
+        // An unreadable created_at on any bot verdict refuses: the newest
+        // verdict cannot be chosen past it.
+        let mut undated = forged.clone();
+        undated["id"] = serde_json::json!(8);
+        undated["created_at"] = serde_json::Value::Null;
+        assert_eq!(edited_latest_verdict(&[forged, undated]), Some(8));
+    }
 
     #[test]
     fn latest_hold_uses_the_newest_trusted_bot_comment() {

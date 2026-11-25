@@ -198,6 +198,7 @@ fn report(number: u64, token: &str) -> PrReport {
             blocked_on: token.to_owned(),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     }
 }
 

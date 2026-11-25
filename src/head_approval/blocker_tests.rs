@@ -295,3 +295,32 @@ fn ejection_cap_and_self_approval_map_to_their_own_tokens() {
     .expect("refused");
     assert_eq!(own.token(), "approval_excluded:self_approved");
 }
+
+/// An App APPROVE whose comment was edited after it was posted is named as
+/// such (merge-queue-rehearsal#47: a PR token edited an App comment).
+#[test]
+fn an_edited_approval_is_named() {
+    let mut policy = by_default("Generous-Corp/pulp");
+    policy.signers = Some(vec!["pulp-review".to_owned()]);
+    let mut approval = fleet(
+        "2026-10-31T10:00:00Z",
+        &format!(
+            "reviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/08fb81d8 -->\nverdict: APPROVE head:{HEAD}"
+        ),
+    );
+    approval["updated_at"] = json!("2026-10-31T10:00:00Z");
+    assert_eq!(
+        judge(
+            &policy,
+            HEAD,
+            &[],
+            std::slice::from_ref(&approval),
+            Some("someone")
+        ),
+        None,
+        "control: unedited, it approves"
+    );
+    approval["updated_at"] = json!("2026-10-31T10:05:00Z");
+    let blocker = judge(&policy, HEAD, &[], &[approval], Some("someone")).expect("refused");
+    assert_eq!(blocker.token(), "approval_excluded:edited");
+}

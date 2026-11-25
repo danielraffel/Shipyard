@@ -92,10 +92,164 @@ const GITHUB_ACTIONS_BOT_LOGIN: &str = "github-actions[bot]";
 /// which acts for GitHub Actions. Login and user ID must both match: any
 /// other creator, including a user or another app's bot that posts a status
 /// of the same name, does not act for the bound app.
+///
+/// A second app is recognized only when this host configures it
+/// ([`STATUS_APP_KEY`], [`set_status_app`]): the dedicated `review-verdict`
+/// App posts its status as its own bot user, and a rule bound to that app
+/// must find that status. Unset, nothing changes.
 #[must_use]
 pub fn status_creator_app_id(login: Option<&str>, user_id: Option<u64>) -> Option<u64> {
-    (login == Some(GITHUB_ACTIONS_BOT_LOGIN) && user_id == Some(GITHUB_ACTIONS_BOT_USER_ID))
-        .then_some(GITHUB_ACTIONS_APP_ID)
+    if login == Some(GITHUB_ACTIONS_BOT_LOGIN) && user_id == Some(GITHUB_ACTIONS_BOT_USER_ID) {
+        return Some(GITHUB_ACTIONS_APP_ID);
+    }
+    let app = configured_status_app()?;
+    (login == Some(app.bot_login.as_str()) && user_id == Some(app.bot_user_id)).then_some(app.id)
+}
+
+/// Machine-global config key naming the dedicated `review-verdict` App:
+/// `[merge_steward.review_verdict_app]` with `id`, `bot_login` and
+/// `bot_user_id`. Default unset.
+pub const STATUS_APP_KEY: &str = "merge_steward.review_verdict_app";
+
+/// An app whose bot user's commit statuses act for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusApp {
+    /// The App's database id, as a ruleset binds it.
+    pub id: u64,
+    /// The App's bot login, `<slug>[bot]`.
+    pub bot_login: String,
+    /// The bot user's database id.
+    pub bot_user_id: u64,
+}
+
+impl StatusApp {
+    /// The setting `value` names, `Ok(None)` when unset.
+    ///
+    /// # Errors
+    ///
+    /// When it is not a table of exactly a positive `id`, a `<slug>[bot]`
+    /// `bot_login` and a positive `bot_user_id`, or names GitHub Actions or
+    /// its bot: those already map, and a second mapping could only confuse.
+    pub fn from_value(value: Option<&toml::Value>) -> Result<Option<Self>, String> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let shape = || {
+            format!(
+                "{STATUS_APP_KEY} must be a table {{ id = <app id>, bot_login = \"<slug>[bot]\", \
+                 bot_user_id = <user id> }}"
+            )
+        };
+        let table = value.as_table().ok_or_else(shape)?;
+        if table
+            .keys()
+            .any(|key| !matches!(key.as_str(), "id" | "bot_login" | "bot_user_id"))
+        {
+            return Err(shape());
+        }
+        let positive = |key: &str| {
+            table
+                .get(key)
+                .and_then(toml::Value::as_integer)
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(shape)
+        };
+        let id = positive("id")?;
+        let bot_user_id = positive("bot_user_id")?;
+        let bot_login = table
+            .get("bot_login")
+            .and_then(toml::Value::as_str)
+            .filter(|login| login.len() > "[bot]".len() && login.ends_with("[bot]"))
+            .ok_or_else(shape)?
+            .to_owned();
+        if id == GITHUB_ACTIONS_APP_ID
+            || bot_user_id == GITHUB_ACTIONS_BOT_USER_ID
+            || bot_login.eq_ignore_ascii_case(GITHUB_ACTIONS_BOT_LOGIN)
+        {
+            return Err(format!(
+                "{STATUS_APP_KEY} names GitHub Actions; it must name the dedicated verdict App"
+            ));
+        }
+        Ok(Some(Self {
+            id,
+            bot_login,
+            bot_user_id,
+        }))
+    }
+
+    /// The setting in this host's machine-global config.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be read or the setting is malformed.
+    pub fn from_machine_global(global_dir: &std::path::Path) -> Result<Option<Self>, String> {
+        let config =
+            crate::config::LoadedConfig::load_machine_global_from_dir(global_dir.to_path_buf())
+                .map_err(|error| format!("{STATUS_APP_KEY} unreadable: {error}"))?;
+        Self::from_value(config.get(STATUS_APP_KEY))
+    }
+}
+
+static STATUS_APP: std::sync::RwLock<Option<StatusApp>> = std::sync::RwLock::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static STATUS_APP_PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STATUS_APP_OVERRIDE: std::cell::RefCell<Option<StatusApp>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Recognize `app`'s statuses for the rest of this process (the steward's
+/// entrypoints call it once with [`StatusApp::from_machine_global`]).
+pub fn set_status_app(app: Option<StatusApp>) {
+    *STATUS_APP
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = app;
+}
+
+/// Load this host's [`STATUS_APP_KEY`] and recognize it.
+///
+/// # Errors
+///
+/// When the setting is malformed: an entrypoint refuses to run rather than
+/// silently not recognizing an App a ruleset may already require.
+pub fn load_status_app(global_dir: &std::path::Path) -> Result<(), String> {
+    set_status_app(StatusApp::from_machine_global(global_dir)?);
+    Ok(())
+}
+
+fn process_status_app() -> Option<StatusApp> {
+    STATUS_APP
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+#[cfg(not(test))]
+fn configured_status_app() -> Option<StatusApp> {
+    process_status_app()
+}
+
+/// This thread's pinned app ([`with_status_app`]), else the process's.
+#[cfg(test)]
+fn configured_status_app() -> Option<StatusApp> {
+    if STATUS_APP_PINNED.with(std::cell::Cell::get) {
+        STATUS_APP_OVERRIDE.with(|cell| cell.borrow().clone())
+    } else {
+        process_status_app()
+    }
+}
+
+/// Run `body` with `app` as this thread's configured status app.
+#[cfg(test)]
+pub(crate) fn with_status_app<T>(app: Option<StatusApp>, body: impl FnOnce() -> T) -> T {
+    STATUS_APP_PINNED.with(|cell| cell.set(true));
+    STATUS_APP_OVERRIDE.with(|cell| *cell.borrow_mut() = app);
+    let result = body();
+    STATUS_APP_PINNED.with(|cell| cell.set(false));
+    STATUS_APP_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    result
 }
 
 /// One open pull request observed at an immutable head.
@@ -1202,6 +1356,54 @@ fn selected_checks<'a>(
                 required.label(),
                 selected_required_check(&pr.checks, required),
             )
+        })
+        .collect()
+}
+
+/// Which observation the steward selects for one required rule on a head:
+/// the rule, and the selected check's surface and producing app. The
+/// verdict-App rollout reads it before each ruleset bind, to prove this
+/// host picks the App's status for a rule bound to the App.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct RequiredSelection {
+    /// The rule's context.
+    pub context: String,
+    /// The app the rule is bound to, when it is.
+    pub required_app_id: Option<u64>,
+    /// `check_run` or `status`; absent when nothing satisfies the rule's binding.
+    pub selected_source: Option<&'static str>,
+    /// The selected observation's producing app, when known.
+    pub selected_app_id: Option<u64>,
+    /// The selected observation's conclusion, else its status.
+    pub selected_state: Option<String>,
+}
+
+/// [`RequiredSelection`] for every required rule of `policy` on `pr`.
+#[must_use]
+pub fn required_selections(
+    pr: &StewardPullRequest,
+    policy: &StewardPolicy,
+) -> Vec<RequiredSelection> {
+    policy
+        .required_checks
+        .iter()
+        .map(|required| {
+            let selected = selected_required_check(&pr.checks, required);
+            RequiredSelection {
+                context: required.context.clone(),
+                required_app_id: required.app_id,
+                selected_source: selected.map(|check| match check.source {
+                    StewardCheckSource::CheckRun => "check_run",
+                    StewardCheckSource::StatusContext => "status",
+                }),
+                selected_app_id: selected.and_then(|check| check.app_id),
+                selected_state: selected.map(|check| {
+                    check
+                        .conclusion
+                        .clone()
+                        .unwrap_or_else(|| check.status.clone())
+                }),
+            }
         })
         .collect()
 }

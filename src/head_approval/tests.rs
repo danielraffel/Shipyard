@@ -2852,9 +2852,11 @@ impl History {
             return Some(Ok("2026-10-11T00:00:00Z\n".to_owned()));
         }
         if joined.contains("pulls/7 --jq {head") {
-            return Some(Ok(json!({"head": self.approved, "base": "main",
+            return Some(Ok(
+                json!({"head": self.approved, "base": "main", "default_branch": "main",
                                   "author": "shipyard-local[bot]"})
-            .to_string()));
+                .to_string(),
+            ));
         }
         if joined.contains("/comments") {
             // With a base signer list the repository-side rule applies: a
@@ -4505,4 +4507,582 @@ fn a_non_boolean_fleet_review_switch_on_the_base_is_unreadable() {
             .expect("a boolean switch reads");
         assert!(policy.required, "{policy:?}");
     });
+}
+
+// ---------------------------------------------------------------------------
+// An edited verdict comment (merge-queue-rehearsal#47, 2026-11-24): a pull
+// request's own `GITHUB_TOKEN` with `pull-requests: write` edited an App
+// comment into new text, and the author stayed `shipyard-local[bot]`.
+// ---------------------------------------------------------------------------
+
+/// `comment` as GitHub reports it after an edit at `edited_at`.
+fn edited(mut comment: Value, edited_at: &str) -> Value {
+    comment["updated_at"] = json!(edited_at);
+    comment
+}
+
+#[test]
+fn an_edited_approve_does_not_approve_its_head() {
+    let policy = pulp_signed();
+    let approve = signed_verdict(
+        7,
+        "2026-11-24T01:52:01Z",
+        "pulp-review",
+        "fleet-pass-reviewer-1",
+        "APPROVE",
+        HEAD,
+    );
+    super::with_host_sessions(None, || {
+        // Control: the same comment, never edited (`updated_at == created_at`).
+        let unedited = edited(approve.clone(), "2026-11-24T01:52:01Z");
+        assert!(allows(&policy, &[unedited], None));
+        let forged = edited(approve.clone(), "2026-11-24T01:52:24Z");
+        assert!(!allows(&policy, std::slice::from_ref(&forged), None));
+        assert_eq!(
+            super::verdict_audit_events(HEAD, &[], &[forged], &policy, None),
+            vec!["excluded_edited_approval:shipyard-local[bot]".to_owned()]
+        );
+        // Times that cannot be compared count as edited.
+        assert!(!allows(&policy, &[edited(approve, "yesterday")], None));
+    });
+}
+
+#[test]
+fn an_edited_approve_of_an_earlier_head_names_no_head_a_carry_could_start_from() {
+    let policy = pulp_signed();
+    let approve = signed_verdict(
+        7,
+        "2026-11-24T01:52:01Z",
+        "pulp-review",
+        "fleet-pass-reviewer-1",
+        "APPROVE",
+        OTHER,
+    );
+    let input = |comments: &[Value]| {
+        super::verdict_heads(&super::CarryInput {
+            repo: "Generous-Corp/pulp",
+            pr: 1,
+            head: HEAD,
+            reviews: &[],
+            comments,
+            policy: &policy,
+            author: None,
+        })
+    };
+    super::with_host_sessions(None, || {
+        assert_eq!(
+            input(std::slice::from_ref(&approve)),
+            vec![OTHER.to_owned()]
+        );
+        assert!(input(&[edited(approve, "2026-11-24T01:52:24Z")]).is_empty());
+    });
+}
+
+#[test]
+fn an_edited_hold_still_holds() {
+    let policy = pulp_signed();
+    let comments = [
+        signed_verdict(
+            1,
+            "2026-10-31T14:40:00Z",
+            "pulp-review",
+            "fleet-pass-reviewer-1",
+            "APPROVE",
+            HEAD,
+        ),
+        edited(
+            signed_verdict(
+                2,
+                "2026-10-31T15:21:00Z",
+                "pulp-review",
+                "fleet-pass-reviewer-1",
+                "HOLD",
+                HEAD,
+            ),
+            "2026-10-31T15:30:00Z",
+        ),
+    ];
+    super::with_host_sessions(None, || {
+        assert!(allows(&policy, &comments[..1], None));
+        assert!(!allows(&policy, &comments, None));
+    });
+}
+
+#[test]
+fn every_comment_record_reader_carries_updated_at() {
+    // Without `updated_at` an edit is invisible to `comment_edited`.
+    assert!(super::COMMENT_RECORD_JQ.contains("updated_at: .updated_at"));
+}
+
+/// A `gh` for `Generous-Corp/pulp#7` whose only comment is a signed App
+/// APPROVE of `HEAD`, read the way `COMMENT_RECORD_JQ` reads it (equal REST
+/// times), with `edited` as its GraphQL `lastEditedAt` answer.
+fn same_second_gh(edited: Result<Value, String>) -> impl Fn(&[String]) -> Result<String, String> {
+    move |args: &[String]| {
+        let joined = args.join(" ");
+        if joined.contains("contents/.shipyard/config.toml") {
+            Ok("[auto_merge]\nreviewer_signers = [\"pulp-review\"]\n".to_owned())
+        } else if joined.contains("lastEditedAt") {
+            assert!(joined.contains("id=IC_node7"), "{joined}");
+            edited.clone().map(|value| value.to_string())
+        } else if joined.contains("/reviews") {
+            Ok(String::new())
+        } else if joined.contains("/comments") {
+            Ok(json!({"id": 7, "node_id": "IC_node7", "login": "shipyard-local[bot]",
+                      "type": "Bot", "association": "CONTRIBUTOR",
+                      "at": "2026-10-12T01:00:00Z", "updated_at": "2026-10-12T01:00:00Z",
+                      "body": format!("reviewer: pulp-review\n<!-- session: \
+                                       Daniels-Mac-Studio-m3/r1 -->\nverdict: APPROVE head:{HEAD}")})
+            .to_string())
+        } else if joined.contains(".commit.committer.date") {
+            Ok("2026-10-12T00:00:00Z\n".to_owned())
+        } else if joined.contains("pulls/7 --jq .user.login") {
+            Ok("someone\n".to_owned())
+        } else {
+            Err(format!("unexpected gh call: {joined}"))
+        }
+    }
+}
+
+/// REST times have one-second resolution: an APPROVE edited in the second it
+/// was posted reads `updated_at == created_at`. GraphQL's `lastEditedAt`
+/// still shows the edit, and an unreadable answer is never an approval.
+#[test]
+fn an_approve_edited_in_its_own_second_is_refused_by_graphql() {
+    let judge = |edited: Result<Value, String>| {
+        let gh = same_second_gh(edited);
+        super::with_host_sessions(None, || {
+            let policy = super::read_policy_repository_side(&gh, "Generous-Corp/pulp", "main")
+                .expect("policy");
+            super::evaluate_with_policy_for_author_with_diagnosis(
+                &gh,
+                "Generous-Corp/pulp",
+                7,
+                HEAD,
+                &policy,
+                &empty_queue(HEAD),
+                Some("someone"),
+            )
+        })
+    };
+    let (gate, _, blocker) =
+        judge(Ok(json!({"data": {"node": {"lastEditedAt": null}}}))).expect("readable");
+    assert!(gate.allows(), "control: never edited: {gate:?}");
+    assert_eq!(blocker, None);
+    let (gate, _, blocker) = judge(Ok(json!({"data": {"node": {
+        "lastEditedAt": "2026-10-12T01:00:00Z"}}})))
+    .expect("readable");
+    assert!(!gate.allows(), "{gate:?}");
+    assert_eq!(
+        blocker.map(|blocker| blocker.token()),
+        Some("approval_excluded:edited".to_owned())
+    );
+    assert!(judge(Err("gh: HTTP 502".to_owned())).is_err());
+    assert!(judge(Ok(json!({"data": {"node": null}}))).is_err());
+    // Errors beside partial data are not an answer.
+    assert!(
+        judge(Ok(json!({"data": {"node": {"lastEditedAt": null}},
+                        "errors": [{"message": "rate limited"}]})))
+        .is_err()
+    );
+}
+
+/// A comment read from the API (it carries `updated_at`) with no `node_id`
+/// cannot be checked, so it never approves.
+#[test]
+fn an_api_comment_with_no_node_id_never_approves() {
+    let comments = [json!({"id": 7, "at": "2026-10-12T01:00:00Z",
+                           "updated_at": "2026-10-12T01:00:00Z"})];
+    let approved = HeadGate::Approved {
+        approval: Approval::Marker {
+            login: "shipyard-local[bot]".to_owned(),
+            comment_id: Some(7),
+            performed_via_github_app_id: None,
+        },
+    };
+    let gh = |_: &[String]| -> Result<String, String> { panic!("no read without a node id") };
+    assert!(super::edit_checked(&gh, HEAD, &comments, approved.clone()).is_err());
+    let mut with_node = comments[0].clone();
+    with_node["node_id"] = json!("IC_7");
+    let gh = |_: &[String]| Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+    assert!(
+        super::edit_checked(&gh, HEAD, &[with_node], approved)
+            .expect("readable")
+            .allows()
+    );
+}
+
+/// The deciding APPROVE comment must carry its edit metadata: with no
+/// `updated_at`, or a null or non-string one, the GraphQL edit check is never
+/// skipped and the head is never approved.
+#[test]
+fn a_deciding_comment_without_edit_metadata_never_approves() {
+    let approved = HeadGate::Approved {
+        approval: Approval::Marker {
+            login: "shipyard-local[bot]".to_owned(),
+            comment_id: Some(7),
+            performed_via_github_app_id: None,
+        },
+    };
+    let gh = |_: &[String]| Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+    let good = json!({"id": 7, "node_id": "IC_7", "at": "2026-10-12T01:00:00Z",
+                      "updated_at": "2026-10-12T01:00:00Z"});
+    assert!(
+        super::edit_checked(&gh, HEAD, std::slice::from_ref(&good), approved.clone())
+            .expect("control: readable")
+            .allows()
+    );
+    let mut missing = good.clone();
+    missing
+        .as_object_mut()
+        .expect("object")
+        .remove("updated_at");
+    let mut shapes = vec![missing];
+    for bad in [Value::Null, json!(5), json!(true)] {
+        let mut record = good.clone();
+        record["updated_at"] = bad;
+        shapes.push(record);
+    }
+    for record in shapes {
+        assert!(
+            super::edit_checked(&gh, HEAD, std::slice::from_ref(&record), approved.clone())
+                .is_err(),
+            "{record}"
+        );
+    }
+}
+
+/// An edited APPROVE from a listed human, or a listed reviewer identity,
+/// counts no more than the App's.
+#[test]
+fn an_edited_approve_by_a_listed_human_or_reviewer_does_not_count() {
+    let human = |updated: &str| {
+        let mut comment = person(
+            "danielraffel",
+            "OWNER",
+            &format!("verdict: APPROVE head:{HEAD}"),
+        );
+        comment["updated_at"] = json!(updated);
+        comment
+    };
+    let humans = by_default_with_humans("danielraffel/tartci", &["danielraffel"]);
+    assert!(allows(
+        &humans,
+        &[human("2026-10-12T01:00:00Z")],
+        Some("author")
+    ));
+    assert!(!allows(
+        &humans,
+        &[human("2026-10-12T01:00:09Z")],
+        Some("author")
+    ));
+    let listed = required(&["danielraffel"]);
+    assert!(allows(
+        &listed,
+        &[human("2026-10-12T01:00:00Z")],
+        Some("author")
+    ));
+    assert!(!allows(
+        &listed,
+        &[human("2026-10-12T01:00:09Z")],
+        Some("author")
+    ));
+}
+
+/// Times that cannot be compared count as edited: a null or other
+/// non-string, an unparseable string, or a missing creation time. Only a
+/// record with no `updated_at` key at all (a review) is not an edit.
+#[test]
+fn noncomparable_edit_times_count_as_edited() {
+    let record = |updated: Value| json!({"at": "2026-10-12T01:00:00Z", "updated_at": updated});
+    assert!(!super::comment_edited(&record(json!(
+        "2026-10-12T01:00:00Z"
+    ))));
+    assert!(!super::comment_edited(
+        &json!({"at": "2026-10-12T01:00:00Z"})
+    ));
+    for bad in [
+        Value::Null,
+        json!(5),
+        json!(true),
+        json!("yesterday"),
+        json!(""),
+    ] {
+        assert!(super::comment_edited(&record(bad.clone())), "{bad}");
+    }
+    assert!(super::comment_edited(
+        &json!({"updated_at": "2026-10-12T01:00:00Z"})
+    ));
+}
+
+/// Both edit stamps are parsed before they are compared: identical malformed
+/// strings are not "never edited", so an APPROVE carrying them never counts,
+/// even when GraphQL reports `lastEditedAt: null`.
+#[test]
+fn identical_malformed_edit_stamps_count_as_edited() {
+    let at = "2026-10-12T01:00:00Z";
+    let record = |created: Value, updated: Value| json!({"at": created, "updated_at": updated});
+    assert_eq!(super::comment_edit_stamps(&json!({"at": at})), Ok(None));
+    assert!(matches!(
+        super::comment_edit_stamps(&record(json!(at), json!(at))),
+        Ok(Some((created, updated))) if created == updated
+    ));
+    let malformed = [
+        (json!("yesterday"), json!("yesterday")),
+        (json!(""), json!("")),
+        (json!("2026-10-12"), json!("2026-10-12")),
+        (Value::Null, Value::Null),
+        (json!(5), json!(5)),
+        (json!({}), json!({})),
+        (json!([]), json!([])),
+        (json!(true), json!(true)),
+        (json!(at), json!("yesterday")),
+        (json!("yesterday"), json!(at)),
+        (Value::Null, json!(at)),
+    ];
+    for (created, updated) in malformed {
+        let bad = record(created, updated);
+        assert!(super::comment_edit_stamps(&bad).is_err(), "{bad}");
+        assert!(super::comment_edited(&bad), "{bad}");
+    }
+    let mut missing_at = record(json!(at), json!(at));
+    missing_at.as_object_mut().expect("object").remove("at");
+    assert!(super::comment_edit_stamps(&missing_at).is_err());
+    assert!(super::comment_edited(&missing_at));
+
+    // The deciding APPROVE with identical malformed stamps is refused even
+    // when GraphQL says it was never edited.
+    let approved = HeadGate::Approved {
+        approval: Approval::Marker {
+            login: "shipyard-local[bot]".to_owned(),
+            comment_id: Some(7),
+            performed_via_github_app_id: None,
+        },
+    };
+    let gh = |_: &[String]| Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
+    let good = json!({"id": 7, "node_id": "IC_7", "at": at, "updated_at": at});
+    assert!(
+        super::edit_checked(&gh, HEAD, std::slice::from_ref(&good), approved.clone())
+            .expect("control: readable")
+            .allows()
+    );
+    let mut bad = good.clone();
+    bad["at"] = json!("yesterday");
+    bad["updated_at"] = json!("yesterday");
+    assert!(super::edit_checked(&gh, HEAD, std::slice::from_ref(&bad), approved).is_err());
+}
+
+/// Every field the gate judges a verdict by, fed a table of malformed
+/// variants: each refuses the records, never drops the verdict.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_verdict_record_with_any_malformed_identity_field_refuses() {
+    const HEAD: &str = "fd0e94e25f447578256f3aae97cc0ab6103d5f0c";
+    let policy = by_default("danielraffel/Shipyard");
+    let hold = json!({"id": 1, "login": "someone", "type": "User", "association": "OWNER",
+                      "at": "2026-11-25T00:00:00Z", "updated_at": "2026-11-25T00:00:00Z",
+                      "body": format!("verdict: HOLD head:{HEAD}")});
+    let app = json!({"id": 2, "login": "shipyard-local[bot]", "type": "Bot",
+                     "association": "NONE", "body": format!("verdict: HOLD head:{HEAD}")});
+    let review = json!({"id": 3, "login": "someone", "type": "User", "association": "MEMBER",
+                        "state": "CHANGES_REQUESTED", "commit_id": HEAD});
+    assert_eq!(
+        super::verdict_records_checked(
+            std::slice::from_ref(&review),
+            &[hold.clone(), app.clone()],
+            &policy
+        ),
+        Ok(()),
+        "control"
+    );
+    let bad_logins = [
+        json!(""),
+        json!(" "),
+        json!(" someone"),
+        json!("someone "),
+        json!("some one"),
+        json!("x".repeat(40)),
+        json!("-x"),
+        json!("x\n"),
+        json!("x[BOT]"),
+        json!(5),
+        json!(null),
+        json!(["someone"]),
+    ];
+    let bad_enum = |good: &str| {
+        vec![
+            json!(""),
+            json!(format!(" {good}")),
+            json!(good.to_ascii_lowercase()),
+            json!("unknown"),
+            json!(5),
+            json!(null),
+            json!([good]),
+        ]
+    };
+    let bad_shas = [
+        json!(""),
+        json!(HEAD.to_ascii_uppercase()),
+        json!(&HEAD[..39]),
+        json!(format!("{HEAD}0")),
+        json!(format!(" {HEAD}")),
+        json!("g".repeat(40)),
+        json!(5),
+        json!(null),
+    ];
+    let refuses = |reviews: &[Value], comments: &[Value], what: &str| {
+        assert!(
+            super::verdict_records_checked(reviews, comments, &policy).is_err(),
+            "{what}"
+        );
+    };
+    let set = |record: &Value, key: &str, value: Option<&Value>| {
+        let mut record = record.clone();
+        match value {
+            Some(value) => record[key] = value.clone(),
+            None => {
+                record.as_object_mut().expect("object").remove(key);
+            }
+        }
+        record
+    };
+    for value in bad_logins.iter().map(Some).chain([None]) {
+        refuses(
+            &[],
+            &[set(&hold, "login", value)],
+            &format!("comment login {value:?}"),
+        );
+        refuses(
+            &[set(&review, "login", value)],
+            &[],
+            &format!("review login {value:?}"),
+        );
+    }
+    for value in bad_enum("OWNER").iter().map(Some).chain([None]) {
+        refuses(
+            &[],
+            &[set(&hold, "association", value)],
+            &format!("association {value:?}"),
+        );
+        refuses(
+            &[set(&review, "association", value)],
+            &[],
+            &format!("association {value:?}"),
+        );
+    }
+    for value in bad_enum("Bot").iter().map(Some).chain([None]) {
+        refuses(
+            &[],
+            &[set(&app, "type", value)],
+            &format!("App type {value:?}"),
+        );
+    }
+    for value in bad_enum("CHANGES_REQUESTED").iter().map(Some).chain([None]) {
+        refuses(
+            &[set(&review, "state", value)],
+            &[],
+            &format!("state {value:?}"),
+        );
+    }
+    for value in bad_shas.iter().map(Some).chain([None]) {
+        refuses(
+            &[set(&review, "commit_id", value)],
+            &[],
+            &format!("commit_id {value:?}"),
+        );
+    }
+    for value in [json!(5), json!(null), json!(["x"])] {
+        refuses(
+            &[],
+            &[set(&hold, "body", Some(&value))],
+            &format!("body {value:?}"),
+        );
+    }
+    // Controls: a record with no verdict is never judged, and a field the
+    // policy never reads (an association under a reviewer list) is not
+    // checked.
+    let plain = json!({"id": 4, "login": null, "body": "thanks"});
+    let commented = json!({"id": 5, "login": null, "state": "COMMENTED"});
+    assert_eq!(
+        super::verdict_records_checked(&[commented], &[plain], &policy),
+        Ok(())
+    );
+    assert_eq!(
+        super::verdict_records_checked(
+            &[],
+            &[set(&hold, "association", None)],
+            &required(&["someone"])
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn logins_and_shas_follow_githubs_canonical_form() {
+    for login in [
+        "someone",
+        "shipyard-local[bot]",
+        "app/shipyard-local",
+        "A-b-1",
+        &"a".repeat(39),
+    ] {
+        assert!(super::is_login(login), "{login}");
+    }
+    for login in [
+        "",
+        " ",
+        "-x",
+        "a b",
+        "x[BOT]",
+        "x[bot] ",
+        &"a".repeat(40),
+        "a@b",
+    ] {
+        assert!(!super::is_login(login), "{login:?}");
+    }
+    assert!(super::is_api_sha(
+        "fd0e94e25f447578256f3aae97cc0ab6103d5f0c"
+    ));
+    for sha in [
+        "",
+        "FD0E94E25F447578256F3AAE97CC0AB6103D5F0C",
+        "fd0e94e25f447578256f3aae97cc0ab6103d5f0",
+        " fd0e94e25f447578256f3aae97cc0ab6103d5f0",
+        "gd0e94e25f447578256f3aae97cc0ab6103d5f0c",
+    ] {
+        assert!(!super::is_api_sha(sha), "{sha:?}");
+    }
+}
+
+/// The author read for the self-approval rule must be a canonical login:
+/// an empty or malformed one would read as "nobody to exclude".
+#[test]
+fn pr_author_refuses_a_non_canonical_login() {
+    let policy = by_default("danielraffel/Shipyard");
+    let read = |answer: &'static str| {
+        let gh = move |_: &[String]| -> Result<String, String> { Ok(answer.to_owned()) };
+        super::pr_author(&gh, "danielraffel/Shipyard", 7, &policy, None)
+    };
+    assert_eq!(read("someone\n"), Ok(Some("someone".to_owned())), "control");
+    for answer in ["", "\n", " \n", " someone\n", "some one\n", "someone \n"] {
+        assert!(read(answer).is_err(), "{answer:?}");
+    }
+    let gh = |_: &[String]| -> Result<String, String> { Err("not read".to_owned()) };
+    for known in ["", " someone", "some one"] {
+        assert!(
+            super::pr_author(&gh, "danielraffel/Shipyard", 7, &policy, Some(known)).is_err(),
+            "{known:?}"
+        );
+    }
+    assert_eq!(
+        super::pr_author(
+            &gh,
+            "danielraffel/Shipyard",
+            7,
+            &policy,
+            Some("app/shipyard-local")
+        ),
+        Ok(Some("app/shipyard-local".to_owned())),
+        "control: GraphQL's App login"
+    );
 }

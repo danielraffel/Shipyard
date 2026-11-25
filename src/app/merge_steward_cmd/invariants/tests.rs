@@ -52,6 +52,7 @@ fn row(number: u64, blocked_on: &str, since: &str, error: Option<&str>) -> PrRep
             since: Some(since.to_owned()),
             ..Stall::default()
         },
+        required_checks: Vec::new(),
     }
 }
 

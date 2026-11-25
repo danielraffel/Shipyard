@@ -1880,7 +1880,7 @@ class BatchAttributionTests(unittest.TestCase):
             approval["body"] = f"Delta review.\n\nverdict: APPROVE head:{head}"
             for index, body in enumerate(
                 (
-                    {"number": 8811, "base": {"ref": "main"}, "head": {"sha": head},
+                    {"number": 8811, "base": {"ref": "main", "repo": {"default_branch": "main"}}, "head": {"sha": head},
                      "user": {"login": "shipyard-local[bot]"}},
                     [[approval]],
                     [[]],
@@ -1894,6 +1894,9 @@ class BatchAttributionTests(unittest.TestCase):
                 f"printf '%s\\n' \"$*\" >> '{guards / 'calls'}'\n"
                 "case \"$*\" in *contents/.shipyard/config.toml*)\n"
                 "  echo 'gh: Not Found (HTTP 404)' >&2; exit 1;; esac\n"
+                # The deciding approval comment's edit history: never edited.
+                "case \"$*\" in *lastEditedAt*)\n"
+                "  echo '{\"data\": {\"node\": {\"lastEditedAt\": null}}}'; exit 0;; esac\n"
                 f"n=$(cat '{guards / 'n'}' 2>/dev/null || echo 0)\n"
                 f"echo $((n+1)) > '{guards / 'n'}'\n"
                 f"cat '{answers}'/$n.json\n",
@@ -1961,7 +1964,7 @@ class FakeApi:
             self.json[f"repos/{REPO}/commits/{sha}/check-runs?per_page=100"] = commit["check_runs"]
             self.json[f"repos/{REPO}/commits/{sha}/status"] = commit["status"]
         for pr in (8678, 8911, 8933):
-            self.json[f"repos/{REPO}/pulls/{pr}"] = {"base": {"ref": "main"}}
+            self.json[f"repos/{REPO}/pulls/{pr}"] = {"base": {"ref": "main", "repo": {"default_branch": "main"}}}
         self.text: dict[str, Any] = {}
         for name in (
             "job_real_pip_relay_403.json",
@@ -2545,8 +2548,12 @@ APPROVE_784_COMMENT = 6127196414
 
 
 def comment_like(template: dict[str, Any], **change: Any) -> dict[str, Any]:
-    """A copy of a captured comment with some fields changed."""
+    """A copy of a captured comment with some fields changed. A new
+    ``created_at`` moves ``updated_at`` with it unless the change names one:
+    the copy is an unedited comment posted then, not an edited one."""
     value = copy.deepcopy(template)
+    if "created_at" in change and "updated_at" not in change:
+        value["updated_at"] = change["created_at"]
     value.update(change)
     return value
 
@@ -2692,6 +2699,8 @@ class ReviewBeforeArm(unittest.TestCase):
              extra: list[tuple[str, dict[str, Any]]] | None = None) -> list[tuple[str, dict[str, Any]]]:
         config_answer = {"error": "gh: Not Found (HTTP 404)"} if config is None else {"text": config}
         return [
+            # The deciding APPROVE comment's GraphQL edit history: never edited.
+            ("lastEditedAt", {"json": {"data": {"node": {"lastEditedAt": None}}}}),
             ("contents/.shipyard/config.toml", config_answer),
             ("mergeQueue(branch", {"json": {"data": {"repository": {
                 "mergeQueue": {"id": "MQ_1"} if queue else None}}}}),
@@ -4332,8 +4341,53 @@ class ReviewIdentity(unittest.TestCase):
     def comment(self, login: str, body: str, at: str | None = "2026-10-12T01:00:00Z",
                 association: str = "COLLABORATOR") -> dict[str, Any]:
         kind = "Bot" if login.endswith("[bot]") else "User"
-        return {"user": {"login": login, "type": kind}, "created_at": at, "body": body,
-                "author_association": association}
+        return {"user": {"login": login, "type": kind}, "created_at": at, "updated_at": at,
+                "body": body, "author_association": association}
+
+    def test_an_edited_approve_never_counts_and_an_edited_hold_still_holds(self) -> None:
+        # merge-queue-rehearsal#47: a pull request's own GITHUB_TOKEN edited an
+        # App comment; the author stayed shipyard-local[bot] and only
+        # updated_at moved.
+        approve = dict(self.comment("shipyard-local[bot]", f"verdict: APPROVE head:{self.HEAD}",
+                                    association="CONTRIBUTOR"),
+                       updated_at="2026-10-12T01:00:00Z")
+        self.assertTrue(guard.review_verdict(self.HEAD, "author", [approve], [],
+                                             self.policy())[0], "control: unedited")
+        edited = dict(approve, updated_at="2026-10-12T01:00:23Z")
+        guard.EXCLUDED_APPROVALS.clear()
+        self.assertFalse(guard.review_verdict(self.HEAD, "author", [edited], [], self.policy())[0])
+        self.assertEqual(guard.EXCLUDED_APPROVALS,
+                         ["shipyard-local[bot] (it was edited after it was posted)"])
+        self.assertEqual(guard.approved_earlier_head(
+            "c" * 40, "author", [approve], [], self.policy()), self.HEAD.lower())
+        self.assertIsNone(guard.approved_earlier_head(
+            "c" * 40, "author", [edited], [], self.policy()), "an edited APPROVE does not carry")
+        hold = dict(self.comment("shipyard-local[bot]", f"verdict: HOLD head:{self.HEAD}",
+                                 at="2026-10-12T02:00:00Z", association="CONTRIBUTOR"),
+                    updated_at="2026-10-12T02:05:00Z")
+        self.assertFalse(guard.review_verdict(self.HEAD, "author", [approve, hold], [],
+                                              self.policy())[0])
+
+    def test_unreadable_or_noncomparable_edit_times_count_as_edited(self) -> None:
+        base = {"created_at": "2026-10-12T01:00:00Z"}
+        self.assertFalse(guard.comment_edited(dict(base, updated_at="2026-10-12T01:00:00Z")))
+        for updated in ("yesterday", "2026-10-12T01:00:00", 5, "", None):
+            self.assertTrue(guard.comment_edited(dict(base, updated_at=updated)), updated)
+        self.assertTrue(guard.comment_edited(base), "a missing updated_at")
+        self.assertTrue(guard.comment_edited({"created_at": None, "updated_at": "x"}))
+        # Malformed values that are equal still count as edited.
+        for same in ("yesterday", "", "2026-10-12T01:00:00"):
+            self.assertTrue(guard.comment_edited({"created_at": same, "updated_at": same}), same)
+
+    def test_a_listed_humans_edited_approve_does_not_count(self) -> None:
+        approve = dict(self.comment("danielraffel", f"verdict: APPROVE head:{self.HEAD}",
+                                    association="OWNER"), updated_at="2026-10-12T01:00:00Z")
+        listed = self.policy(("danielraffel",))
+        self.assertTrue(guard.review_verdict(self.HEAD, "author", [approve], [], listed)[0])
+        edited = dict(approve, updated_at="2026-10-12T01:00:09Z")
+        self.assertFalse(guard.review_verdict(self.HEAD, "author", [edited], [], listed)[0])
+        self.assertIsNone(guard._deciding_approval_comment(
+            self.HEAD, "author", [edited], [], listed))
 
     def policy(self, humans: tuple[str, ...] = ()) -> dict[str, Any]:
         policy = guard.review_policy(None, "danielraffel/tartci", True)
@@ -4419,6 +4473,7 @@ class ReviewIdentity(unittest.TestCase):
             for association in ("NONE", "OWNER"):
                 spoof = {"user": {"login": login, "type": "User"}, "author_association": association,
                          "created_at": "2026-10-12T01:00:00Z",
+                         "updated_at": "2026-10-12T01:00:00Z",
                          "body": f"reviewer: pulp-review\nverdict: APPROVE head:{self.HEAD}"}
                 self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [spoof], [],
                                                       self.policy())[0], (login, association))
@@ -4434,6 +4489,9 @@ class ReviewIdentity(unittest.TestCase):
 
     def incident(self, name: str) -> tuple[dict[str, Any], str]:
         comment = review_fixture(name)
+        # The trimmed capture keeps no updated_at; the live comment was
+        # never edited.
+        comment.setdefault("updated_at", comment.get("created_at"))
         head = guard.marker_verdict(comment["body"])[1]
         return comment, head
 
@@ -4970,7 +5028,8 @@ class HoldMakesHeadUnapprovable(unittest.TestCase):
         body = (f"Review.\nreviewer: {signer}\n"
                 f"<!-- session: Daniels-Mac-Studio-m3/{session} -->\nverdict: {verdict} head:{head}")
         return {"id": comment_id, "user": {"login": "shipyard-local[bot]", "type": "Bot"},
-                "created_at": at, "body": body, "author_association": "CONTRIBUTOR"}
+                "created_at": at, "updated_at": at, "body": body,
+                "author_association": "CONTRIBUTOR"}
 
     def judge(self, comments: list[dict[str, Any]],
               reviews: list[dict[str, Any]] | None = None) -> tuple[bool, str]:
@@ -5007,7 +5066,8 @@ class HoldMakesHeadUnapprovable(unittest.TestCase):
 
     def test_a_hold_from_a_login_that_does_not_count_is_ignored(self) -> None:
         drive_by = {"id": 9, "user": {"login": "drive-by", "type": "User"},
-                    "created_at": "2026-10-31T14:00:00Z", "author_association": "NONE",
+                    "created_at": "2026-10-31T14:00:00Z", "updated_at": "2026-10-31T14:00:00Z",
+                    "author_association": "NONE",
                     "body": f"verdict: HOLD head:{self.HEAD}"}
         allowed, why = self.judge([
             drive_by,
@@ -5310,7 +5370,8 @@ class ReviewerClaimReviewGate(unittest.TestCase):
                 "output": {"summary": json.dumps(summary)}}
 
     def gate(self, check_runs: list[dict[str, Any]]) -> tuple[bool, str, Any]:
-        pull = {"base": {"ref": "main"}, "head": {"sha": self.head, "ref": "feature/x"},
+        pull = {"base": {"ref": "main", "repo": {"default_branch": "main"}},
+                "head": {"sha": self.head, "ref": "feature/x"},
                 "user": {"login": "author"}}
 
         def real_gh(arguments: list[str]) -> Any:
@@ -5321,13 +5382,19 @@ class ReviewerClaimReviewGate(unittest.TestCase):
                 return pull
             raise AssertionError(f"unexpected gh read {arguments}")
 
-        approval = {"verdict_comment_id": 1, "signer": "pulp-review",
+        def real_gh_or_graphql(arguments: list[str]) -> Any:
+            if any("lastEditedAt" in arg for arg in arguments):
+                return {"data": {"node": {"lastEditedAt": None}}}
+            return real_gh(arguments)
+
+        approval = {"verdict_comment_id": 1, "verdict_node_id": "IC_1", "verdict_from_api": True,
+                    "signer": "pulp-review",
                     "approved_head": self.head, "approved_at": "2026-10-27T20:30:00Z"}
         target = {"repo": self.repo, "pr": 11, "head": self.head, "bound_head": self.head}
         with tempfile.TemporaryDirectory() as guards, \
                 mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": guards}), \
                 mock.patch.object(guard, "host_review_default", return_value=True), \
-                mock.patch.object(guard, "run_real_gh", side_effect=real_gh), \
+                mock.patch.object(guard, "run_real_gh", side_effect=real_gh_or_graphql), \
                 mock.patch.object(guard, "base_config_text", return_value=self.config), \
                 mock.patch.object(guard, "_rest_pages", return_value=[]), \
                 mock.patch.object(guard, "review_verdict",

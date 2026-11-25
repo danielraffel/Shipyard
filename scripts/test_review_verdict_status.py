@@ -100,6 +100,14 @@ class AwaitingClassification(unittest.TestCase):
         self.assertTrue(text.startswith("awaiting reviewer verdict; 31 approvals excluded"))
 
 
+def plain_comment_event() -> dict[str, Any]:
+    """An ``issue_comment`` payload on PR 784 whose comment is no verdict."""
+    return {"action": "created",
+            "comment": {"id": 1, "body": "thanks", "user": {"login": "someone", "type": "User"},
+                        "author_association": "NONE"},
+            "issue": {"number": 784, "pull_request": {"url": "x"}}}
+
+
 class ReviewVerdictStatus(unittest.TestCase):
     install = arm.ReviewBeforeArm.install
     case = arm.ReviewBeforeArm.case
@@ -109,6 +117,8 @@ class ReviewVerdictStatus(unittest.TestCase):
     def setUp(self) -> None:
         self.root = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, True)
+        # Statuses already on the head (``held_in_history``): none by default.
+        self.history: list[dict[str, Any]] = []
         self.guards = self.root / "guards"
         self.guards.mkdir()
         shutil.copy(arm.SCRIPT, self.guards / "queue-arm-guard")
@@ -134,6 +144,8 @@ class ReviewVerdictStatus(unittest.TestCase):
         answers = self.case("shipyard-784", queue=False, comments=[trail], config=config,
                             graphql=arm.opened(arm.review_fixture("shipyard-784-graphql.json")))
         answers.insert(0, ("/statuses/", {"json": {"state": "posted"}}))
+        # The head's status history, read for a HOLD this job posted before.
+        answers.insert(0, (f"/commits/{HEAD}/statuses?", {"pages": [self.history]}))
         # The head's own pull_request_target run, which a comment or review
         # re-runs so its check follows the verdict.
         answers.insert(0, ("/actions/runs/555/rerun", {"text": ""}))
@@ -154,11 +166,11 @@ class ReviewVerdictStatus(unittest.TestCase):
         return arm.comment_like(template, body=body, created_at=at, **change)
 
     def post(self, answers: list[tuple[str, dict[str, Any]]], event_name: str = "issue_comment",
-             event: dict[str, Any] | None = None, ref: str = "refs/heads/main") -> subprocess.CompletedProcess:
+             event: dict[str, Any] | None = None, ref: str = "refs/heads/main",
+             **env: str) -> subprocess.CompletedProcess:
         (self.root / "calls").unlink(missing_ok=True)
         fake = self.install(answers)
-        payload = event if event is not None else {
-            "issue": {"number": 784, "pull_request": {"url": "x"}}}
+        payload = event if event is not None else plain_comment_event()
         event_path = self.root / "event.json"
         payload.setdefault("repository", {"default_branch": "main"})
         event_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -170,6 +182,7 @@ class ReviewVerdictStatus(unittest.TestCase):
                        "SHIPYARD_REBASE_CARRY": "0", "SHIPYARD_REVIEW_BEFORE_ARM": "0",
                        # Nor its signers file, which would allow anyone here.
                        "SHIPYARD_GHAPP_GUARDS_DIR": str(self.permissive_guards())}
+        environment.update(env)
         return subprocess.run([sys.executable, str(self.scripts / STATUS.name)], env=environment,
                               capture_output=True, text=True, check=False,
                               stdin=subprocess.DEVNULL)
@@ -637,3 +650,981 @@ class ReviewVerdictStatus(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# A pull request's own workflow token can edit or delete any comment and keep
+# its author (merge-queue-rehearsal#47, runs 45528887180 and 45529945081).
+HOLD_BODY = f"Findings.\nreviewer: pulp-review\n{STAMP}\nverdict: HOLD head:{HEAD}"
+
+# A key the variant table removes rather than sets.
+MISSING = object()
+# Logins GitHub never sends: empty, padded, inner space, too long, a leading
+# hyphen, a control character, or not a string at all.
+BAD_LOGINS = ("", " ", "   ", " someone", "someone ", "some one", "x" * 40, "-x", "x\n",
+              "x[bot] ", "x[BOT]", "a@b", 5, True, None, ["someone"], {})
+# Shas GitHub never sends: empty, padded, upper case, short, long, not hex,
+# or not a string.
+BAD_SHAS = ("", " ", HEAD.upper(), HEAD[:39], HEAD + "0", f" {HEAD}", f"{HEAD}\n",
+            "g" * 40, 5, None, [HEAD], {})
+# Pull request numbers and record ids GitHub never sends.
+BAD_NUMBERS = (0, -1, True, False, "784", 784.0, None, [784], 2 ** 64)
+
+OPT_OUT = "[auto_merge]\narm_requires_head_approval = false\n"
+
+
+class TamperedVerdicts(unittest.TestCase):
+    """Edited and deleted verdict comments, and a chosen base."""
+
+    install = ReviewVerdictStatus.install
+    case = ReviewVerdictStatus.case
+    run_guard = ReviewVerdictStatus.run_guard
+    calls = ReviewVerdictStatus.calls
+    setUp = ReviewVerdictStatus.setUp
+    permissive_guards = ReviewVerdictStatus.permissive_guards
+    answers = ReviewVerdictStatus.answers
+    comment = ReviewVerdictStatus.comment
+    post = ReviewVerdictStatus.post
+    posted = ReviewVerdictStatus.posted
+    judged = ReviewVerdictStatus.judged
+
+    def approved(self) -> list[dict[str, Any]]:
+        return [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
+
+    def statuses(self) -> list[str]:
+        return [line for line in self.calls().splitlines() if f"statuses/{HEAD} " in line
+                or line.endswith(f"statuses/{HEAD}")]
+
+    def comment_event(self, action: str, body: str, before: str | None = None) -> dict[str, Any]:
+        comment = self.comment(body, "2026-10-12T16:00:00Z", id=9)
+        event: dict[str, Any] = {"action": action, "comment": comment,
+                                 "issue": {"number": 784, "pull_request": {"url": "x"}}}
+        if before is not None:
+            event["changes"] = {"body": {"from": before}}
+        return event
+
+    def test_an_edited_approve_is_not_success(self) -> None:
+        self.assertEqual(self.judged(self.approved(), SIGNERS), "success")  # control
+        trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z",
+                              updated_at="2026-10-12T15:00:23Z")]
+        self.assertEqual(self.judged(trail, SIGNERS), "pending")
+        self.assertIn("edited", self.posted()["description"])
+
+    def test_an_approve_edited_in_its_own_second_is_not_success(self) -> None:
+        # REST times have one-second resolution: an edit in the second the
+        # comment was posted leaves updated_at == created_at. GraphQL's
+        # lastEditedAt still shows it.
+        edited = [("lastEditedAt", {"json": {"data": {"node": {
+            "lastEditedAt": "2026-10-12T15:00:00Z"}}}}), *self.answers(self.approved(), SIGNERS)]
+        result = self.post(edited)
+        self.assertEqual(self.posted()["state"], "pending", result.stdout + result.stderr)
+        partial = [("lastEditedAt", {"json": {"data": {"node": {"lastEditedAt": None}},
+                                              "errors": [{"message": "rate limited"}]}}),
+                   *self.answers(self.approved(), SIGNERS)]
+        result = self.post(partial)
+        self.assertEqual(self.posted()["state"], "failure", "errors beside partial data")
+        unreadable = [("lastEditedAt", {"error": "gh: HTTP 502"}),
+                      *self.answers(self.approved(), SIGNERS)]
+        result = self.post(unreadable)
+        self.assertEqual(self.posted()["state"], "failure", result.stdout + result.stderr)
+        guard = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD],
+                               edited, REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(guard.returncode, 0, guard.stderr)
+
+    def test_a_deleted_hold_still_holds(self) -> None:
+        # Control: the deleted comment was not a HOLD, so the APPROVE decides.
+        quiet = self.post(self.answers(self.approved(), SIGNERS),
+                          event=self.comment_event("deleted", "thanks"))
+        self.assertEqual(self.posted()["state"], "success", quiet.stderr)
+        result = self.post(self.answers(self.approved(), SIGNERS),
+                           event=self.comment_event("deleted", HOLD_BODY))
+        posted = self.posted()
+        self.assertEqual(posted["state"], "failure", result.stdout + result.stderr)
+        self.assertTrue(posted["description"].startswith(f"a HOLD naming head {HEAD[:12]}"),
+                        posted)
+
+    def test_a_hold_deleted_before_its_own_created_run_reads_still_holds(self) -> None:
+        # A pull request's GITHUB_TOKEN deletes the HOLD at once; that delete
+        # starts no workflow run, so the HOLD's own `created` payload is the
+        # only evidence left. The listing no longer has it.
+        result = self.post(self.answers(self.approved(), SIGNERS),
+                           event=self.comment_event("created", HOLD_BODY))
+        posted = self.posted()
+        self.assertEqual(posted["state"], "failure", result.stdout + result.stderr)
+        self.assertTrue(posted["description"].startswith(f"a HOLD naming head {HEAD[:12]}"))
+
+    def test_a_removed_hold_holds_even_before_any_approve(self) -> None:
+        # With no approval the head is only pending; the removed HOLD must
+        # still be recorded as a failure, or a later APPROVE would count.
+        self.post(self.answers([], SIGNERS), event=self.comment_event("created", HOLD_BODY))
+        self.assertEqual(self.posted()["state"], "failure")
+
+    def test_the_payload_holds_only_a_hold_naming_this_head(self) -> None:
+        other = HOLD_BODY.replace(HEAD, arm.HOLD_784)
+        self.post(self.answers(self.approved(), SIGNERS),
+                  event=self.comment_event("created", other))
+        self.assertEqual(self.posted()["state"], "success", "a HOLD of another head")
+        # An APPROVE whose prose says HOLD reaches the payload judge, which
+        # takes only HOLDs.
+        prose = SIGNED_APPROVE.format(head=HEAD).replace("Reviewed.", "Reviewed; no HOLD.")
+        self.post(self.answers(self.approved(), SIGNERS),
+                  event=self.comment_event("created", prose))
+        self.assertEqual(self.posted()["state"], "success", "an APPROVE in the payload")
+
+    def test_a_hold_edited_into_an_approve_still_holds(self) -> None:
+        self.post(self.answers(self.approved(), SIGNERS),
+                  event=self.comment_event("edited", SIGNED_APPROVE.format(head=HEAD),
+                                           before=HOLD_BODY))
+        self.assertEqual(self.posted()["state"], "failure")
+
+    def test_a_hold_this_job_posted_before_still_holds(self) -> None:
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        self.history = [dict(held, creator={"login": "someone-else[bot]"})]
+        self.assertEqual(self.judged(self.approved(), SIGNERS), "success",
+                         "another creator's status is not this job's")
+        self.history = [held]
+        self.post(self.answers(self.approved(), SIGNERS))
+        self.assertEqual(self.posted()["state"], "failure")
+        # With the App configured, the App's own failure holds, and so does
+        # the github-actions one: it may be a HOLD posted before the App
+        # existed, or one the App leg could not post.
+        app = {"REVIEW_VERDICT_APP_BOT_LOGIN": "fleet-verdict[bot]"}
+        self.history = []
+        self.post(self.answers(self.approved(), SIGNERS), **app)
+        self.assertEqual(self.posted()["state"], "success", "control: no history")
+        self.history = [dict(held, creator={"login": "someone-else[bot]"})]
+        self.post(self.answers(self.approved(), SIGNERS), **app)
+        self.assertEqual(self.posted()["state"], "success", "another creator's status")
+        self.history = [held]
+        self.post(self.answers(self.approved(), SIGNERS), **app)
+        self.assertEqual(self.posted()["state"], "failure", "the Actions history still holds")
+        self.history = [dict(held, creator={"login": "fleet-verdict[bot]"})]
+        self.post(self.answers(self.approved(), SIGNERS), **app)
+        self.assertEqual(self.posted()["state"], "failure")
+
+    def test_a_numberless_event_still_reads_the_heads_hold_history(self) -> None:
+        # A fork's workflow_run and a check_run can list no pull request; the
+        # head's status history must still hold a head whose HOLD is gone.
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        for name in ("workflow_run", "check_run"):
+            event = {name: {"pull_requests": [], "head_sha": HEAD}}
+            self.history = []
+            result = self.post(self.answers(self.approved(), SIGNERS), name, copy.deepcopy(event))
+            self.assertEqual(self.posted()["state"], "success", f"control {name}: {result.stderr}")
+            self.history = [held]
+            result = self.post(self.answers(self.approved(), SIGNERS), name, copy.deepcopy(event))
+            self.assertEqual(self.posted()["state"], "failure", f"{name}: {result.stdout}")
+            self.assertIn(f"/commits/{HEAD}/statuses", self.calls())
+
+    def test_a_malformed_event_payload_refuses(self) -> None:
+        # Read as "not a pull request", a malformed payload would exit 0 and
+        # leave the required check green.
+        broken = [("pull_request_target", {}), ("pull_request_target", {"pull_request": None}),
+                  ("pull_request_target", {"pull_request": {"number": "784"}}),
+                  ("pull_request_target", {"pull_request": {"number": True}}),
+                  ("issue_comment", {"issue": None}),
+                  ("issue_comment", {"issue": {"pull_request": {"url": "x"}}}),
+                  ("issue_comment", {"issue": {"number": "784", "pull_request": {"url": "x"}}})]
+        for name in ("workflow_run", "check_run"):
+            broken += [(name, {}), (name, {name: None}),
+                       (name, {name: {"pull_requests": [], "head_sha": None}}),
+                       (name, {name: {"pull_requests": []}}),
+                       (name, {name: {"pull_requests": "784", "head_sha": HEAD}}),
+                       (name, {name: {"pull_requests": [{"number": "784"}], "head_sha": HEAD}}),
+                       (name, {name: {"pull_requests": ["x"], "head_sha": HEAD}})]
+        for name, event in broken:
+            result = self.post(self.answers(self.approved(), SIGNERS), name, event)
+            self.assertNotEqual(result.returncode, 0, f"{name} {event}: {result.stdout}")
+            self.assertNotIn("state=success", self.calls() if (self.root / "calls").exists()
+                             else "", event)
+        # Controls: a comment on an issue still posts nothing, and a PR with
+        # no readable state is unreadable, never "closed".
+        self.assertEqual(self.post([], event={"issue": {"number": 5}}).returncode, 0)
+        answers = self.answers(self.approved(), SIGNERS)
+        pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+        pull.pop("state")
+        result = self.post(answers, "pull_request_target", {"pull_request": {"number": 784}})
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_a_malformed_status_in_the_history_refuses(self) -> None:
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        # Control: a status of another context with a null description is
+        # GitHub's own shape for a status posted without one.
+        self.history = [dict(held, context="ci", description=None)]
+        self.post(self.answers(self.approved(), SIGNERS))
+        self.assertEqual(self.posted()["state"], "success", "control")
+        broken = [{k: v for k, v in held.items() if k != "creator"},
+                  dict(held, creator=None), dict(held, creator={}),
+                  {k: v for k, v in held.items() if k != "context"},
+                  dict(held, context=None),
+                  {k: v for k, v in held.items() if k != "state"},
+                  dict(held, state=7), dict(held, description=None),
+                  dict(held, description=["x"]), "not a status"]
+        for bad in broken:
+            self.history = [bad]
+            result = self.post(self.answers(self.approved(), SIGNERS))
+            self.assertNotEqual(result.returncode, 0, f"{bad}: {result.stdout}")
+            self.assertNotIn("state=success", self.calls(), bad)
+
+    def test_an_unknown_status_state_in_the_history_refuses(self) -> None:
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        # Controls: another context in each documented state is read, not held.
+        for state in ("error", "failure", "pending", "success"):
+            self.history = [dict(held, context="ci", state=state, description="x")]
+            self.post(self.answers(self.approved(), SIGNERS))
+            self.assertEqual(self.posted()["state"], "success", f"control {state}")
+        # The HOLD text in any documented state holds: skipped, an error or
+        # pending copy of it would hide the HOLD.
+        for state in ("error", "failure", "pending", "success"):
+            self.history = [dict(held, state=state)]
+            self.post(self.answers(self.approved(), SIGNERS))
+            self.assertEqual(self.posted()["state"], "failure", state)
+        # A state outside the enum refuses, on this job's context and any other.
+        for state in ("held", "FAILURE", "Failure", "", " failure", "queued", ["failure"], {}):
+            for context in ("review-verdict", "ci"):
+                self.history = [dict(held, context=context, state=state)]
+                result = self.post(self.answers(self.approved(), SIGNERS))
+                self.assertNotEqual(result.returncode, 0, f"{context} {state!r}: {result.stdout}")
+                self.assertNotIn("state=success", self.calls(), (context, state))
+
+    def test_an_unknown_pull_request_state_refuses(self) -> None:
+        # Only "open" and "closed" are documented. A closed pull request posts
+        # nothing and exits 0, so an unknown state read as closed would leave
+        # an earlier green status standing.
+        event = {"pull_request": {"number": 784}}
+
+        def with_state(state: Any) -> list[tuple[str, dict[str, Any]]]:
+            answers = self.answers(self.approved(), SIGNERS)
+            next(answer["json"] for needle, answer in answers
+                 if needle == "/pulls/")["state"] = state
+            return answers
+
+        self.assertEqual(self.post(with_state("open"), "pull_request_target",
+                                   copy.deepcopy(event)).returncode, 0, "control open")
+        result = self.post(with_state("closed"), "pull_request_target", copy.deepcopy(event))
+        self.assertEqual(result.returncode, 0, "control closed")
+        self.assertNotIn("/statuses/", self.calls())
+        for state in ("pending", "OPEN", "Closed", "merged", "draft", " open", "open ",
+                      5, True, ["open"], {"open": True}):
+            result = self.post(with_state(state), "pull_request_target", copy.deepcopy(event))
+            self.assertNotEqual(result.returncode, 0, f"{state!r}: {result.stdout}")
+            self.assertIn("unreadable", result.stderr, state)
+            self.assertNotIn("nothing to post", result.stdout, state)
+            self.assert_refused(self.comment_event("created", "thanks"),
+                                answers=with_state(state))
+        # A pull request sharing the head with an unknown state is never
+        # dropped from the judgment as "not open".
+        for state in ("pending", "OPEN", "", None, 5, ["open"]):
+            answers = [
+                (needle, {"pages": [[
+                    {"number": 784, "state": "open", "head": {"sha": HEAD}},
+                    {"number": 785, "state": state, "head": {"sha": HEAD}},
+                ]]}) if needle == f"/commits/{HEAD}/pulls" else (needle, answer)
+                for needle, answer in self.answers(self.approved(), SIGNERS)
+            ]
+            result = self.post(answers)
+            self.assertNotEqual(result.returncode, 0, f"{state!r}: {result.stdout}")
+            self.assertIn("pull requests on", result.stderr, state)
+            self.assertNotIn("/statuses/", self.calls(), state)
+
+    def test_a_malformed_comment_event_refuses(self) -> None:
+        approve = SIGNED_APPROVE.format(head=HEAD)
+        good = self.comment_event("edited", approve, before="thanks")
+        self.post(self.answers(self.approved(), SIGNERS), event=good)
+        self.assertEqual(self.posted()["state"], "success", "control")
+        broken = []
+        for key in ("comment", "action"):
+            event = self.comment_event("deleted", approve)
+            event.pop(key)
+            broken.append(event)
+        event = self.comment_event("deleted", approve)
+        event["comment"] = "text"
+        broken.append(event)
+        event = self.comment_event("deleted", approve)
+        event["comment"].pop("body")
+        broken.append(event)
+        event = self.comment_event("deleted", approve)
+        event["comment"]["body"] = None
+        broken.append(event)
+        event = self.comment_event("deleted", approve)
+        event["comment"]["user"] = None
+        broken.append(event)
+        edited = self.comment_event("edited", approve)
+        broken.append(edited)
+        for changes in ({"body": None}, {"body": {}}, {"body": {"from": 3}}, "x"):
+            event = self.comment_event("edited", approve)
+            event["changes"] = changes
+            broken.append(event)
+        for event in broken:
+            self.assert_refused(event)
+
+    def assert_refused(self, event: dict[str, Any], name: str = "issue_comment",
+                       answers: list[tuple[str, dict[str, Any]]] | None = None) -> None:
+        result = self.post(answers if answers is not None
+                           else self.answers(self.approved(), SIGNERS), name, event)
+        self.assertNotEqual(result.returncode, 0, f"{event}: {result.stdout}")
+        self.assertNotIn("state=success", self.calls() if (self.root / "calls").exists()
+                         else "", event)
+
+    def test_a_malformed_pull_request_marker_refuses(self) -> None:
+        # Control: GitHub's own marker object is judged.
+        self.post(self.answers(self.approved(), SIGNERS),
+                  event=self.comment_event("created", "thanks"))
+        self.assertEqual(self.posted()["state"], "success", "control")
+        # A truthy non-object, a null, an empty or url-less object: none is
+        # GitHub's marker, so none is read as a pull request or as an issue.
+        for marker in ("x", ["x"], [], 1, 0, True, False, None, {}, {"url": ""},
+                       {"url": 3}, {"html_url": "x"}):
+            event = self.comment_event("created", "thanks")
+            event["issue"]["pull_request"] = marker
+            self.assert_refused(event)
+        # Control: an issue with no marker at all is still nothing to judge.
+        self.assertEqual(self.post([], event={"issue": {"number": 5}}).returncode, 0)
+
+    def test_an_edit_without_its_earlier_body_or_an_unknown_action_refuses(self) -> None:
+        approve = SIGNED_APPROVE.format(head=HEAD)
+        for action in ("created", "deleted"):
+            self.post(self.answers(self.approved(), SIGNERS),
+                      event=self.comment_event(action, approve))
+            self.assertEqual(self.posted()["state"], "success", f"control {action}")
+        # An edit that removed a HOLD but carries no earlier body would let
+        # the HOLD vanish: every edit must carry ``changes.body.from``.
+        for changes in ({}, {"title": {"from": "x"}}, {"body": {"from": None}}, [], None):
+            event = self.comment_event("edited", approve, before=HOLD_BODY)
+            event["changes"] = changes
+            self.assert_refused(event)
+        for action in ("pinned", "", None, 5, ["edited"], {"edited": True}):
+            event = self.comment_event("deleted", approve)
+            event["action"] = action
+            self.assert_refused(event)
+
+    def test_a_malformed_pull_request_record_refuses(self) -> None:
+        event = {"pull_request": {"number": 784}}
+        result = self.post(self.answers(self.approved(), SIGNERS), "pull_request_target",
+                           copy.deepcopy(event))
+        self.assertEqual(result.returncode, 0, f"control: {result.stdout}{result.stderr}")
+
+        def broken(change: Any) -> list[tuple[str, dict[str, Any]]]:
+            answers = self.answers(self.approved(), SIGNERS)
+            pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+            change(pull)
+            return answers
+
+        changes = [
+            lambda pull: pull.update(state=""), lambda pull: pull.update(state=None),
+            lambda pull: pull.update(head="x"), lambda pull: pull.update(head={}),
+            lambda pull: pull["head"].update(sha=""), lambda pull: pull["head"].update(sha=7),
+            lambda pull: pull.update(base=None), lambda pull: pull["base"].update(ref=["main"]),
+            lambda pull: pull["base"].update(repo="x"),
+            lambda pull: pull["base"]["repo"].pop("default_branch"),
+            lambda pull: pull.update(user=None), lambda pull: pull["user"].update(login=""),
+        ]
+        for change in changes:
+            self.assert_refused(copy.deepcopy(event), "pull_request_target", broken(change))
+            # The comment path reads the same record.
+            self.assert_refused(self.comment_event("created", "thanks"),
+                                answers=broken(change))
+
+    def test_a_removed_hold_with_a_malformed_author_refuses(self) -> None:
+        # 1653-r6-f1: a deleted HOLD whose author login (or user type, or
+        # association) is not canonical would read as an untrusted identity,
+        # so the HOLD would be dropped and the earlier APPROVE post success.
+        result = self.post(self.answers(self.approved(), SIGNERS),
+                           event=self.comment_event("deleted", HOLD_BODY))
+        self.assertEqual(self.posted()["state"], "failure", "control: " + result.stderr)
+
+        def with_user(field: str, value: Any) -> dict[str, Any]:
+            event = self.comment_event("deleted", HOLD_BODY)
+            target = event["comment"] if field == "author_association" else event["comment"]["user"]
+            if value is MISSING:
+                target.pop(field, None)
+            else:
+                target[field] = value
+            return event
+
+        for value in (*BAD_LOGINS, MISSING):
+            self.assert_refused(with_user("login", value))
+        for value in ("bot", "BOT", "", " Bot", "App", None, 5, MISSING):
+            self.assert_refused(with_user("type", value))
+        for value in ("owner", "Owner", "", " OWNER", "ADMIN", None, 5, ["OWNER"], MISSING):
+            self.assert_refused(with_user("author_association", value))
+
+    def test_a_status_with_a_malformed_creator_refuses(self) -> None:
+        # 1653-r6-f2: a review-verdict HOLD failure whose creator login is not
+        # canonical would be skipped as "not this job's", and a later APPROVE
+        # would post success.
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        self.history = [held]
+        self.post(self.answers(self.approved(), SIGNERS))
+        self.assertEqual(self.posted()["state"], "failure", "control")
+        # A login is case-insensitive: a case variant of this job's creator,
+        # and of its context, still holds.
+        for variant in (dict(held, creator={"login": "GitHub-Actions[bot]"}),
+                        dict(held, context="Review-Verdict")):
+            self.history = [variant]
+            self.post(self.answers(self.approved(), SIGNERS))
+            self.assertEqual(self.posted()["state"], "failure", variant)
+        for login in (*BAD_LOGINS, MISSING):
+            creator = {} if login is MISSING else {"login": login}
+            for context in ("review-verdict", "ci"):
+                self.history = [dict(held, context=context, creator=creator)]
+                result = self.post(self.answers(self.approved(), SIGNERS))
+                self.assertNotEqual(result.returncode, 0, f"{login!r}: {result.stdout}")
+                self.assertNotIn("state=success", self.calls(), (context, login))
+        for context in ("", " ", " review-verdict", "review-verdict ", "x" * 300):
+            self.history = [dict(held, context=context)]
+            result = self.post(self.answers(self.approved(), SIGNERS))
+            self.assertNotEqual(result.returncode, 0, f"{context!r}: {result.stdout}")
+            self.assertNotIn("state=success", self.calls(), context)
+
+    def test_a_pull_row_with_a_non_canonical_head_refuses(self) -> None:
+        # 1653-r6-f3: a row whose head sha is empty or non-canonical was
+        # filtered out of the shared-head judgment; it refuses the listing.
+        def rows(row: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+            return [
+                (needle, {"pages": [[{"number": 784, "state": "open", "head": {"sha": HEAD}},
+                                     row]]}) if needle == f"/commits/{HEAD}/pulls"
+                else (needle, answer)
+                for needle, answer in self.answers(self.approved(), SIGNERS)]
+
+        control = rows({"number": 785, "state": "closed", "head": {"sha": HEAD}})
+        self.post(control)
+        self.assertEqual(self.posted()["state"], "success", "control")
+        for sha in (*BAD_SHAS, MISSING):
+            head = {} if sha is MISSING else {"sha": sha}
+            result = self.post(rows({"number": 785, "state": "open", "head": head}))
+            self.assertNotEqual(result.returncode, 0, f"{sha!r}: {result.stdout}")
+            self.assertIn("pull requests on", result.stderr, sha)
+            self.assertNotIn("/statuses/", self.calls(), sha)
+        for number in (*BAD_NUMBERS, MISSING):
+            row = {"state": "open", "head": {"sha": HEAD}}
+            if number is not MISSING:
+                row["number"] = number
+            result = self.post(rows(row))
+            self.assertNotEqual(result.returncode, 0, f"{number!r}: {result.stdout}")
+            self.assertNotIn("/statuses/", self.calls(), number)
+
+    def test_the_host_guard_refuses_a_non_canonical_author_or_verdict_record(self) -> None:
+        # No author is never "nobody to exclude", and a verdict comment whose
+        # author cannot be read is never dropped from the judgment.
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+        allowed = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                                 SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(allowed.returncode, 0, "control: " + allowed.stderr)
+        for login in ("", " ", "some one", None, 5):
+            answers = self.answers(self.approved(), SIGNERS)
+            next(answer["json"] for needle, answer in answers
+                 if needle == "/pulls/")["user"]["login"] = login
+            guard = self.run_guard(merge, answers, REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+            self.assertNotEqual(guard.returncode, 0, f"author {login!r}: {guard.stderr}")
+        for login in ("", " ", "some one", None):
+            approve = self.approved()
+            approve[0]["user"] = dict(approve[0]["user"], login=login)
+            guard = self.run_guard(merge, self.answers(approve, SIGNERS), REPO,
+                                   SHIPYARD_SIGNERS_FROM_BASE="1")
+            self.assertNotEqual(guard.returncode, 0, f"verdict login {login!r}: {guard.stderr}")
+            self.assertIn("unreadable", guard.stderr, login)
+
+    def test_an_edit_history_answer_must_be_well_formed(self) -> None:
+        from unittest import mock
+        guard = arm.guard
+        never = {"data": {"node": {"lastEditedAt": None}}}
+        with mock.patch.object(guard, "graphql", return_value=never):
+            self.assertIsNone(guard.comment_last_edited("IC_1"), "control")
+        for answer in (dict(never, errors=[]), dict(never, errors={}), dict(never, errors=""),
+                       dict(never, errors=0), {"data": ["x"]}, {"data": "x"}, {"data": None},
+                       {"data": {"node": "x"}}, {"data": {"node": {}}},
+                       {"data": {"node": {"lastEditedAt": 5}}}, [], None):
+            with mock.patch.object(guard, "graphql", return_value=answer), \
+                    self.assertRaises(guard.GuardError, msg=answer):
+                guard.comment_last_edited("IC_1")
+
+    def retargeted(self, base_config: str) -> list[tuple[str, dict[str, Any]]]:
+        answers = self.answers([], SIGNERS)
+        pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+        pull["base"]["ref"] = "b0"
+        return [("config.toml?ref=b0", {"text": base_config}),
+                ("config.toml?ref=main", {"text": SIGNERS}), *answers]
+
+    def test_policy_comes_from_the_default_branch_and_another_base_is_refused(self) -> None:
+        # The N4 attack: branch b0 turns review off; the pull request into b0
+        # carries no approval at all.
+        result = self.post(self.retargeted(OPT_OUT))
+        posted = self.posted()
+        self.assertEqual(posted["state"], "failure", result.stdout + result.stderr)
+        self.assertIn("not the default branch main", posted["description"])
+        self.assertNotIn("ref=b0", self.calls())
+
+    def test_the_host_guard_reads_policy_from_the_default_branch(self) -> None:
+        guard = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD],
+                               self.retargeted(OPT_OUT), REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(guard.returncode, 0, guard.stderr)
+        self.assertNotIn("does not require a review", guard.stderr)
+        self.assertNotIn("ref=b0", self.calls())
+
+    def test_the_host_guard_refuses_a_head_its_hold_record_holds(self) -> None:
+        # The HOLD comment is gone (a pull request's token deleted it); the
+        # hold hook's record on this host still names the head.
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+        allowed = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                                 SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(allowed.returncode, 0, "control: " + allowed.stderr)
+        record = self.guards / "holds.jsonl"
+        record.write_text(json.dumps({"repo": "danielraffel/shipyard", "pr": 784,
+                                      "hold_head": arm.HOLD_784, "action": "none",
+                                      "at": "2026-11-24T00:00:00Z"}) + "\n"
+                          , encoding="utf-8")
+        other = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                               SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(other.returncode, 0, "a HOLD of another head: " + other.stderr)
+        with record.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"repo": REPO, "pr": 784, "hold_head": HEAD,
+                                     "at": "2026-11-24T01:00:00Z"}) + "\n")
+        held = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                              SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(held.returncode, 0, held.stderr)
+        self.assertIn("hold record", held.stderr)
+
+    def test_a_malformed_hold_record_refuses(self) -> None:
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+        record = self.guards / "holds.jsonl"
+        row = {"repo": REPO, "pr": 9, "hold_head": HEAD, "at": "2026-11-24T01:00:00Z"}
+        # Control: a well-formed row of another pull request is no record.
+        record.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        control = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                                 SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(control.returncode, 0, "control: " + control.stderr)
+        # A row missing, or mistyping, any field the match reads could be the
+        # HOLD of this head, so it refuses rather than being skipped.
+        held = dict(row, pr=784)
+        shapes = [{k: v for k, v in held.items() if k != key}
+                  for key in ("repo", "pr", "hold_head", "at")]
+        shapes += [dict(held, repo=None), dict(held, repo=7), dict(held, repo=""),
+                   dict(held, pr="784"), dict(held, pr=784.0), dict(held, pr=True),
+                   dict(held, pr=None), dict(held, hold_head=None), dict(held, hold_head=""),
+                   dict(held, hold_head=["x"]), dict(held, at=None), dict(held, at=5),
+                   dict(held, at="")]
+        for bad in ("not json\n", "[1, 2]\n", "\"text\"\n",
+                    *(json.dumps(shape) + "\n" for shape in shapes)):
+            record.write_text(json.dumps(row) + "\n" + bad, encoding="utf-8")
+            guard = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                                   SHIPYARD_SIGNERS_FROM_BASE="1")
+            self.assertNotEqual(guard.returncode, 0, bad + guard.stderr)
+            self.assertIn("hold record", guard.stderr)
+
+    def test_the_host_guard_refuses_a_pull_request_into_another_base(self) -> None:
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+        answers = self.answers(self.approved(), SIGNERS)
+        pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+        pull["base"]["ref"] = "b0"
+        guard = self.run_guard(merge, answers, REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(guard.returncode, 0, guard.stderr)
+        self.assertIn("not the default branch main", guard.stderr)
+        self.assertNotIn("ref=b0", self.calls())
+
+    def test_the_host_guard_refuses_another_base_even_when_review_is_off(self) -> None:
+        # The default branch's policy turns review off; that opt-out still
+        # never lands a pull request into another base.
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+
+        def into(base: str) -> list[tuple[str, dict[str, Any]]]:
+            answers = self.answers([], OPT_OUT)
+            pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+            pull["base"]["ref"] = base
+            return answers
+
+        allowed = self.run_guard(merge, into("main"), REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(allowed.returncode, 0, "control: " + allowed.stderr)
+        refused = self.run_guard(merge, into("b0"), REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("not the default branch main", refused.stderr)
+        self.assertNotIn("does not require a review", refused.stderr)
+
+    def test_an_unreadable_hold_record_refuses(self) -> None:
+        (self.guards / "holds.jsonl").mkdir()
+        guard = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD],
+                               self.answers(self.approved(), SIGNERS), REPO,
+                               SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(guard.returncode, 0, guard.stderr)
+        self.assertIn("hold record", guard.stderr)
+
+    def test_an_api_comment_with_no_node_id_never_approves(self) -> None:
+        trail = [self.comment(SIGNED_APPROVE.format(head=HEAD), "2026-10-12T15:00:00Z")]
+        trail[0].pop("node_id")
+        result = self.post(self.answers(trail, SIGNERS))
+        self.assertEqual(self.posted()["state"], "failure", result.stdout + result.stderr)
+        self.assertIn("node id", result.stdout + result.stderr)
+
+    def app_gh(self, fake: pathlib.Path) -> pathlib.Path:
+        """``gh`` that refuses the App token and passes anything else to ``fake``."""
+        wrapper = self.root / "gh-app"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'if [ "$GH_TOKEN" = broken-app-token ]; then echo "HTTP 401 Bad credentials" >&2; '
+            "exit 1; fi\n"
+            f'exec {fake} "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        return wrapper
+
+    def test_the_app_leg_fails_open(self) -> None:
+        answers = self.answers(self.approved(), SIGNERS)
+        baseline = self.post(answers, event_name="pull_request_target",
+                             event={"pull_request": {"number": 784}})
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        # A token that could not be minted: logged, Actions post unchanged.
+        empty = self.post(answers, event_name="pull_request_target",
+                          event={"pull_request": {"number": 784}},
+                          REVIEW_VERDICT_APP_ID="123", REVIEW_VERDICT_APP_TOKEN="")
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertIn("::warning title=review-verdict App leg::", empty.stdout)
+        self.assertEqual(len(self.statuses()), 1)
+        # A refused App post: logged without the token, Actions post unchanged.
+        self.install(answers)
+        broken = self.post(answers, event_name="pull_request_target",
+                           event={"pull_request": {"number": 784}},
+                           GHAPP_REAL_GH=str(self.app_gh(self.root / "gh")),
+                           REVIEW_VERDICT_APP_ID="123", REVIEW_VERDICT_APP_TOKEN="broken-app-token")
+        self.assertEqual(broken.returncode, 0, broken.stderr)
+        self.assertIn("the App post failed", broken.stdout)
+        self.assertNotIn("broken-app-token", broken.stdout + broken.stderr)
+        self.assertEqual(len(self.statuses()), 1)
+        # A refusal the App cannot post fails the job after a retry, so the
+        # App's last `success` is never left standing on a refused head.
+        held = self.answers([], SIGNERS)
+        self.install(held)
+        refused = self.post(held, event=plain_comment_event(),
+                            GHAPP_REAL_GH=str(self.app_gh(self.root / "gh")),
+                            REVIEW_VERDICT_APP_ID="123",
+                            REVIEW_VERDICT_APP_TOKEN="broken-app-token")
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stdout.count("the App post failed"), 2, "one retry")
+        self.assertIn("::error title=review-verdict App leg::", refused.stdout)
+        self.assertEqual(len(self.statuses()), 1, "the Actions post still happens")
+        # A working App token posts the same status twice.
+        self.install(answers)
+        good = self.post(answers, event_name="pull_request_target",
+                         event={"pull_request": {"number": 784}},
+                         GHAPP_REAL_GH=str(self.app_gh(self.root / "gh")),
+                         REVIEW_VERDICT_APP_ID="123", REVIEW_VERDICT_APP_TOKEN="good-app-token")
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertEqual(len(self.statuses()), 2)
+
+
+class CarryFromAHeldHead(unittest.TestCase):
+    """The delta review's D1: APPROVE(H), HOLD(H), the HOLD deleted, the base
+    merged in (H2). The approval of H carries to H2; a held head's approval
+    never carries."""
+
+    H = "a" * 40
+    H2 = "b" * 40
+
+    def setUp(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("review_verdict_status", STATUS)
+        assert spec is not None and spec.loader is not None
+        self.status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.status)
+        self.guard = self.status.load_guard()
+
+    def poster_state(self, held: dict[str, str]) -> str:
+        from unittest import mock
+        posted: list[list[str]] = []
+
+        def real_gh(arguments: list[str]) -> Any:
+            if arguments[-1] == f"repos/{REPO}/pulls/7":
+                return {"state": "open", "head": {"sha": self.H2}, "user": {"login": "author"},
+                        "base": {"ref": "main", "repo": {"default_branch": "main"}}}
+            if "/statuses/" in " ".join(arguments):
+                posted.append(arguments)
+                return {}
+            raise AssertionError(arguments)
+
+        self.guard.run_real_gh = real_gh
+        carried = self.status.Decision(True, "PR #7: carried", None, (), self.H)
+        with mock.patch.object(self.status, "load_guard", return_value=self.guard), \
+                mock.patch.object(self.status, "open_pulls_on", return_value=[7]), \
+                mock.patch.object(self.status, "decide", return_value=carried), \
+                mock.patch.object(self.status, "refresh_head_check"), \
+                mock.patch.object(self.status, "held_in_history",
+                                  side_effect=lambda guard, repo, head: held.get(head)):
+            self.status.run("pull_request_target", {"pull_request": {"number": 7}}, REPO, None)
+        state = next(a for a in posted[-1] if a.startswith("state="))
+        return state.split("=", 1)[1]
+
+    def test_the_poster_refuses_a_carry_from_a_held_head(self) -> None:
+        self.assertEqual(self.poster_state({}), "success", "control: nothing held")
+        self.assertEqual(self.poster_state({self.H: "a HOLD naming head aaaa"}), "failure")
+
+    def guard_gate(self, holds: dict[str, str | None]) -> tuple[bool, str]:
+        import os
+        from unittest import mock
+        pull = {"base": {"ref": "main", "repo": {"default_branch": "main"}},
+                "head": {"sha": self.H2, "ref": "feature/x"}, "user": {"login": "author"}}
+        target = {"repo": REPO, "pr": 7, "head": self.H2, "bound_head": self.H2}
+        guard = self.guard
+        with tempfile.TemporaryDirectory() as guards, \
+                mock.patch.dict(os.environ, {"SHIPYARD_GHAPP_GUARDS_DIR": guards}), \
+                mock.patch.object(guard, "host_review_default", return_value=True), \
+                mock.patch.object(guard, "run_real_gh", return_value=pull), \
+                mock.patch.object(guard, "base_config_text", return_value=SIGNERS), \
+                mock.patch.object(guard, "_rest_pages", return_value=[]), \
+                mock.patch.object(guard, "review_verdict", return_value=(False, "no verdict")), \
+                mock.patch.object(guard, "approved_earlier_head", return_value=self.H), \
+                mock.patch.object(guard, "carry_limits", return_value=None), \
+                mock.patch.object(guard, "merge_only_carry", return_value=None), \
+                mock.patch.object(guard, "self_approval", return_value=None), \
+                mock.patch.object(guard, "same_session_note", return_value=None), \
+                mock.patch.object(guard, "deciding_approval", return_value={}), \
+                mock.patch.object(guard, "recorded_hold",
+                                  side_effect=lambda repo, number, head: holds.get(head)):
+            allowed, message, _ = guard.review_gate(target, REPO, dry_run=True)
+        return allowed, message
+
+    def test_the_guard_refuses_a_carry_from_a_held_head(self) -> None:
+        allowed, message = self.guard_gate({})
+        self.assertTrue(allowed, "control: " + message)
+        allowed, message = self.guard_gate({self.H: "2026-11-24T01:00:00Z"})
+        self.assertFalse(allowed, message)
+        self.assertIn("never carries", message)
+
+
+class RollupMemberEdit(unittest.TestCase):
+    """A rollup member's approval meets the same GraphQL edit rule."""
+
+    def test_an_edited_member_approval_does_not_count(self) -> None:
+        from unittest import mock
+        guard = arm.guard
+
+        def review(deciding: dict[str, Any], edited: str | None) -> str | None:
+            with mock.patch.object(guard, "run_real_gh", return_value={"user": {"login": "a"}}), \
+                    mock.patch.object(guard, "_rest_pages", return_value=[]), \
+                    mock.patch.object(guard, "review_verdict", return_value=(True, "ok")), \
+                    mock.patch.object(guard, "self_approval", return_value=None), \
+                    mock.patch.object(guard, "deciding_approval", return_value=deciding), \
+                    mock.patch.object(guard, "comment_last_edited", return_value=edited):
+                return guard.member_review(REPO, 7, HEAD, {}, False)
+
+        api = {"verdict_comment_id": 1, "verdict_node_id": "IC_1", "verdict_from_api": True}
+        self.assertIsNone(review(api, None), "control: never edited")
+        self.assertIn("was edited", review(api, "2026-11-24T01:00:00Z") or "")
+        with self.assertRaises(guard.GuardError):
+            review(dict(api, verdict_node_id=None), None)
+
+
+class MalformedPayloadTable(unittest.TestCase):
+    """Every payload shape the status and the guard judge by, fed a table of
+    malformed variants of every field they read: each must refuse (raise),
+    never skip the row or read it as something else."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("review_verdict_status_table", STATUS)
+        assert spec is not None and spec.loader is not None
+        cls.status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.status)
+
+    @staticmethod
+    def variants(kind: str, good: Any) -> list[Any]:
+        """The malformed values of one field of ``kind``, ``good`` its valid value."""
+        common = [MISSING, None, [good], {}]
+        if kind == "login":
+            return [*BAD_LOGINS, MISSING]
+        if kind == "sha":
+            return [*BAD_SHAS, MISSING]
+        if kind == "number":
+            return [*BAD_NUMBERS, MISSING]
+        if kind == "enum":
+            return [*common, "", " ", f" {good}", f"{good} ", good.swapcase(), "unknown", 5]
+        if kind == "text":
+            return [*common, "", " ", f" {good}", f"{good} ", "x" * 300, 5, True]
+        if kind == "str":
+            return [*common, 5, True]
+        raise AssertionError(kind)
+
+    @staticmethod
+    def with_field(record: Any, path: tuple[Any, ...], value: Any) -> Any:
+        record = copy.deepcopy(record)
+        target = record
+        for key in path[:-1]:
+            target = target[key]
+        if value is MISSING:
+            target.pop(path[-1], None)
+        else:
+            target[path[-1]] = value
+        return record
+
+    def assert_table(self, reader: Any, good: Any,
+                     fields: list[tuple[tuple[Any, ...], str]], errors: Any) -> None:
+        reader(copy.deepcopy(good))  # control: the canonical shape reads
+        for path, kind in fields:
+            here: Any = good
+            for key in path:
+                here = here[key]
+            for value in self.variants(kind, here):
+                with self.subTest(path=path, value=value), self.assertRaises(errors):
+                    reader(self.with_field(good, path, value))
+
+    def fake_guard(self, answer: Any) -> Any:
+        from types import SimpleNamespace
+
+        class GuardError(Exception):
+            pass
+
+        def run_real_gh(arguments: list[str]) -> Any:
+            return copy.deepcopy(answer)
+
+        return SimpleNamespace(GuardError=GuardError, run_real_gh=run_real_gh,
+                               run_real_gh_text=lambda arguments: "")
+
+    def test_the_issue_comment_payload(self) -> None:
+        good = {"action": "deleted", "issue": {"number": 784, "pull_request": {"url": "x"}},
+                "comment": {"id": 9, "body": "b", "author_association": "OWNER",
+                            "user": {"login": "shipyard-local[bot]", "type": "Bot"}}}
+        self.assert_table(self.status.comment_event, good, [
+            (("issue", "number"), "number"), (("action",), "enum"),
+            (("comment", "body"), "str"), (("comment", "user", "login"), "login"),
+            (("comment", "user", "type"), "enum"),
+            (("comment", "author_association"), "enum")], ValueError)
+        edited = dict(good, action="edited", changes={"body": {"from": "a"}})
+        self.assert_table(self.status.comment_event, edited,
+                          [(("changes", "body", "from"), "str")], ValueError)
+
+    def test_the_event_targets(self) -> None:
+        self.assert_table(lambda event: self.status.event_target("pull_request_target", event),
+                          {"pull_request": {"number": 784}},
+                          [(("pull_request", "number"), "number")], ValueError)
+        for name in ("workflow_run", "check_run"):
+            self.assert_table(lambda event, name=name: self.status.event_target(name, event),
+                              {name: {"pull_requests": [{"number": 784}], "head_sha": HEAD}},
+                              [((name, "head_sha"), "sha"),
+                               ((name, "pull_requests", 0, "number"), "number")], ValueError)
+
+    def test_the_pull_request_record(self) -> None:
+        good = {"state": "open", "head": {"sha": HEAD}, "user": {"login": "someone"},
+                "base": {"ref": "main", "repo": {"default_branch": "main"}}}
+
+        def read(pull: Any) -> Any:
+            guard = self.fake_guard(pull)
+            try:
+                return self.status.read_pull(guard, REPO, 784)
+            except guard.GuardError as error:
+                raise LookupError(str(error)) from error
+
+        self.assert_table(read, good, [
+            (("state",), "enum"), (("head", "sha"), "sha"), (("base", "ref"), "text"),
+            (("base", "repo", "default_branch"), "text"), (("user", "login"), "login")],
+            LookupError)
+
+    def test_the_pull_requests_on_a_head(self) -> None:
+        def read(row: Any) -> Any:
+            guard = self.fake_guard([[{"number": 1, "state": "open", "head": {"sha": HEAD}}, row]])
+            try:
+                return self.status.open_pulls_on(guard, REPO, HEAD)
+            except guard.GuardError as error:
+                raise LookupError(str(error)) from error
+
+        self.assert_table(read, {"number": 784, "state": "open", "head": {"sha": HEAD}}, [
+            (("number",), "number"), (("state",), "enum"), (("head", "sha"), "sha")],
+            LookupError)
+
+    def test_the_status_history(self) -> None:
+        def read(row: Any) -> Any:
+            guard = self.fake_guard([[row]])
+            try:
+                return self.status.held_in_history(guard, REPO, HEAD)
+            except guard.GuardError as error:
+                raise LookupError(str(error)) from error
+
+        good = {"context": "ci", "state": "failure", "description": "x",
+                "creator": {"login": "github-actions[bot]"}}
+        self.assert_table(read, good, [
+            (("context",), "text"), (("state",), "enum"), (("creator", "login"), "login")],
+            LookupError)
+        for value in (5, True, ["x"], {}):
+            with self.subTest(description=value), self.assertRaises(LookupError):
+                read(dict(good, description=value))
+
+    def test_the_workflow_runs(self) -> None:
+        def read(page: Any) -> Any:
+            guard = self.fake_guard([page])
+            try:
+                return self.status.refresh_head_check(guard, REPO, HEAD)
+            except guard.GuardError as error:
+                raise LookupError(str(error)) from error
+
+        good = {"total_count": 1, "workflow_runs": [
+            {"id": 555, "name": "Review verdict", "event": "pull_request_target"}]}
+        self.assert_table(read, good, [
+            (("workflow_runs", 0, "id"), "number"), (("workflow_runs", 0, "name"), "text"),
+            (("workflow_runs", 0, "event"), "enum")], LookupError)
+        for count in (-1, True, "1", None, 1.0):
+            with self.subTest(total_count=count), self.assertRaises(LookupError):
+                read(dict(good, total_count=count))
+
+    def test_the_guards_verdict_records(self) -> None:
+        guard = arm.guard
+        approve = f"verdict: APPROVE head:{HEAD}"
+
+        def check(records: Any) -> None:
+            refusal = guard.verdict_records_refusal(*records)
+            if refusal is not None:
+                raise LookupError(refusal)
+
+        comment = {"id": 1, "body": approve, "author_association": "OWNER",
+                   "user": {"login": "someone", "type": "User"}}
+        review = {"id": 2, "state": "CHANGES_REQUESTED", "commit_id": HEAD,
+                  "author_association": "MEMBER", "user": {"login": "someone", "type": "User"}}
+        self.assert_table(check, [[comment], []], [
+            ((0, 0, "user", "login"), "login"), ((0, 0, "user", "type"), "enum"),
+            ((0, 0, "author_association"), "enum"), ((0, 0, "body"), "str")], LookupError)
+        self.assert_table(check, [[], [review]], [
+            ((1, 0, "state"), "enum"), ((1, 0, "commit_id"), "sha"),
+            ((1, 0, "user", "login"), "login"), ((1, 0, "user", "type"), "enum"),
+            ((1, 0, "author_association"), "enum")], LookupError)
+        # Controls: a record with no verdict is never judged, so none of its
+        # identity fields is checked.
+        check([[{"id": 3, "body": "thanks", "user": None}],
+               [{"id": 4, "state": "COMMENTED", "user": None, "commit_id": None}]])
+        # A listing row that is not an object refuses rather than being dropped.
+        from unittest import mock
+        with mock.patch.object(guard, "run_real_gh", return_value=[[comment, "x"]]), \
+                self.assertRaises(guard.GuardError):
+            guard._rest_pages("repos/x/y/issues/1/comments")
+
+    def test_the_guards_hold_record_rows(self) -> None:
+        guard = arm.guard
+        from unittest import mock
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+
+        def read(row: Any) -> Any:
+            (root / "holds.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with mock.patch.object(guard, "_guards_dir", return_value=root):
+                try:
+                    return guard.recorded_hold(REPO, 784, HEAD)
+                except guard.GuardError as error:
+                    raise LookupError(str(error)) from error
+
+        good = {"repo": REPO, "pr": 9, "hold_head": HEAD, "at": "2026-11-24T01:00:00Z"}
+        self.assert_table(read, good, [
+            (("pr",), "number"), (("hold_head",), "sha"), (("at",), "text")], LookupError)
+        for repo in ("", " ", f" {REPO}", "nope", "a/b/c", "a b/c", None, 5, MISSING):
+            with self.subTest(repo=repo), self.assertRaises(LookupError):
+                read(self.with_field(good, ("repo",), repo))
+
+    def test_the_status_and_the_guard_agree_on_logins_and_shas(self) -> None:
+        for value in ("someone", "shipyard-local[bot]", "app/shipyard-local", "a", "a" * 39, "A-b-1",
+                      *BAD_LOGINS):
+            self.assertEqual(self.status.is_login(value), arm.guard.is_login(value), value)
+        for value in (HEAD, *BAD_SHAS):
+            self.assertEqual(self.status.is_sha40(value), arm.guard.is_api_sha(value), value)
