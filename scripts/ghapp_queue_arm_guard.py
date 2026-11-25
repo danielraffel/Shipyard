@@ -3674,6 +3674,17 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         # protects can carry a config that turns review off or names any
         # reviewer (verdict-App review N4).
         default = default_branch(pull)
+        if base != default:
+            # The same refusal as the status and `shipyard review-verdict`: a
+            # pull request chooses its base, and only the default branch is
+            # protected, so a review is judged only for a pull request into it.
+            # It comes before the policy's opt-out below, so a policy that
+            # turns review off never lets a pull request into another base land.
+            what = (f"its base {base} is not the default branch {default}; only a pull "
+                    f"request into {default} is judged")
+            return False, f"{label} ({repo}): {what}", review_fix(
+                "wrong_base", f"{label}: {what}", repo, number, head,
+                f"retarget https://github.com/{repo}/pull/{number} to {default}", False)
         config_text = base_config_text(repo, default)
         policy = review_policy(config_text, repo, True)
         if not policy["required"] and not host_requires_guard():
@@ -3681,15 +3692,6 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
             # return: a base cannot opt out of review to dodge the host rule
             # (src/head_approval/guard.rs checks the host rule first too).
             return True, f"{repo} does not require a review before arming", None
-        if base != default:
-            # The same refusal as the status and `shipyard review-verdict`: a
-            # pull request chooses its base, and only the default branch is
-            # protected, so a review is judged only for a pull request into it.
-            what = (f"its base {base} is not the default branch {default}; only a pull "
-                    f"request into {default} is judged")
-            return False, f"{label} ({repo}): {what}", review_fix(
-                "wrong_base", f"{label}: {what}", repo, number, head,
-                f"retarget https://github.com/{repo}/pull/{number} to {default}", False)
         live_head = ((pull.get("head") or {}).get("sha") or "").lower()
         if live_head != head.lower():
             return False, (

@@ -115,12 +115,28 @@ fn read_comments(
     ))
 }
 
-/// The id of the newest bot verdict comment when its text changed after it
-/// was posted (`updated_at` differs from `created_at`). Any token with
-/// `pull-requests: write` can edit a comment and keep its author, so an edited
-/// HOLD can hide or rewrite findings and an edited APPROVE can read as no HOLD.
+/// The id of the newest bot verdict comment unless it is provably unedited:
+/// its `created_at` and `updated_at` are both readable RFC 3339 times and
+/// equal. Any token with `pull-requests: write` can edit a comment and keep its
+/// author, so an edited HOLD can hide or rewrite findings and an edited APPROVE
+/// can read as no HOLD. Missing, null, non-string or unparseable edit metadata
+/// cannot show the text is the reviewer's, so it is refused the same way; a bot
+/// verdict with no readable `created_at` is refused too, because the newest
+/// verdict cannot be chosen past it.
 fn edited_latest_verdict(comments: &[Value]) -> Option<u64> {
-    let newest = comments
+    let id = |comment: &Value| {
+        comment
+            .get("id")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    };
+    let time = |comment: &Value, key: &str| {
+        comment
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+    };
+    let verdicts: Vec<&Value> = comments
         .iter()
         .filter(|comment| {
             comment.pointer("/user/login").and_then(Value::as_str) == Some("shipyard-local[bot]")
@@ -130,19 +146,23 @@ fn edited_latest_verdict(comments: &[Value]) -> Option<u64> {
                     .and_then(|body| body.lines().rev().find(|line| !line.trim().is_empty()))
                     .is_some_and(|last| last.trim().starts_with("verdict: "))
         })
-        .max_by(|a, b| {
-            let at = |c: &Value| {
-                c.get("created_at")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            at(a).cmp(&at(b))
-        })?;
-    let created = newest.get("created_at").and_then(Value::as_str);
-    let updated = newest.get("updated_at").and_then(Value::as_str);
-    (updated.is_some() && updated != created)
-        .then(|| newest.get("id").and_then(Value::as_u64).unwrap_or_default())
+        .collect();
+    if let Some(unreadable) = verdicts.iter().find(|c| time(c, "created_at").is_none()) {
+        return Some(id(unreadable));
+    }
+    // The same choice `latest_hold` makes: the newest by `created_at`.
+    let newest = verdicts.into_iter().max_by(|a, b| {
+        let at = |c: &Value| {
+            c.get("created_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        at(a).cmp(&at(b))
+    })?;
+    let created = time(newest, "created_at");
+    let updated = time(newest, "updated_at");
+    (created.is_none() || updated != created).then(|| id(newest))
 }
 
 /// The newest bot verdict decides: a HOLD followed by an APPROVE (or any later
@@ -318,6 +338,43 @@ mod tests {
         let mut newer_edited = newer;
         newer_edited["updated_at"] = serde_json::json!("2026-01-02T00:05:00Z");
         assert_eq!(edited_latest_verdict(&[hold, newer_edited]), Some(2));
+    }
+
+    /// Edit metadata that cannot prove the newest verdict is unedited refuses
+    /// it: a forged APPROVE whose `updated_at` is missing, null, not a string or
+    /// not a time must not read as a closed HOLD.
+    #[test]
+    fn incomplete_edit_metadata_refuses_the_newest_verdict() {
+        let forged = serde_json::json!({"id": 7, "user":{"login":"shipyard-local[bot]"},
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z",
+            "body":"ok\nverdict: APPROVE head:old"});
+        assert_eq!(
+            edited_latest_verdict(std::slice::from_ref(&forged)),
+            None,
+            "control"
+        );
+        for updated in [
+            serde_json::Value::Null,
+            serde_json::json!(5),
+            serde_json::json!("not a time"),
+            serde_json::json!(""),
+        ] {
+            let mut bad = forged.clone();
+            bad["updated_at"] = updated.clone();
+            assert_eq!(edited_latest_verdict(&[bad]), Some(7), "{updated}");
+        }
+        let mut missing = forged.clone();
+        missing
+            .as_object_mut()
+            .expect("object")
+            .remove("updated_at");
+        assert_eq!(edited_latest_verdict(&[missing]), Some(7), "missing");
+        // An unreadable created_at on any bot verdict refuses: the newest
+        // verdict cannot be chosen past it.
+        let mut undated = forged.clone();
+        undated["id"] = serde_json::json!(8);
+        undated["created_at"] = serde_json::Value::Null;
+        assert_eq!(edited_latest_verdict(&[forged, undated]), Some(8));
     }
 
     #[test]

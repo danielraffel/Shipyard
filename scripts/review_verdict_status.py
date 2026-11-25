@@ -276,13 +276,26 @@ def removed_holds(guard: ModuleType, repo: str, number: int, head: str,
     policy. Only HOLDs count from the payload, never an APPROVE."""
     if event_name != "issue_comment":
         return []
-    comment = event.get("comment") or {}
-    if not isinstance(comment, dict):
-        return []
-    bodies = [comment.get("body")]
-    if event.get("action") == "edited":
-        bodies.append(((event.get("changes") or {}).get("body") or {}).get("from"))
-    if not any(isinstance(body, str) and "HOLD" in body for body in bodies):
+    # A comment event whose payload cannot be read is refused, never read as
+    # "no HOLD removed": the payload is the only record of a deleted HOLD.
+    comment = event.get("comment")
+    action = event.get("action")
+    if (not isinstance(comment, dict) or not isinstance(action, str)
+            or not isinstance(comment.get("body"), str)
+            or not isinstance(comment.get("user"), dict)
+            or not isinstance(comment["user"].get("login"), str)):
+        raise guard.GuardError("the comment event payload is malformed")
+    bodies = [comment["body"]]
+    if action == "edited":
+        changes = event.get("changes")
+        if not isinstance(changes, dict):
+            raise guard.GuardError("the comment edit carries no readable changes")
+        if "body" in changes:
+            before = changes["body"].get("from") if isinstance(changes["body"], dict) else None
+            if not isinstance(before, str):
+                raise guard.GuardError("the comment edit carries no readable earlier body")
+            bodies.append(before)
+    if not any("HOLD" in body for body in bodies):
         return []
     pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
     if not isinstance(pull, dict):
@@ -292,8 +305,6 @@ def removed_holds(guard: ModuleType, repo: str, number: int, head: str,
         guard.base_config_text(repo, guard.default_branch(pull)), repo, True)
     holds = []
     for body in bodies:
-        if not isinstance(body, str):
-            continue
         record = {"id": comment.get("id"), "user": comment.get("user"),
                   "author_association": comment.get("author_association"),
                   "created_at": comment.get("created_at"), "body": body}
@@ -305,13 +316,18 @@ def removed_holds(guard: ModuleType, repo: str, number: int, head: str,
 
 
 def status_creators() -> set[str]:
-    """The creator whose ``review-verdict`` statuses are this job's own: the
-    verdict App's bot once ``REVIEW_VERDICT_APP_BOT_LOGIN`` names it, else
-    ``github-actions[bot]``. Never both: every workflow in the repository posts
-    as ``github-actions[bot]``, so once the App posts, a ``github-actions``
-    failure is anyone's and must not hold a head."""
+    """The creators whose ``review-verdict`` HOLD failures hold a head:
+    ``github-actions[bot]``, and the verdict App's bot too once
+    ``REVIEW_VERDICT_APP_BOT_LOGIN`` names it.
+
+    The job posts every status as ``github-actions[bot]`` and only then, when
+    its token could be minted, as the App (``post_as_app``), so a HOLD
+    failure posted before the App existed, or one the App leg could not post,
+    is in the Actions history alone. Dropping that history would let a held
+    head read as unheld. Counting it fails closed: a HOLD failure another
+    workflow posts can only hold a head, never admit one."""
     app_bot = os.environ.get(APP_BOT_ENV, "").strip()
-    return {app_bot} if app_bot else {ACTIONS_BOT}
+    return {ACTIONS_BOT, app_bot} if app_bot else {ACTIONS_BOT}
 
 
 def held_in_history(guard: ModuleType, repo: str, head: str) -> str | None:
@@ -327,13 +343,25 @@ def held_in_history(guard: ModuleType, repo: str, head: str) -> str | None:
         if not isinstance(page, list):
             raise guard.GuardError(f"{what} are unreadable")
         for status in page:
-            if not isinstance(status, dict):
+            # Every field the match reads must be readable: a status that
+            # cannot be read could be the HOLD, so it refuses rather than
+            # being skipped. GitHub stores a status posted without one with
+            # a null description; this job always posts one.
+            creator = status.get("creator") if isinstance(status, dict) else None
+            if (not isinstance(status, dict)
+                    or not isinstance(status.get("context"), str)
+                    or not isinstance(status.get("state"), str)
+                    or not isinstance(creator, dict)
+                    or not isinstance(creator.get("login"), str)
+                    or not (status.get("description") is None
+                            or isinstance(status.get("description"), str))):
                 raise guard.GuardError(f"{what} contain a malformed status")
-            description = status.get("description")
-            if (status.get("context") == CONTEXT and status.get("state") == "failure"
-                    and (status.get("creator") or {}).get("login") in creators
-                    and isinstance(description, str)
-                    and description.lower().startswith(marker)):
+            description = status["description"]
+            if status["context"] != CONTEXT or creator["login"] not in creators:
+                continue
+            if not isinstance(description, str):
+                raise guard.GuardError(f"{what} contain a {CONTEXT} status with no description")
+            if status["state"] == "failure" and description.lower().startswith(marker):
                 return description
     return None
 

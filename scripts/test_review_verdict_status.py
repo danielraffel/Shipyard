@@ -100,6 +100,13 @@ class AwaitingClassification(unittest.TestCase):
         self.assertTrue(text.startswith("awaiting reviewer verdict; 31 approvals excluded"))
 
 
+def plain_comment_event() -> dict[str, Any]:
+    """An ``issue_comment`` payload on PR 784 whose comment is no verdict."""
+    return {"action": "created",
+            "comment": {"id": 1, "body": "thanks", "user": {"login": "someone"}},
+            "issue": {"number": 784, "pull_request": {"url": "x"}}}
+
+
 class ReviewVerdictStatus(unittest.TestCase):
     install = arm.ReviewBeforeArm.install
     case = arm.ReviewBeforeArm.case
@@ -162,8 +169,7 @@ class ReviewVerdictStatus(unittest.TestCase):
              **env: str) -> subprocess.CompletedProcess:
         (self.root / "calls").unlink(missing_ok=True)
         fake = self.install(answers)
-        payload = event if event is not None else {
-            "issue": {"number": 784, "pull_request": {"url": "x"}}}
+        payload = event if event is not None else plain_comment_event()
         event_path = self.root / "event.json"
         payload.setdefault("repository", {"default_branch": "main"})
         event_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -765,14 +771,77 @@ class TamperedVerdicts(unittest.TestCase):
         self.history = [held]
         self.post(self.answers(self.approved(), SIGNERS))
         self.assertEqual(self.posted()["state"], "failure")
-        # Once the App posts, only the App's own failure holds: a
-        # github-actions one could come from any workflow.
+        # With the App configured, the App's own failure holds, and so does
+        # the github-actions one: it may be a HOLD posted before the App
+        # existed, or one the App leg could not post.
         app = {"REVIEW_VERDICT_APP_BOT_LOGIN": "fleet-verdict[bot]"}
+        self.history = []
         self.post(self.answers(self.approved(), SIGNERS), **app)
-        self.assertEqual(self.posted()["state"], "success")
+        self.assertEqual(self.posted()["state"], "success", "control: no history")
+        self.history = [dict(held, creator={"login": "someone-else[bot]"})]
+        self.post(self.answers(self.approved(), SIGNERS), **app)
+        self.assertEqual(self.posted()["state"], "success", "another creator's status")
+        self.history = [held]
+        self.post(self.answers(self.approved(), SIGNERS), **app)
+        self.assertEqual(self.posted()["state"], "failure", "the Actions history still holds")
         self.history = [dict(held, creator={"login": "fleet-verdict[bot]"})]
         self.post(self.answers(self.approved(), SIGNERS), **app)
         self.assertEqual(self.posted()["state"], "failure")
+
+    def test_a_malformed_status_in_the_history_refuses(self) -> None:
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        # Control: a status of another context with a null description is
+        # GitHub's own shape for a status posted without one.
+        self.history = [dict(held, context="ci", description=None)]
+        self.post(self.answers(self.approved(), SIGNERS))
+        self.assertEqual(self.posted()["state"], "success", "control")
+        broken = [{k: v for k, v in held.items() if k != "creator"},
+                  dict(held, creator=None), dict(held, creator={}),
+                  {k: v for k, v in held.items() if k != "context"},
+                  dict(held, context=None),
+                  {k: v for k, v in held.items() if k != "state"},
+                  dict(held, state=7), dict(held, description=None),
+                  dict(held, description=["x"]), "not a status"]
+        for bad in broken:
+            self.history = [bad]
+            result = self.post(self.answers(self.approved(), SIGNERS))
+            self.assertNotEqual(result.returncode, 0, f"{bad}: {result.stdout}")
+            self.assertNotIn("state=success", self.calls(), bad)
+
+    def test_a_malformed_comment_event_refuses(self) -> None:
+        approve = SIGNED_APPROVE.format(head=HEAD)
+        good = self.comment_event("edited", approve, before="thanks")
+        self.post(self.answers(self.approved(), SIGNERS), event=good)
+        self.assertEqual(self.posted()["state"], "success", "control")
+        broken = []
+        for key in ("comment", "action"):
+            event = self.comment_event("deleted", approve)
+            event.pop(key)
+            broken.append(event)
+        event = self.comment_event("deleted", approve)
+        event["comment"] = "text"
+        broken.append(event)
+        event = self.comment_event("deleted", approve)
+        event["comment"].pop("body")
+        broken.append(event)
+        event = self.comment_event("deleted", approve)
+        event["comment"]["body"] = None
+        broken.append(event)
+        event = self.comment_event("deleted", approve)
+        event["comment"]["user"] = None
+        broken.append(event)
+        edited = self.comment_event("edited", approve)
+        broken.append(edited)
+        for changes in ({"body": None}, {"body": {}}, {"body": {"from": 3}}, "x"):
+            event = self.comment_event("edited", approve)
+            event["changes"] = changes
+            broken.append(event)
+        for event in broken:
+            result = self.post(self.answers(self.approved(), SIGNERS), event=event)
+            self.assertNotEqual(result.returncode, 0, f"{event}: {result.stdout}")
+            self.assertNotIn("state=success", self.calls(), event)
 
     def retargeted(self, base_config: str) -> list[tuple[str, dict[str, Any]]]:
         answers = self.answers([], SIGNERS)
@@ -840,6 +909,24 @@ class TamperedVerdicts(unittest.TestCase):
         self.assertIn("not the default branch main", guard.stderr)
         self.assertNotIn("ref=b0", self.calls())
 
+    def test_the_host_guard_refuses_another_base_even_when_review_is_off(self) -> None:
+        # The default branch's policy turns review off; that opt-out still
+        # never lands a pull request into another base.
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+
+        def into(base: str) -> list[tuple[str, dict[str, Any]]]:
+            answers = self.answers([], OPT_OUT)
+            pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+            pull["base"]["ref"] = base
+            return answers
+
+        allowed = self.run_guard(merge, into("main"), REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(allowed.returncode, 0, "control: " + allowed.stderr)
+        refused = self.run_guard(merge, into("b0"), REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(refused.returncode, 0, refused.stderr)
+        self.assertIn("not the default branch main", refused.stderr)
+        self.assertNotIn("does not require a review", refused.stderr)
+
     def test_an_unreadable_hold_record_refuses(self) -> None:
         (self.guards / "holds.jsonl").mkdir()
         guard = self.run_guard(["pr", "merge", "784", "--merge", "--match-head-commit", HEAD],
@@ -892,7 +979,7 @@ class TamperedVerdicts(unittest.TestCase):
         # App's last `success` is never left standing on a refused head.
         held = self.answers([], SIGNERS)
         self.install(held)
-        refused = self.post(held, event={"issue": {"number": 784, "pull_request": {"url": "x"}}},
+        refused = self.post(held, event=plain_comment_event(),
                             GHAPP_REAL_GH=str(self.app_gh(self.root / "gh")),
                             REVIEW_VERDICT_APP_ID="123",
                             REVIEW_VERDICT_APP_TOKEN="broken-app-token")
