@@ -40,6 +40,8 @@ impl Fixture {
             ["contents/.shipyard/config.toml", {"text": base_config}],
             ["/reviews", {"pages": [[]]}],
             ["/comments", {"pages": [comments]}],
+            // The deciding comment's edit history: never edited.
+            ["lastEditedAt", {"json": {"data": {"node": {"lastEditedAt": null}}}}],
             ["node(id:", {"json": {"data": {"node": {
                 "number": 4242, "state": "OPEN", "headRefOid": HEAD, "baseRefName": "main",
                 "isInMergeQueue": false, "mergeQueueEntry": null, "autoMergeRequest": null,
@@ -163,6 +165,8 @@ fn verdict(body: &str) -> Value {
         "user": {"login": "shipyard-local[bot]", "type": "Bot"},
         "author_association": "CONTRIBUTOR",
         "created_at": "2026-10-24T22:53:36Z",
+        "updated_at": "2026-10-24T22:53:36Z",
+        "node_id": "IC_verdict",
         "body": body,
     }])
 }

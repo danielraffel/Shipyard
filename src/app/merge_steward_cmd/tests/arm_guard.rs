@@ -21,6 +21,7 @@ case "$*" in
   *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'reviewer_signers = ["pulp-review"]' ;;
   *"--slurp"*"pulls/42/reviews"*) printf '%s' '[[]]' ;;
   *"--slurp"*"issues/42/comments"*) printf '%s' '[[{comments}]]' ;;
+  *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"node(id:"*) printf '%s' '{{"data":{{"node":{{"number":42,"state":"OPEN","headRefOid":"{head}","baseRefName":"main","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"repository":{{"nameWithOwner":"Generous-Corp/pulp"}},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}' ;;
   "api repos/Generous-Corp/pulp/pulls/42") printf '%s' '{{"number":42,"base":{{"ref":"main","repo":{{"default_branch":"main"}}}},"head":{{"sha":"{head}"}},"user":{{"login":"shipyard-local[bot]","type":"Bot"}}}}' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
@@ -42,7 +43,7 @@ esac
 
 fn approval(signer: &str) -> String {
     format!(
-        r#"{{"id":6390564321,"user":{{"login":"shipyard-local[bot]","type":"Bot"}},"author_association":"CONTRIBUTOR","created_at":"2026-10-24T22:53:36Z","body":"reviewer: {signer}\n<!-- session: Daniels-Mac-Studio-m3/08fb81d8 -->\nverdict: APPROVE head:{HEAD}"}}"#
+        r#"{{"id":6390564321,"user":{{"login":"shipyard-local[bot]","type":"Bot"}},"author_association":"CONTRIBUTOR","created_at":"2026-10-24T22:53:36Z","updated_at":"2026-10-24T22:53:36Z","node_id":"IC_verdict","body":"reviewer: {signer}\n<!-- session: Daniels-Mac-Studio-m3/08fb81d8 -->\nverdict: APPROVE head:{HEAD}"}}"#
     )
 }
 
