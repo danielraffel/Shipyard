@@ -2720,6 +2720,13 @@ fn edit_checked(
         ],
     )
     .map_err(|error| format!("approval comment {id} edit history unreadable: {error}"))?;
+    // Partial data next to errors is not an answer.
+    if answer.get("errors").is_some_and(|errors| !errors.is_null()) {
+        return Err(format!(
+            "approval comment {id} edit history unreadable: {}",
+            answer["errors"]
+        ));
+    }
     match answer.pointer("/data/node/lastEditedAt") {
         Some(Value::Null) => Ok(gate),
         Some(Value::String(_)) => Ok(HeadGate::NotApproved {

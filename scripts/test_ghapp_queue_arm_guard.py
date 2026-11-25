@@ -4341,8 +4341,8 @@ class ReviewIdentity(unittest.TestCase):
     def comment(self, login: str, body: str, at: str | None = "2026-10-12T01:00:00Z",
                 association: str = "COLLABORATOR") -> dict[str, Any]:
         kind = "Bot" if login.endswith("[bot]") else "User"
-        return {"user": {"login": login, "type": kind}, "created_at": at, "body": body,
-                "author_association": association}
+        return {"user": {"login": login, "type": kind}, "created_at": at, "updated_at": at,
+                "body": body, "author_association": association}
 
     def test_an_edited_approve_never_counts_and_an_edited_hold_still_holds(self) -> None:
         # merge-queue-rehearsal#47: a pull request's own GITHUB_TOKEN edited an
@@ -4371,10 +4371,13 @@ class ReviewIdentity(unittest.TestCase):
     def test_unreadable_or_noncomparable_edit_times_count_as_edited(self) -> None:
         base = {"created_at": "2026-10-12T01:00:00Z"}
         self.assertFalse(guard.comment_edited(dict(base, updated_at="2026-10-12T01:00:00Z")))
-        self.assertFalse(guard.comment_edited(base), "no updated_at: not read from the API")
-        for updated in ("yesterday", "2026-10-12T01:00:00", 5, ""):
+        for updated in ("yesterday", "2026-10-12T01:00:00", 5, "", None):
             self.assertTrue(guard.comment_edited(dict(base, updated_at=updated)), updated)
+        self.assertTrue(guard.comment_edited(base), "a missing updated_at")
         self.assertTrue(guard.comment_edited({"created_at": None, "updated_at": "x"}))
+        # Malformed values that are equal still count as edited.
+        for same in ("yesterday", "", "2026-10-12T01:00:00"):
+            self.assertTrue(guard.comment_edited({"created_at": same, "updated_at": same}), same)
 
     def test_a_listed_humans_edited_approve_does_not_count(self) -> None:
         approve = dict(self.comment("danielraffel", f"verdict: APPROVE head:{self.HEAD}",
@@ -4470,6 +4473,7 @@ class ReviewIdentity(unittest.TestCase):
             for association in ("NONE", "OWNER"):
                 spoof = {"user": {"login": login, "type": "User"}, "author_association": association,
                          "created_at": "2026-10-12T01:00:00Z",
+                         "updated_at": "2026-10-12T01:00:00Z",
                          "body": f"reviewer: pulp-review\nverdict: APPROVE head:{self.HEAD}"}
                 self.assertFalse(guard.review_verdict(self.HEAD, "shipyard-local[bot]", [spoof], [],
                                                       self.policy())[0], (login, association))
@@ -4485,6 +4489,9 @@ class ReviewIdentity(unittest.TestCase):
 
     def incident(self, name: str) -> tuple[dict[str, Any], str]:
         comment = review_fixture(name)
+        # The trimmed capture keeps no updated_at; the live comment was
+        # never edited.
+        comment.setdefault("updated_at", comment.get("created_at"))
         head = guard.marker_verdict(comment["body"])[1]
         return comment, head
 
@@ -5021,7 +5028,8 @@ class HoldMakesHeadUnapprovable(unittest.TestCase):
         body = (f"Review.\nreviewer: {signer}\n"
                 f"<!-- session: Daniels-Mac-Studio-m3/{session} -->\nverdict: {verdict} head:{head}")
         return {"id": comment_id, "user": {"login": "shipyard-local[bot]", "type": "Bot"},
-                "created_at": at, "body": body, "author_association": "CONTRIBUTOR"}
+                "created_at": at, "updated_at": at, "body": body,
+                "author_association": "CONTRIBUTOR"}
 
     def judge(self, comments: list[dict[str, Any]],
               reviews: list[dict[str, Any]] | None = None) -> tuple[bool, str]:
@@ -5058,7 +5066,8 @@ class HoldMakesHeadUnapprovable(unittest.TestCase):
 
     def test_a_hold_from_a_login_that_does_not_count_is_ignored(self) -> None:
         drive_by = {"id": 9, "user": {"login": "drive-by", "type": "User"},
-                    "created_at": "2026-10-31T14:00:00Z", "author_association": "NONE",
+                    "created_at": "2026-10-31T14:00:00Z", "updated_at": "2026-10-31T14:00:00Z",
+                    "author_association": "NONE",
                     "body": f"verdict: HOLD head:{self.HEAD}"}
         allowed, why = self.judge([
             drive_by,

@@ -696,6 +696,11 @@ class TamperedVerdicts(unittest.TestCase):
             "lastEditedAt": "2026-10-12T15:00:00Z"}}}}), *self.answers(self.approved(), SIGNERS)]
         result = self.post(edited)
         self.assertEqual(self.posted()["state"], "pending", result.stdout + result.stderr)
+        partial = [("lastEditedAt", {"json": {"data": {"node": {"lastEditedAt": None}},
+                                              "errors": [{"message": "rate limited"}]}}),
+                   *self.answers(self.approved(), SIGNERS)]
+        result = self.post(partial)
+        self.assertEqual(self.posted()["state"], "failure", "errors beside partial data")
         unreadable = [("lastEditedAt", {"error": "gh: HTTP 502"}),
                       *self.answers(self.approved(), SIGNERS)]
         result = self.post(unreadable)
@@ -802,7 +807,7 @@ class TamperedVerdicts(unittest.TestCase):
         record = self.guards / "holds.jsonl"
         record.write_text(json.dumps({"repo": "danielraffel/shipyard", "pr": 784,
                                       "hold_head": arm.HOLD_784, "action": "none"}) + "\n"
-                          + "not json\n", encoding="utf-8")
+                          , encoding="utf-8")
         other = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
                                SHIPYARD_SIGNERS_FROM_BASE="1")
         self.assertEqual(other.returncode, 0, "a HOLD of another head: " + other.stderr)
@@ -813,6 +818,27 @@ class TamperedVerdicts(unittest.TestCase):
                               SHIPYARD_SIGNERS_FROM_BASE="1")
         self.assertNotEqual(held.returncode, 0, held.stderr)
         self.assertIn("hold record", held.stderr)
+
+    def test_a_malformed_hold_record_refuses(self) -> None:
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+        record = self.guards / "holds.jsonl"
+        for bad in ("not json\n", "[1, 2]\n", "\"text\"\n"):
+            record.write_text(json.dumps({"repo": REPO, "pr": 9, "hold_head": HEAD}) + "\n"
+                              + bad, encoding="utf-8")
+            guard = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                                   SHIPYARD_SIGNERS_FROM_BASE="1")
+            self.assertNotEqual(guard.returncode, 0, bad + guard.stderr)
+            self.assertIn("hold record", guard.stderr)
+
+    def test_the_host_guard_refuses_a_pull_request_into_another_base(self) -> None:
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+        answers = self.answers(self.approved(), SIGNERS)
+        pull = next(answer["json"] for needle, answer in answers if needle == "/pulls/")
+        pull["base"]["ref"] = "b0"
+        guard = self.run_guard(merge, answers, REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertNotEqual(guard.returncode, 0, guard.stderr)
+        self.assertIn("not the default branch main", guard.stderr)
+        self.assertNotIn("ref=b0", self.calls())
 
     def test_an_unreadable_hold_record_refuses(self) -> None:
         (self.guards / "holds.jsonl").mkdir()

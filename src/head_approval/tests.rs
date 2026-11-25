@@ -4679,6 +4679,12 @@ fn an_approve_edited_in_its_own_second_is_refused_by_graphql() {
     );
     assert!(judge(Err("gh: HTTP 502".to_owned())).is_err());
     assert!(judge(Ok(json!({"data": {"node": null}}))).is_err());
+    // Errors beside partial data are not an answer.
+    assert!(
+        judge(Ok(json!({"data": {"node": {"lastEditedAt": null}},
+                        "errors": [{"message": "rate limited"}]})))
+        .is_err()
+    );
 }
 
 /// A comment read from the API (it carries `updated_at`) with no `node_id`

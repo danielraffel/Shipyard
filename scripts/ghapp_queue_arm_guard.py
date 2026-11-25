@@ -1789,17 +1789,13 @@ def comment_edited(comment: dict[str, Any]) -> bool:
     included) can edit any comment in the repository, and the author stays
     who posted it (merge-queue-rehearsal#47 proved it on an App comment). So
     an edited body says nothing about what its author wrote. GitHub moves
-    ``updated_at`` on an edit and not on a reaction. A record without
-    ``updated_at`` is one this module did not read from the API; one whose
-    times cannot be compared counts as edited."""
-    created_raw = comment.get("created_at")
-    updated_raw = comment.get("updated_at")
-    if updated_raw is None:
-        return False
-    if updated_raw == created_raw:
-        return False
-    created = _timestamp(created_raw)
-    updated = _timestamp(updated_raw)
+    ``updated_at`` on an edit and not on a reaction. Anything but two valid,
+    comparable, equal times (a missing, null or malformed one) counts as
+    edited."""
+    created = _timestamp(comment.get("created_at"))
+    updated = _timestamp(comment.get("updated_at"))
+    # Only two valid, comparable RFC 3339 times that are equal read as never
+    # edited; a missing, null or malformed one counts as edited.
     if (created is None or updated is None
             or created.tzinfo is None or updated.tzinfo is None):
         return True
@@ -1878,13 +1874,17 @@ def recorded_hold(repo: str, number: int, head: str) -> str | None:
         return None
     except OSError as error:
         raise GuardError(f"the hold record {path} is unreadable: {error}") from error
-    for line in text.splitlines():
+    for number_line, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
         try:
             row = json.loads(line)
-        except ValueError:
-            continue
-        if (isinstance(row, dict)
-                and str(row.get("repo") or "").lower() == repo.lower()
+        except ValueError as error:
+            raise GuardError(f"the hold record {path} line {number_line} is malformed: "
+                             f"{error}") from error
+        if not isinstance(row, dict):
+            raise GuardError(f"the hold record {path} line {number_line} is not an object")
+        if (str(row.get("repo") or "").lower() == repo.lower()
                 and row.get("pr") == number
                 and str(row.get("hold_head") or "").lower() == head.lower()):
             return str(row.get("at") or "an unrecorded time")
@@ -3596,7 +3596,11 @@ def comment_last_edited(node_id: str) -> str | None:
     the second the comment was posted leaves it equal to ``created_at``;
     ``lastEditedAt`` is set by any edit. Raises when it cannot be read."""
     answer = graphql(COMMENT_EDIT_QUERY, {"id": node_id})
-    node = ((answer or {}).get("data") or {}).get("node") if isinstance(answer, dict) else None
+    if not isinstance(answer, dict) or answer.get("errors"):
+        # Partial data next to errors is not an answer.
+        raise GuardError(f"comment {node_id} edit history is unreadable "
+                         f"({(answer or {}).get('errors') if isinstance(answer, dict) else answer})")
+    node = (answer.get("data") or {}).get("node")
     if not isinstance(node, dict) or "lastEditedAt" not in node:
         raise GuardError(f"comment {node_id} edit history is unreadable")
     edited = node["lastEditedAt"]
@@ -3669,13 +3673,23 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         # base: a pull request chooses its base, and a branch no ruleset
         # protects can carry a config that turns review off or names any
         # reviewer (verdict-App review N4).
-        config_text = base_config_text(repo, default_branch(pull))
+        default = default_branch(pull)
+        config_text = base_config_text(repo, default)
         policy = review_policy(config_text, repo, True)
         if not policy["required"] and not host_requires_guard():
             # A host that requires guard admission never takes this early
             # return: a base cannot opt out of review to dodge the host rule
             # (src/head_approval/guard.rs checks the host rule first too).
             return True, f"{repo} does not require a review before arming", None
+        if base != default:
+            # The same refusal as the status and `shipyard review-verdict`: a
+            # pull request chooses its base, and only the default branch is
+            # protected, so a review is judged only for a pull request into it.
+            what = (f"its base {base} is not the default branch {default}; only a pull "
+                    f"request into {default} is judged")
+            return False, f"{label} ({repo}): {what}", review_fix(
+                "wrong_base", f"{label}: {what}", repo, number, head,
+                f"retarget https://github.com/{repo}/pull/{number} to {default}", False)
         live_head = ((pull.get("head") or {}).get("sha") or "").lower()
         if live_head != head.lower():
             return False, (

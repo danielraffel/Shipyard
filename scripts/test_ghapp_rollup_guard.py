@@ -238,6 +238,7 @@ class RollupAcceptance(unittest.TestCase):
         earlier = "e" * 40
         comment = {"id": 5, "user": {"login": "shipyard-review[bot]", "type": "Bot"},
                    "author_association": "NONE", "created_at": "2026-10-04T00:00:00Z",
+                   "updated_at": "2026-10-04T00:00:00Z", "node_id": "IC_5",
                    "body": f"verdict: APPROVE head:{earlier}"}
         policy = guard.review_policy('[auto_merge]\narm_requires_head_approval = true\n'
                                      'reviewer_identities = ["shipyard-review[bot]"]\n',
@@ -247,7 +248,8 @@ class RollupAcceptance(unittest.TestCase):
         with mock.patch.object(guard, "run_real_gh", side_effect=hub), \
                 mock.patch.object(guard, "_rest_pages", side_effect=pages.__getitem__), \
                 mock.patch.object(guard, "merge_only_carry", return_value=None), \
-                mock.patch.object(guard, "carry_limits", return_value=None):
+                mock.patch.object(guard, "carry_limits", return_value=None), \
+                mock.patch.object(guard, "comment_last_edited", return_value=None):
             refusal = guard.member_review(REPO, 11, heads[0], policy, True)
             self.assertIn("member #11", refusal)
             # With require_counted_approval off, the carry rule decides.
@@ -383,6 +385,7 @@ class RollupReviewGate(unittest.TestCase):
                   '[train]\nenabled = true\nmode = "rollup"\n')
         verdict = {"id": 5, "user": {"login": "shipyard-review[bot]", "type": "Bot"},
                    "author_association": "NONE", "created_at": "2026-10-04T00:00:00Z",
+                   "updated_at": "2026-10-04T00:00:00Z", "node_id": "IC_5",
                    "body": f"verdict: APPROVE head:{head}"}
         pages: dict[str, list[Any]] = {
             f"repos/{REPO}/issues/11/comments?per_page=100": [verdict],
@@ -396,6 +399,7 @@ class RollupReviewGate(unittest.TestCase):
                 mock.patch.object(guard, "run_real_gh", side_effect=hub), \
                 mock.patch.object(guard, "base_config_text", return_value=config), \
                 mock.patch.object(guard, "_rest_pages", side_effect=lambda path: pages[path]), \
+                mock.patch.object(guard, "comment_last_edited", return_value=None), \
                 contextlib.redirect_stderr(io.StringIO()):
             allowed, message, _ = guard.review_gate(dict(target), REPO)
             self.assertTrue(allowed, message)

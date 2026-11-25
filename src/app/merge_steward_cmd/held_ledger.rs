@@ -140,9 +140,26 @@ fn recorded_hold(
             ));
         }
     };
-    Ok(text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    // A malformed or non-object line refuses, as in the queue-arm guard.
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str::<Value>(line)
+            .ok()
+            .filter(Value::is_object)
+            .ok_or_else(|| {
+                format!(
+                    "the hold record {} line {} is malformed",
+                    path.display(),
+                    index + 1
+                )
+            })?;
+        rows.push(row);
+    }
+    Ok(rows
+        .into_iter()
         .find(|row| {
             row.get("repo")
                 .and_then(Value::as_str)
@@ -391,7 +408,7 @@ mod tests {
         std::fs::write(
             dir.path().join(HOLDS_LOG),
             format!(
-                "not json\n{}\n",
+                "{}\n",
                 serde_json::json!({"repo": "O/R", "pr": 7, "hold_head": HEAD,
                                    "at": "2026-11-24T01:00:00Z"})
             ),
@@ -416,6 +433,16 @@ mod tests {
                 .allows(),
             "another pull request"
         );
+        // A malformed or non-object line refuses.
+        for bad in ["not json", "[1]", "\"text\""] {
+            let malformed = tempfile::tempdir().expect("guards");
+            std::fs::write(malformed.path().join(HOLDS_LOG), format!("{bad}\n")).expect("record");
+            assert!(
+                apply_with_holds(&ledger, Some(malformed.path()), "o/r", 7, HEAD, approved())
+                    .is_err(),
+                "{bad}"
+            );
+        }
         // A directory where the file should be cannot be read as a file.
         let unreadable = tempfile::tempdir().expect("guards");
         std::fs::create_dir(unreadable.path().join(HOLDS_LOG)).expect("dir");
