@@ -4871,3 +4871,218 @@ fn identical_malformed_edit_stamps_count_as_edited() {
     bad["updated_at"] = json!("yesterday");
     assert!(super::edit_checked(&gh, HEAD, std::slice::from_ref(&bad), approved).is_err());
 }
+
+/// Every field the gate judges a verdict by, fed a table of malformed
+/// variants: each refuses the records, never drops the verdict.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_verdict_record_with_any_malformed_identity_field_refuses() {
+    const HEAD: &str = "fd0e94e25f447578256f3aae97cc0ab6103d5f0c";
+    let policy = by_default("danielraffel/Shipyard");
+    let hold = json!({"id": 1, "login": "someone", "type": "User", "association": "OWNER",
+                      "at": "2026-11-25T00:00:00Z", "updated_at": "2026-11-25T00:00:00Z",
+                      "body": format!("verdict: HOLD head:{HEAD}")});
+    let app = json!({"id": 2, "login": "shipyard-local[bot]", "type": "Bot",
+                     "association": "NONE", "body": format!("verdict: HOLD head:{HEAD}")});
+    let review = json!({"id": 3, "login": "someone", "type": "User", "association": "MEMBER",
+                        "state": "CHANGES_REQUESTED", "commit_id": HEAD});
+    assert_eq!(
+        super::verdict_records_checked(
+            std::slice::from_ref(&review),
+            &[hold.clone(), app.clone()],
+            &policy
+        ),
+        Ok(()),
+        "control"
+    );
+    let bad_logins = [
+        json!(""),
+        json!(" "),
+        json!(" someone"),
+        json!("someone "),
+        json!("some one"),
+        json!("x".repeat(40)),
+        json!("-x"),
+        json!("x\n"),
+        json!("x[BOT]"),
+        json!(5),
+        json!(null),
+        json!(["someone"]),
+    ];
+    let bad_enum = |good: &str| {
+        vec![
+            json!(""),
+            json!(format!(" {good}")),
+            json!(good.to_ascii_lowercase()),
+            json!("unknown"),
+            json!(5),
+            json!(null),
+            json!([good]),
+        ]
+    };
+    let bad_shas = [
+        json!(""),
+        json!(HEAD.to_ascii_uppercase()),
+        json!(&HEAD[..39]),
+        json!(format!("{HEAD}0")),
+        json!(format!(" {HEAD}")),
+        json!("g".repeat(40)),
+        json!(5),
+        json!(null),
+    ];
+    let refuses = |reviews: &[Value], comments: &[Value], what: &str| {
+        assert!(
+            super::verdict_records_checked(reviews, comments, &policy).is_err(),
+            "{what}"
+        );
+    };
+    let set = |record: &Value, key: &str, value: Option<&Value>| {
+        let mut record = record.clone();
+        match value {
+            Some(value) => record[key] = value.clone(),
+            None => {
+                record.as_object_mut().expect("object").remove(key);
+            }
+        }
+        record
+    };
+    for value in bad_logins.iter().map(Some).chain([None]) {
+        refuses(
+            &[],
+            &[set(&hold, "login", value)],
+            &format!("comment login {value:?}"),
+        );
+        refuses(
+            &[set(&review, "login", value)],
+            &[],
+            &format!("review login {value:?}"),
+        );
+    }
+    for value in bad_enum("OWNER").iter().map(Some).chain([None]) {
+        refuses(
+            &[],
+            &[set(&hold, "association", value)],
+            &format!("association {value:?}"),
+        );
+        refuses(
+            &[set(&review, "association", value)],
+            &[],
+            &format!("association {value:?}"),
+        );
+    }
+    for value in bad_enum("Bot").iter().map(Some).chain([None]) {
+        refuses(
+            &[],
+            &[set(&app, "type", value)],
+            &format!("App type {value:?}"),
+        );
+    }
+    for value in bad_enum("CHANGES_REQUESTED").iter().map(Some).chain([None]) {
+        refuses(
+            &[set(&review, "state", value)],
+            &[],
+            &format!("state {value:?}"),
+        );
+    }
+    for value in bad_shas.iter().map(Some).chain([None]) {
+        refuses(
+            &[set(&review, "commit_id", value)],
+            &[],
+            &format!("commit_id {value:?}"),
+        );
+    }
+    for value in [json!(5), json!(null), json!(["x"])] {
+        refuses(
+            &[],
+            &[set(&hold, "body", Some(&value))],
+            &format!("body {value:?}"),
+        );
+    }
+    // Controls: a record with no verdict is never judged, and a field the
+    // policy never reads (an association under a reviewer list) is not
+    // checked.
+    let plain = json!({"id": 4, "login": null, "body": "thanks"});
+    let commented = json!({"id": 5, "login": null, "state": "COMMENTED"});
+    assert_eq!(
+        super::verdict_records_checked(&[commented], &[plain], &policy),
+        Ok(())
+    );
+    assert_eq!(
+        super::verdict_records_checked(
+            &[],
+            &[set(&hold, "association", None)],
+            &required(&["someone"])
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn logins_and_shas_follow_githubs_canonical_form() {
+    for login in [
+        "someone",
+        "shipyard-local[bot]",
+        "app/shipyard-local",
+        "A-b-1",
+        &"a".repeat(39),
+    ] {
+        assert!(super::is_login(login), "{login}");
+    }
+    for login in [
+        "",
+        " ",
+        "-x",
+        "a b",
+        "x[BOT]",
+        "x[bot] ",
+        &"a".repeat(40),
+        "a@b",
+    ] {
+        assert!(!super::is_login(login), "{login:?}");
+    }
+    assert!(super::is_api_sha(
+        "fd0e94e25f447578256f3aae97cc0ab6103d5f0c"
+    ));
+    for sha in [
+        "",
+        "FD0E94E25F447578256F3AAE97CC0AB6103D5F0C",
+        "fd0e94e25f447578256f3aae97cc0ab6103d5f0",
+        " fd0e94e25f447578256f3aae97cc0ab6103d5f0",
+        "gd0e94e25f447578256f3aae97cc0ab6103d5f0c",
+    ] {
+        assert!(!super::is_api_sha(sha), "{sha:?}");
+    }
+}
+
+/// The author read for the self-approval rule must be a canonical login:
+/// an empty or malformed one would read as "nobody to exclude".
+#[test]
+fn pr_author_refuses_a_non_canonical_login() {
+    let policy = by_default("danielraffel/Shipyard");
+    let read = |answer: &'static str| {
+        let gh = move |_: &[String]| -> Result<String, String> { Ok(answer.to_owned()) };
+        super::pr_author(&gh, "danielraffel/Shipyard", 7, &policy, None)
+    };
+    assert_eq!(read("someone\n"), Ok(Some("someone".to_owned())), "control");
+    for answer in ["", "\n", " \n", " someone\n", "some one\n", "someone \n"] {
+        assert!(read(answer).is_err(), "{answer:?}");
+    }
+    let gh = |_: &[String]| -> Result<String, String> { Err("not read".to_owned()) };
+    for known in ["", " someone", "some one"] {
+        assert!(
+            super::pr_author(&gh, "danielraffel/Shipyard", 7, &policy, Some(known)).is_err(),
+            "{known:?}"
+        );
+    }
+    assert_eq!(
+        super::pr_author(
+            &gh,
+            "danielraffel/Shipyard",
+            7,
+            &policy,
+            Some("app/shipyard-local")
+        ),
+        Ok(Some("app/shipyard-local".to_owned())),
+        "control: GraphQL's App login"
+    );
+}

@@ -112,6 +112,21 @@ fn judged_heads(gate: &HeadGate, head: &str) -> Vec<String> {
 /// queue-arm guard reads the same file.
 const HOLDS_LOG: &str = "holds.jsonl";
 
+/// `owner/name` with no whitespace and nothing else: a repository the hold
+/// hook could have written.
+fn canonical_repo(name: &str) -> bool {
+    let mut parts = name.split('/');
+    let well_formed = |part: Option<&str>| {
+        part.is_some_and(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+    };
+    well_formed(parts.next()) && well_formed(parts.next()) && parts.next().is_none()
+}
+
 /// When this host's hold record names `head` of `repo#pr` as held.
 ///
 /// No file (or no guards directory) is no record.
@@ -160,11 +175,14 @@ fn recorded_hold(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
         };
+        // The hold hook writes `hold_head` from the verdict marker, so it is
+        // 40 lowercase hex; a padded, short or upper-case one would match no
+        // head and be skipped.
         let (Some(name), Some(number), Some(hold_head), Some(at)) = (
-            text_field("repo"),
-            row.get("pr").and_then(Value::as_u64),
-            text_field("hold_head"),
-            text_field("at"),
+            text_field("repo").filter(|name| canonical_repo(name)),
+            row.get("pr").and_then(Value::as_u64).filter(|pr| *pr > 0),
+            text_field("hold_head").filter(|head| crate::head_approval::is_api_sha(head)),
+            text_field("at").filter(|at| DateTime::parse_from_rfc3339(at).is_ok()),
         ) else {
             return Err(malformed());
         };
@@ -391,6 +409,7 @@ mod tests {
     /// The host's hold record holds the live head and a carried-from head
     /// with an empty ledger; an unreadable record is an error, never a pass.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn the_hosts_hold_record_holds_and_fails_closed() {
         let ledger = StewardLedger::default();
         let dir = tempfile::tempdir().expect("guards");
@@ -457,6 +476,19 @@ mod tests {
             ("at", Value::Null),
             ("at", serde_json::json!(5)),
             ("at", serde_json::json!("")),
+            // Present and typed but not canonical: each would match no head
+            // (or no repository) and be skipped as "no record".
+            ("repo", serde_json::json!(" O/R")),
+            ("repo", serde_json::json!("O R/x")),
+            ("repo", serde_json::json!("o")),
+            ("repo", serde_json::json!("o/r/x")),
+            ("pr", serde_json::json!(0)),
+            ("hold_head", serde_json::json!(format!(" {HEAD}"))),
+            ("hold_head", serde_json::json!(HEAD.to_ascii_uppercase())),
+            ("hold_head", serde_json::json!(&HEAD[..39])),
+            ("hold_head", serde_json::json!(format!("{HEAD}0"))),
+            ("at", serde_json::json!("yesterday")),
+            ("at", serde_json::json!(" 2026-11-24T01:00:00Z")),
         ] {
             let mut row = held.clone();
             row[key] = value;

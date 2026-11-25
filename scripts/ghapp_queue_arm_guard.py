@@ -307,6 +307,43 @@ TOKEN_PERMISSIONS_HEADER = "GITHUB_TOKEN Permissions"
 # (refs/pull/<n>/merge) the full lane checks out.
 FULL_LANE_PR_INPUT = "pr_number"
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+# Every ``author_association`` GitHub documents. Any other value is
+# unreadable: read as untrusted, a HOLD from a trusted account would be dropped.
+AUTHOR_ASSOCIATIONS = frozenset({
+    "COLLABORATOR", "CONTRIBUTOR", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN",
+    "MEMBER", "NONE", "OWNER"})
+# Every ``user.type`` GitHub documents. A missing type would read the fleet
+# App as a user account and drop its HOLD.
+USER_TYPES = frozenset({"Bot", "Organization", "User"})
+# Every pull request review state the REST API documents, exactly as it
+# spells them.
+REVIEW_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"})
+# A GitHub login: alphanumerics and hyphens, at most 39 characters, starting
+# with an alphanumeric; an App's bot user adds ``[bot]``, and GraphQL names
+# an App ``app/<slug>``. Same as
+# scripts/review_verdict_status.py LOGIN.
+LOGIN = re.compile(r"(?:app/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?")
+# A commit sha as GitHub's REST API answers it: 40 lowercase hex.
+API_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def is_login(value: Any) -> bool:
+    """A canonical GitHub login: a string matching ``LOGIN`` exactly (never
+    empty, padded, or carrying any other character)."""
+    return isinstance(value, str) and LOGIN.fullmatch(value) is not None
+
+
+def in_enum(value: Any, allowed: frozenset[str]) -> bool:
+    """One of ``allowed`` exactly: a string, so an unhashable value refuses
+    rather than raising ``TypeError``."""
+    return isinstance(value, str) and value in allowed
+
+
+def is_api_sha(value: Any) -> bool:
+    """A commit sha as the REST API answers it: 40 lowercase hex characters."""
+    return isinstance(value, str) and API_SHA.fullmatch(value) is not None
+
+
 MERGE_MUTATIONS = ("mergepullrequest",)
 # Same pattern as src/head_approval.rs marker_verdict.
 _MARKER = re.compile(
@@ -1887,12 +1924,18 @@ def recorded_hold(repo: str, number: int, head: str) -> str | None:
         # Every row the hold hook writes carries all four; a row missing one
         # could be the HOLD of this head, so it refuses rather than being
         # skipped as "no record".
-        if (not isinstance(row.get("repo"), str) or not row["repo"]
+        # The hold hook writes hold_head from the verdict marker (40
+        # lowercase hex): a padded, short or upper-case one matches no head,
+        # so it refuses rather than being skipped.
+        if (not isinstance(row.get("repo"), str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", row["repo"]) is None
                 or not isinstance(row.get("pr"), int) or isinstance(row.get("pr"), bool)
-                or not isinstance(row.get("hold_head"), str) or not row["hold_head"]
-                or not isinstance(row.get("at"), str) or not row["at"]):
+                or not 0 < row["pr"] < 2 ** 63
+                or not is_api_sha(row.get("hold_head"))
+                or _timestamp(row.get("at")) is None):
             raise GuardError(f"the hold record {path} line {number_line} is malformed: it "
-                             "needs a string repo, hold_head and at and an integer pr")
+                             "needs an owner/name repo, a 40-hex hold_head, an ISO 8601 at and "
+                             "a positive integer pr")
         if (row["repo"].lower() == repo.lower()
                 and row["pr"] == number
                 and row["hold_head"].lower() == head.lower()):
@@ -2490,9 +2533,10 @@ def member_review(repo: str, number: int, head: str, policy: dict[str, Any],
     if not isinstance(pull, dict):
         raise GuardError(f"member #{number} is unreadable")
     author = (pull.get("user") or {}).get("login")
-    author = author if isinstance(author, str) else None
-    comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
-    reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    # No author is never "nobody to exclude": the self-approval rule needs it.
+    if not is_login(author):
+        raise GuardError(f"member #{number} names no canonical author login")
+    comments, reviews = verdict_listing(repo, number)
     allowed, why = review_verdict(head, author, comments, reviews, policy)
     approved = head
     if not allowed:
@@ -3500,8 +3544,67 @@ def _rest_pages(path: str) -> list[dict[str, Any]]:
     for page in pages:
         if not isinstance(page, list):
             raise GuardError(f"{path} did not answer a list")
-        records.extend(item for item in page if isinstance(item, dict))
+        # A row that is not an object could be the verdict that decides, so
+        # it refuses the listing rather than being dropped from it.
+        if not all(isinstance(item, dict) for item in page):
+            raise GuardError(f"{path} answered a row that is not an object")
+        records.extend(page)
     return records
+
+
+def verdict_records_refusal(comments: list[dict[str, Any]],
+                            reviews: list[dict[str, Any]]) -> str | None:
+    """Why a comment or review that carries a verdict cannot be read, or None.
+
+    ``counting_verdicts`` judges a verdict by who posted it, so every field
+    that judgment reads must be canonical on any record that carries one:
+    a login that is empty or malformed, an association or user type outside
+    GitHub's enums, an unknown review state, or a review sha that is not 40
+    lowercase hex would otherwise drop a HOLD as untrusted or naming nothing.
+    A record with no verdict is never judged, so it is not checked."""
+    def identity(record: dict[str, Any], what: str) -> str | None:
+        user = record.get("user")
+        if not isinstance(user, dict) or not is_login(user.get("login")):
+            return f"{what} carries no canonical author login"
+        if not in_enum(user.get("type"), USER_TYPES):
+            return f"{what} carries an unknown user type {user.get('type')!r}"
+        if not in_enum(record.get("author_association"), AUTHOR_ASSOCIATIONS):
+            return (f"{what} carries an unknown author association "
+                    f"{record.get('author_association')!r}")
+        return None
+
+    for comment in comments:
+        body = comment.get("body")
+        what = f"comment {comment.get('id')}"
+        if not isinstance(body, str):
+            return f"{what} carries no readable body"
+        if marker_verdict(body) is not None:
+            refusal = identity(comment, what)
+            if refusal is not None:
+                return refusal
+    for review in reviews:
+        state = review.get("state")
+        what = f"review {review.get('id')}"
+        if not in_enum(state, REVIEW_STATES):
+            return f"{what} carries an unknown state {state!r}"
+        if state in ("APPROVED", "CHANGES_REQUESTED"):
+            refusal = identity(review, what)
+            if refusal is not None:
+                return refusal
+            if not is_api_sha(review.get("commit_id")):
+                return f"{what} names no canonical commit sha"
+    return None
+
+
+def verdict_listing(repo: str, number: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Every comment and review of ``repo#number``, each verdict-carrying
+    record canonical (``verdict_records_refusal``), or ``GuardError``."""
+    comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
+    reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+    refusal = verdict_records_refusal(comments, reviews)
+    if refusal is not None:
+        raise GuardError(f"PR #{number}'s verdicts are unreadable: {refusal}")
+    return comments, reviews
 
 
 def default_branch(pull: Any) -> str:
@@ -3712,9 +3815,10 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
             ), review_fix("head_moved", f"{label} moved from {head[:12]} to {live_head[:12]}",
                           repo, number, live_head, read_pull, True)
         author = (pull.get("user") or {}).get("login")
-        author = author if isinstance(author, str) else None
-        comments = _rest_pages(f"repos/{repo}/issues/{number}/comments?per_page=100")
-        reviews = _rest_pages(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+        # No author is never "nobody to exclude": the self-approval rule needs it.
+        if not is_login(author):
+            raise GuardError("the pull request names no canonical author login")
+        comments, reviews = verdict_listing(repo, number)
     except GuardError as error:
         return False, (
             f"{label}: cannot read what its review requires ({error}); refusing to land it unreviewed"

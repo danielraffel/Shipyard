@@ -103,7 +103,8 @@ class AwaitingClassification(unittest.TestCase):
 def plain_comment_event() -> dict[str, Any]:
     """An ``issue_comment`` payload on PR 784 whose comment is no verdict."""
     return {"action": "created",
-            "comment": {"id": 1, "body": "thanks", "user": {"login": "someone"}},
+            "comment": {"id": 1, "body": "thanks", "user": {"login": "someone", "type": "User"},
+                        "author_association": "NONE"},
             "issue": {"number": 784, "pull_request": {"url": "x"}}}
 
 
@@ -654,6 +655,20 @@ if __name__ == "__main__":
 # A pull request's own workflow token can edit or delete any comment and keep
 # its author (merge-queue-rehearsal#47, runs 45528887180 and 45529945081).
 HOLD_BODY = f"Findings.\nreviewer: pulp-review\n{STAMP}\nverdict: HOLD head:{HEAD}"
+
+# A key the variant table removes rather than sets.
+MISSING = object()
+# Logins GitHub never sends: empty, padded, inner space, too long, a leading
+# hyphen, a control character, or not a string at all.
+BAD_LOGINS = ("", " ", "   ", " someone", "someone ", "some one", "x" * 40, "-x", "x\n",
+              "x[bot] ", "x[BOT]", "a@b", 5, True, None, ["someone"], {})
+# Shas GitHub never sends: empty, padded, upper case, short, long, not hex,
+# or not a string.
+BAD_SHAS = ("", " ", HEAD.upper(), HEAD[:39], HEAD + "0", f" {HEAD}", f"{HEAD}\n",
+            "g" * 40, 5, None, [HEAD], {})
+# Pull request numbers and record ids GitHub never sends.
+BAD_NUMBERS = (0, -1, True, False, "784", 784.0, None, [784], 2 ** 64)
+
 OPT_OUT = "[auto_merge]\narm_requires_head_approval = false\n"
 
 
@@ -1017,6 +1032,108 @@ class TamperedVerdicts(unittest.TestCase):
             self.assert_refused(self.comment_event("created", "thanks"),
                                 answers=broken(change))
 
+    def test_a_removed_hold_with_a_malformed_author_refuses(self) -> None:
+        # 1653-r6-f1: a deleted HOLD whose author login (or user type, or
+        # association) is not canonical would read as an untrusted identity,
+        # so the HOLD would be dropped and the earlier APPROVE post success.
+        result = self.post(self.answers(self.approved(), SIGNERS),
+                           event=self.comment_event("deleted", HOLD_BODY))
+        self.assertEqual(self.posted()["state"], "failure", "control: " + result.stderr)
+
+        def with_user(field: str, value: Any) -> dict[str, Any]:
+            event = self.comment_event("deleted", HOLD_BODY)
+            target = event["comment"] if field == "author_association" else event["comment"]["user"]
+            if value is MISSING:
+                target.pop(field, None)
+            else:
+                target[field] = value
+            return event
+
+        for value in (*BAD_LOGINS, MISSING):
+            self.assert_refused(with_user("login", value))
+        for value in ("bot", "BOT", "", " Bot", "App", None, 5, MISSING):
+            self.assert_refused(with_user("type", value))
+        for value in ("owner", "Owner", "", " OWNER", "ADMIN", None, 5, ["OWNER"], MISSING):
+            self.assert_refused(with_user("author_association", value))
+
+    def test_a_status_with_a_malformed_creator_refuses(self) -> None:
+        # 1653-r6-f2: a review-verdict HOLD failure whose creator login is not
+        # canonical would be skipped as "not this job's", and a later APPROVE
+        # would post success.
+        held = {"context": "review-verdict", "state": "failure",
+                "creator": {"login": "github-actions[bot]"},
+                "description": f"a HOLD naming head {HEAD[:12]} makes it un-approvable"}
+        self.history = [held]
+        self.post(self.answers(self.approved(), SIGNERS))
+        self.assertEqual(self.posted()["state"], "failure", "control")
+        # A login is case-insensitive: a case variant of this job's creator,
+        # and of its context, still holds.
+        for variant in (dict(held, creator={"login": "GitHub-Actions[bot]"}),
+                        dict(held, context="Review-Verdict")):
+            self.history = [variant]
+            self.post(self.answers(self.approved(), SIGNERS))
+            self.assertEqual(self.posted()["state"], "failure", variant)
+        for login in (*BAD_LOGINS, MISSING):
+            creator = {} if login is MISSING else {"login": login}
+            for context in ("review-verdict", "ci"):
+                self.history = [dict(held, context=context, creator=creator)]
+                result = self.post(self.answers(self.approved(), SIGNERS))
+                self.assertNotEqual(result.returncode, 0, f"{login!r}: {result.stdout}")
+                self.assertNotIn("state=success", self.calls(), (context, login))
+        for context in ("", " ", " review-verdict", "review-verdict ", "x" * 300):
+            self.history = [dict(held, context=context)]
+            result = self.post(self.answers(self.approved(), SIGNERS))
+            self.assertNotEqual(result.returncode, 0, f"{context!r}: {result.stdout}")
+            self.assertNotIn("state=success", self.calls(), context)
+
+    def test_a_pull_row_with_a_non_canonical_head_refuses(self) -> None:
+        # 1653-r6-f3: a row whose head sha is empty or non-canonical was
+        # filtered out of the shared-head judgment; it refuses the listing.
+        def rows(row: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+            return [
+                (needle, {"pages": [[{"number": 784, "state": "open", "head": {"sha": HEAD}},
+                                     row]]}) if needle == f"/commits/{HEAD}/pulls"
+                else (needle, answer)
+                for needle, answer in self.answers(self.approved(), SIGNERS)]
+
+        control = rows({"number": 785, "state": "closed", "head": {"sha": HEAD}})
+        self.post(control)
+        self.assertEqual(self.posted()["state"], "success", "control")
+        for sha in (*BAD_SHAS, MISSING):
+            head = {} if sha is MISSING else {"sha": sha}
+            result = self.post(rows({"number": 785, "state": "open", "head": head}))
+            self.assertNotEqual(result.returncode, 0, f"{sha!r}: {result.stdout}")
+            self.assertIn("pull requests on", result.stderr, sha)
+            self.assertNotIn("/statuses/", self.calls(), sha)
+        for number in (*BAD_NUMBERS, MISSING):
+            row = {"state": "open", "head": {"sha": HEAD}}
+            if number is not MISSING:
+                row["number"] = number
+            result = self.post(rows(row))
+            self.assertNotEqual(result.returncode, 0, f"{number!r}: {result.stdout}")
+            self.assertNotIn("/statuses/", self.calls(), number)
+
+    def test_the_host_guard_refuses_a_non_canonical_author_or_verdict_record(self) -> None:
+        # No author is never "nobody to exclude", and a verdict comment whose
+        # author cannot be read is never dropped from the judgment.
+        merge = ["pr", "merge", "784", "--merge", "--match-head-commit", HEAD]
+        allowed = self.run_guard(merge, self.answers(self.approved(), SIGNERS), REPO,
+                                 SHIPYARD_SIGNERS_FROM_BASE="1")
+        self.assertEqual(allowed.returncode, 0, "control: " + allowed.stderr)
+        for login in ("", " ", "some one", None, 5):
+            answers = self.answers(self.approved(), SIGNERS)
+            next(answer["json"] for needle, answer in answers
+                 if needle == "/pulls/")["user"]["login"] = login
+            guard = self.run_guard(merge, answers, REPO, SHIPYARD_SIGNERS_FROM_BASE="1")
+            self.assertNotEqual(guard.returncode, 0, f"author {login!r}: {guard.stderr}")
+        for login in ("", " ", "some one", None):
+            approve = self.approved()
+            approve[0]["user"] = dict(approve[0]["user"], login=login)
+            guard = self.run_guard(merge, self.answers(approve, SIGNERS), REPO,
+                                   SHIPYARD_SIGNERS_FROM_BASE="1")
+            self.assertNotEqual(guard.returncode, 0, f"verdict login {login!r}: {guard.stderr}")
+            self.assertIn("unreadable", guard.stderr, login)
+
     def test_an_edit_history_answer_must_be_well_formed(self) -> None:
         from unittest import mock
         guard = arm.guard
@@ -1301,3 +1418,213 @@ class RollupMemberEdit(unittest.TestCase):
         self.assertIn("was edited", review(api, "2026-11-24T01:00:00Z") or "")
         with self.assertRaises(guard.GuardError):
             review(dict(api, verdict_node_id=None), None)
+
+
+class MalformedPayloadTable(unittest.TestCase):
+    """Every payload shape the status and the guard judge by, fed a table of
+    malformed variants of every field they read: each must refuse (raise),
+    never skip the row or read it as something else."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("review_verdict_status_table", STATUS)
+        assert spec is not None and spec.loader is not None
+        cls.status = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.status)
+
+    @staticmethod
+    def variants(kind: str, good: Any) -> list[Any]:
+        """The malformed values of one field of ``kind``, ``good`` its valid value."""
+        common = [MISSING, None, [good], {}]
+        if kind == "login":
+            return [*BAD_LOGINS, MISSING]
+        if kind == "sha":
+            return [*BAD_SHAS, MISSING]
+        if kind == "number":
+            return [*BAD_NUMBERS, MISSING]
+        if kind == "enum":
+            return [*common, "", " ", f" {good}", f"{good} ", good.swapcase(), "unknown", 5]
+        if kind == "text":
+            return [*common, "", " ", f" {good}", f"{good} ", "x" * 300, 5, True]
+        if kind == "str":
+            return [*common, 5, True]
+        raise AssertionError(kind)
+
+    @staticmethod
+    def with_field(record: Any, path: tuple[Any, ...], value: Any) -> Any:
+        record = copy.deepcopy(record)
+        target = record
+        for key in path[:-1]:
+            target = target[key]
+        if value is MISSING:
+            target.pop(path[-1], None)
+        else:
+            target[path[-1]] = value
+        return record
+
+    def assert_table(self, reader: Any, good: Any,
+                     fields: list[tuple[tuple[Any, ...], str]], errors: Any) -> None:
+        reader(copy.deepcopy(good))  # control: the canonical shape reads
+        for path, kind in fields:
+            here: Any = good
+            for key in path:
+                here = here[key]
+            for value in self.variants(kind, here):
+                with self.subTest(path=path, value=value), self.assertRaises(errors):
+                    reader(self.with_field(good, path, value))
+
+    def fake_guard(self, answer: Any) -> Any:
+        from types import SimpleNamespace
+
+        class GuardError(Exception):
+            pass
+
+        def run_real_gh(arguments: list[str]) -> Any:
+            return copy.deepcopy(answer)
+
+        return SimpleNamespace(GuardError=GuardError, run_real_gh=run_real_gh,
+                               run_real_gh_text=lambda arguments: "")
+
+    def test_the_issue_comment_payload(self) -> None:
+        good = {"action": "deleted", "issue": {"number": 784, "pull_request": {"url": "x"}},
+                "comment": {"id": 9, "body": "b", "author_association": "OWNER",
+                            "user": {"login": "shipyard-local[bot]", "type": "Bot"}}}
+        self.assert_table(self.status.comment_event, good, [
+            (("issue", "number"), "number"), (("action",), "enum"),
+            (("comment", "body"), "str"), (("comment", "user", "login"), "login"),
+            (("comment", "user", "type"), "enum"),
+            (("comment", "author_association"), "enum")], ValueError)
+        edited = dict(good, action="edited", changes={"body": {"from": "a"}})
+        self.assert_table(self.status.comment_event, edited,
+                          [(("changes", "body", "from"), "str")], ValueError)
+
+    def test_the_event_targets(self) -> None:
+        self.assert_table(lambda event: self.status.event_target("pull_request_target", event),
+                          {"pull_request": {"number": 784}},
+                          [(("pull_request", "number"), "number")], ValueError)
+        for name in ("workflow_run", "check_run"):
+            self.assert_table(lambda event, name=name: self.status.event_target(name, event),
+                              {name: {"pull_requests": [{"number": 784}], "head_sha": HEAD}},
+                              [((name, "head_sha"), "sha"),
+                               ((name, "pull_requests", 0, "number"), "number")], ValueError)
+
+    def test_the_pull_request_record(self) -> None:
+        good = {"state": "open", "head": {"sha": HEAD}, "user": {"login": "someone"},
+                "base": {"ref": "main", "repo": {"default_branch": "main"}}}
+
+        def read(pull: Any) -> Any:
+            guard = self.fake_guard(pull)
+            try:
+                return self.status.read_pull(guard, REPO, 784)
+            except guard.GuardError as error:
+                raise LookupError(str(error)) from error
+
+        self.assert_table(read, good, [
+            (("state",), "enum"), (("head", "sha"), "sha"), (("base", "ref"), "text"),
+            (("base", "repo", "default_branch"), "text"), (("user", "login"), "login")],
+            LookupError)
+
+    def test_the_pull_requests_on_a_head(self) -> None:
+        def read(row: Any) -> Any:
+            guard = self.fake_guard([[{"number": 1, "state": "open", "head": {"sha": HEAD}}, row]])
+            try:
+                return self.status.open_pulls_on(guard, REPO, HEAD)
+            except guard.GuardError as error:
+                raise LookupError(str(error)) from error
+
+        self.assert_table(read, {"number": 784, "state": "open", "head": {"sha": HEAD}}, [
+            (("number",), "number"), (("state",), "enum"), (("head", "sha"), "sha")],
+            LookupError)
+
+    def test_the_status_history(self) -> None:
+        def read(row: Any) -> Any:
+            guard = self.fake_guard([[row]])
+            try:
+                return self.status.held_in_history(guard, REPO, HEAD)
+            except guard.GuardError as error:
+                raise LookupError(str(error)) from error
+
+        good = {"context": "ci", "state": "failure", "description": "x",
+                "creator": {"login": "github-actions[bot]"}}
+        self.assert_table(read, good, [
+            (("context",), "text"), (("state",), "enum"), (("creator", "login"), "login")],
+            LookupError)
+        for value in (5, True, ["x"], {}):
+            with self.subTest(description=value), self.assertRaises(LookupError):
+                read(dict(good, description=value))
+
+    def test_the_workflow_runs(self) -> None:
+        def read(page: Any) -> Any:
+            guard = self.fake_guard([page])
+            try:
+                return self.status.refresh_head_check(guard, REPO, HEAD)
+            except guard.GuardError as error:
+                raise LookupError(str(error)) from error
+
+        good = {"total_count": 1, "workflow_runs": [
+            {"id": 555, "name": "Review verdict", "event": "pull_request_target"}]}
+        self.assert_table(read, good, [
+            (("workflow_runs", 0, "id"), "number"), (("workflow_runs", 0, "name"), "text"),
+            (("workflow_runs", 0, "event"), "enum")], LookupError)
+        for count in (-1, True, "1", None, 1.0):
+            with self.subTest(total_count=count), self.assertRaises(LookupError):
+                read(dict(good, total_count=count))
+
+    def test_the_guards_verdict_records(self) -> None:
+        guard = arm.guard
+        approve = f"verdict: APPROVE head:{HEAD}"
+
+        def check(records: Any) -> None:
+            refusal = guard.verdict_records_refusal(*records)
+            if refusal is not None:
+                raise LookupError(refusal)
+
+        comment = {"id": 1, "body": approve, "author_association": "OWNER",
+                   "user": {"login": "someone", "type": "User"}}
+        review = {"id": 2, "state": "CHANGES_REQUESTED", "commit_id": HEAD,
+                  "author_association": "MEMBER", "user": {"login": "someone", "type": "User"}}
+        self.assert_table(check, [[comment], []], [
+            ((0, 0, "user", "login"), "login"), ((0, 0, "user", "type"), "enum"),
+            ((0, 0, "author_association"), "enum"), ((0, 0, "body"), "str")], LookupError)
+        self.assert_table(check, [[], [review]], [
+            ((1, 0, "state"), "enum"), ((1, 0, "commit_id"), "sha"),
+            ((1, 0, "user", "login"), "login"), ((1, 0, "user", "type"), "enum"),
+            ((1, 0, "author_association"), "enum")], LookupError)
+        # Controls: a record with no verdict is never judged, so none of its
+        # identity fields is checked.
+        check([[{"id": 3, "body": "thanks", "user": None}],
+               [{"id": 4, "state": "COMMENTED", "user": None, "commit_id": None}]])
+        # A listing row that is not an object refuses rather than being dropped.
+        from unittest import mock
+        with mock.patch.object(guard, "run_real_gh", return_value=[[comment, "x"]]), \
+                self.assertRaises(guard.GuardError):
+            guard._rest_pages("repos/x/y/issues/1/comments")
+
+    def test_the_guards_hold_record_rows(self) -> None:
+        guard = arm.guard
+        from unittest import mock
+        root = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+
+        def read(row: Any) -> Any:
+            (root / "holds.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with mock.patch.object(guard, "_guards_dir", return_value=root):
+                try:
+                    return guard.recorded_hold(REPO, 784, HEAD)
+                except guard.GuardError as error:
+                    raise LookupError(str(error)) from error
+
+        good = {"repo": REPO, "pr": 9, "hold_head": HEAD, "at": "2026-11-24T01:00:00Z"}
+        self.assert_table(read, good, [
+            (("pr",), "number"), (("hold_head",), "sha"), (("at",), "text")], LookupError)
+        for repo in ("", " ", f" {REPO}", "nope", "a/b/c", "a b/c", None, 5, MISSING):
+            with self.subTest(repo=repo), self.assertRaises(LookupError):
+                read(self.with_field(good, ("repo",), repo))
+
+    def test_the_status_and_the_guard_agree_on_logins_and_shas(self) -> None:
+        for value in ("someone", "shipyard-local[bot]", "app/shipyard-local", "a", "a" * 39, "A-b-1",
+                      *BAD_LOGINS):
+            self.assertEqual(self.status.is_login(value), arm.guard.is_login(value), value)
+        for value in (HEAD, *BAD_SHAS):
+            self.assertEqual(self.status.is_sha40(value), arm.guard.is_api_sha(value), value)

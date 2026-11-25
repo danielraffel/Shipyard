@@ -232,6 +232,135 @@ pub const SESSION_ENVS: [&str; 2] = ["CLAUDE_CODE_SESSION_ID", "CODEX_COMPANION_
 /// `author_association` values whose verdicts count when no reviewer is
 /// listed (besides the fleet App's).
 pub const TRUSTED_ASSOCIATIONS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+/// Every `author_association` GitHub documents. A record outside it is
+/// unreadable: read as untrusted, a trusted account's HOLD would be dropped.
+const AUTHOR_ASSOCIATIONS: [&str; 8] = [
+    "COLLABORATOR",
+    "CONTRIBUTOR",
+    "FIRST_TIMER",
+    "FIRST_TIME_CONTRIBUTOR",
+    "MANNEQUIN",
+    "MEMBER",
+    "NONE",
+    "OWNER",
+];
+/// Every `user.type` GitHub documents. A missing type would read the fleet
+/// App as a user account and drop its HOLD.
+const USER_TYPES: [&str; 3] = ["Bot", "Organization", "User"];
+/// Every pull request review state the REST API documents, as it spells them.
+const REVIEW_STATES: [&str; 5] = [
+    "APPROVED",
+    "CHANGES_REQUESTED",
+    "COMMENTED",
+    "DISMISSED",
+    "PENDING",
+];
+
+/// A canonical GitHub login: alphanumerics and hyphens, at most 39
+/// characters, starting with an alphanumeric, an App's bot user adding
+/// `[bot]`, and GraphQL naming an App `app/<slug>`. Never empty, padded or
+/// carrying any other character. Same rule as `LOGIN` in
+/// `scripts/ghapp_queue_arm_guard.py`.
+#[must_use]
+pub(crate) fn is_login(value: &str) -> bool {
+    let value = value.strip_prefix("app/").unwrap_or(value);
+    let name = value.strip_suffix("[bot]").unwrap_or(value);
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && name.len() <= 39
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// A commit sha as GitHub's REST API answers it: 40 lowercase hex.
+#[must_use]
+pub(crate) fn is_api_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Why a review or comment record carrying a verdict cannot be judged under
+/// `policy`, or `Ok` when every one can.
+///
+/// The gate judges a verdict by who posted it, so every field that judgment
+/// reads must be canonical on a record that carries one, or a HOLD would be
+/// dropped as untrusted or naming nothing: the login (always read), the user
+/// type (read for the fleet App's login, which counts only as a Bot), the
+/// author association (read under the default rule, for any other login), a
+/// review's state (an enum GitHub documents, exactly), and a review's sha
+/// (40 lowercase hex). A record with no verdict is never judged, so it is
+/// not checked; a field the policy never reads is not either.
+///
+/// # Errors
+///
+/// Naming the first record that cannot be judged.
+pub(crate) fn verdict_records_checked(
+    reviews: &[Value],
+    comments: &[Value],
+    policy: &ApprovalPolicy,
+) -> Result<(), String> {
+    let default_rule = policy.any_reviewer_but_author && policy.reviewer_logins.is_empty();
+    let identity = |record: &Value, what: &str| -> Result<(), String> {
+        let Some(login) = record
+            .get("login")
+            .and_then(Value::as_str)
+            .filter(|login| is_login(login))
+        else {
+            return Err(format!("{what} carries no canonical author login"));
+        };
+        if is_fleet_author(login)
+            && !record
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| USER_TYPES.contains(&kind))
+        {
+            return Err(format!("{what} carries an unknown user type"));
+        }
+        if default_rule
+            && !is_fleet_author(login)
+            && !record
+                .get("association")
+                .and_then(Value::as_str)
+                .is_some_and(|association| AUTHOR_ASSOCIATIONS.contains(&association))
+        {
+            return Err(format!("{what} carries an unknown author association"));
+        }
+        Ok(())
+    };
+    for comment in comments {
+        let what = format!("comment {}", comment.get("id").unwrap_or(&Value::Null));
+        let Some(body) = comment.get("body").and_then(Value::as_str) else {
+            return Err(format!("{what} carries no readable body"));
+        };
+        if marker_verdict(body).is_some() {
+            identity(comment, &what)?;
+        }
+    }
+    for review in reviews {
+        let what = format!("review {}", review.get("id").unwrap_or(&Value::Null));
+        let Some(state) = review
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|state| REVIEW_STATES.contains(state))
+        else {
+            return Err(format!("{what} carries an unknown state"));
+        };
+        if matches!(state, "APPROVED" | "CHANGES_REQUESTED") {
+            identity(review, &what)?;
+            if !review
+                .get("commit_id")
+                .and_then(Value::as_str)
+                .is_some_and(is_api_sha)
+            {
+                return Err(format!("{what} names no canonical commit sha"));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 thread_local! {
@@ -2653,6 +2782,8 @@ pub fn evaluate_excusing_with_policy(
         &format!("repos/{repo}/issues/{pr}/comments"),
         COMMENT_RECORD_JQ,
     )?;
+    verdict_records_checked(&reviews, &comments, policy)
+        .map_err(|error| format!("PR #{pr}'s verdicts are unreadable: {error}"))?;
     let gate = decide_for_author(
         policy,
         head,
@@ -2768,6 +2899,11 @@ fn pr_author(
     policy: &ApprovalPolicy,
     known: Option<&str>,
 ) -> Result<Option<String>, String> {
+    if let Some(known) = known
+        && !is_login(known)
+    {
+        return Err(format!("PR #{pr} carried no canonical author login"));
+    }
     if known.is_some() || !policy.any_reviewer_but_author || !policy.reviewer_logins.is_empty() {
         return Ok(known.map(str::to_owned));
     }
@@ -2777,9 +2913,10 @@ fn pr_author(
         "--jq".to_owned(),
         ".user.login".to_owned(),
     ])?;
-    let login = login.trim();
-    if login.is_empty() {
-        return Err(format!("PR #{pr} carried no author"));
+    // `gh --jq` ends its answer with a newline; anything else is not a login.
+    let login = login.strip_suffix('\n').unwrap_or(&login);
+    if !is_login(login) {
+        return Err(format!("PR #{pr} carried no canonical author login"));
     }
     Ok(Some(login.to_owned()))
 }
@@ -2899,6 +3036,8 @@ fn evaluate_events_by_source(
         &format!("repos/{repo}/issues/{pr}/comments"),
         COMMENT_RECORD_JQ,
     )?;
+    verdict_records_checked(&reviews, &comments, policy)
+        .map_err(|error| format!("PR #{pr}'s verdicts are unreadable: {error}"))?;
     let all_comments = comments.clone();
     let comments = if comments.iter().any(|comment| {
         comment

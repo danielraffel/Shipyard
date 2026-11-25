@@ -291,3 +291,106 @@ fn a_pull_request_into_another_branch_is_refused_and_policy_comes_from_main() {
         "{verdict:?}"
     );
 }
+
+/// The pull request's head and author must be canonical: an empty author
+/// would read as "nobody to exclude" from self-approval, and a non-canonical
+/// head as a head nothing names.
+#[test]
+fn a_pull_request_with_a_non_canonical_head_or_author_is_unreadable() {
+    let answer = |head: Value, author: Value| {
+        move |args: &[String]| -> Result<String, String> {
+            let joined = args.join(" ");
+            if joined.contains("pulls/7 --jq {head") {
+                return Ok(
+                    json!({"head": head, "base": "main", "default_branch": "main",
+                                 "author": author})
+                    .to_string(),
+                );
+            }
+            gh("x", None, Vec::new(), Vec::new())(args)
+        }
+    };
+    assert!(
+        review_verdict(
+            &answer(json!(HEAD), json!("someone")),
+            "o/r",
+            7,
+            None,
+            false
+        )
+        .is_ok(),
+        "control"
+    );
+    for author in [
+        json!(""),
+        json!(" "),
+        json!(" someone"),
+        json!("some one"),
+        json!(5),
+        json!(null),
+    ] {
+        let error = review_verdict(&answer(json!(HEAD), author.clone()), "o/r", 7, None, false)
+            .expect_err("a non-canonical author is unreadable");
+        assert!(error.contains("author login"), "{author}: {error}");
+    }
+    for head in [
+        json!(" "),
+        json!(HEAD.to_ascii_uppercase()),
+        json!(&HEAD[..39]),
+        json!(format!(" {HEAD}")),
+        json!(5),
+    ] {
+        let error = review_verdict(
+            &answer(head.clone(), json!("someone")),
+            "o/r",
+            7,
+            None,
+            false,
+        )
+        .expect_err("a non-canonical head is unreadable");
+        assert!(error.contains("head sha"), "{head}: {error}");
+    }
+}
+
+/// A HOLD whose author cannot be read refuses the verdict, never drops out
+/// of it as an untrusted account's and leaves the earlier APPROVE standing.
+#[test]
+fn a_hold_with_a_non_canonical_author_refuses_the_verdict() {
+    let approve = app_approval(HEAD, Some("pulp-review"));
+    let hold = |login: Value| {
+        let mut hold = app_comment(&format!(
+            "Findings.\nreviewer: pulp-review\n{STAMP}\nverdict: HOLD head:{HEAD}"
+        ));
+        hold["id"] = json!(6);
+        hold["at"] = json!("2026-10-14T18:00:00Z");
+        hold["updated_at"] = json!("2026-10-14T18:00:00Z");
+        hold["login"] = login;
+        hold
+    };
+    let verdict = |comments: Vec<Value>| {
+        review_verdict(
+            &gh(HEAD, Some(SIGNED), Vec::new(), comments),
+            "danielraffel/tartci",
+            7,
+            None,
+            false,
+        )
+    };
+    let control = verdict(vec![approve.clone(), hold(json!("shipyard-local[bot]"))])
+        .expect("control: a canonical HOLD is judged");
+    assert_eq!(control.verdict, "refused", "control: the HOLD holds");
+    for login in [
+        json!(""),
+        json!(" "),
+        json!("some one"),
+        json!(null),
+        json!(5),
+    ] {
+        let error = verdict(vec![approve.clone(), hold(login.clone())])
+            .expect_err("a HOLD with a non-canonical author is unreadable");
+        assert!(
+            error.contains("verdicts are unreadable"),
+            "{login}: {error}"
+        );
+    }
+}

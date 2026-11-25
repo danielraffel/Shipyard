@@ -56,6 +56,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -132,6 +133,54 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+# The shared validators every payload field this job judges by goes through.
+# Each answers only "canonical or not": a caller refuses on False, never skips.
+# A GitHub login: alphanumerics and hyphens, at most 39 characters, starting
+# with an alphanumeric; an App's bot user adds ``[bot]``, and GraphQL names
+# an App ``app/<slug>``. Same as
+# scripts/ghapp_queue_arm_guard.py LOGIN.
+LOGIN = re.compile(r"(?:app/)?[A-Za-z0-9][A-Za-z0-9-]{0,38}(?:\[bot\])?")
+# A commit sha as GitHub's REST API and webhooks send it: 40 lowercase hex.
+SHA40 = re.compile(r"[0-9a-f]{40}")
+# GitHub caps refs, status contexts and workflow names well below this.
+TEXT_LIMIT = 255
+# Every ``author_association`` GitHub documents. A payload outside it is
+# unreadable: read as untrusted, a trusted account's HOLD would be dropped.
+AUTHOR_ASSOCIATIONS = frozenset({
+    "COLLABORATOR", "CONTRIBUTOR", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN",
+    "MEMBER", "NONE", "OWNER"})
+# Every ``user.type`` GitHub documents. Missing, the fleet App's HOLD would
+# read as a user account's and be dropped.
+USER_TYPES = frozenset({"Bot", "Organization", "User"})
+
+
+def is_text(value: Any) -> bool:
+    """A non-empty string with no surrounding whitespace, within ``TEXT_LIMIT``."""
+    return (isinstance(value, str) and 0 < len(value) <= TEXT_LIMIT
+            and value == value.strip())
+
+
+def is_login(value: Any) -> bool:
+    """A canonical GitHub login (``LOGIN``, exactly)."""
+    return isinstance(value, str) and LOGIN.fullmatch(value) is not None
+
+
+def is_sha40(value: Any) -> bool:
+    """A commit sha as GitHub sends it: 40 lowercase hex characters."""
+    return isinstance(value, str) and SHA40.fullmatch(value) is not None
+
+
+def in_enum(value: Any, allowed: frozenset[str]) -> bool:
+    """One of ``allowed`` exactly: a string, so an unhashable value refuses
+    rather than raising ``TypeError``."""
+    return isinstance(value, str) and value in allowed
+
+
+def is_number(value: Any) -> bool:
+    """A pull request number or record id: a positive integer, never a bool."""
+    return _is_int(value) and 0 < value < 2 ** 63
+
+
 def comment_event(event: Any) -> CommentEvent:
     """The one reader of an ``issue_comment`` payload.
 
@@ -154,15 +203,20 @@ def comment_event(event: Any) -> CommentEvent:
             or not marker["url"]:
         raise ValueError("the issue_comment payload's pull_request marker is malformed")
     number = issue.get("number")
-    if not _is_int(number):
+    if not is_number(number):
         raise ValueError("the issue_comment payload names no pull request number")
     comment = event.get("comment")
     action = event.get("action")
+    # The guard judges a payload HOLD by its author's login, user type and
+    # association: each must be canonical, or an untrusted-looking identity
+    # would drop a removed HOLD (``removed_holds``).
     if (not isinstance(comment, dict) or not isinstance(comment.get("body"), str)
             or not isinstance(comment.get("user"), dict)
-            or not isinstance(comment["user"].get("login"), str)):
+            or not is_login(comment["user"].get("login"))
+            or not in_enum(comment["user"].get("type"), USER_TYPES)
+            or not in_enum(comment.get("author_association"), AUTHOR_ASSOCIATIONS)):
         raise ValueError("the comment event payload is malformed")
-    if action not in COMMENT_ACTIONS:
+    if not in_enum(action, COMMENT_ACTIONS):
         raise ValueError(f"the comment event's action {action!r} is not one GitHub sends")
     bodies = [comment["body"]]
     if action == "edited":
@@ -177,25 +231,26 @@ def comment_event(event: Any) -> CommentEvent:
 
 def read_pull(guard: ModuleType, repo: str, number: int) -> PullRecord:
     """The one reader of a pull request's REST answer: its state (one of
-    ``PULL_STATES``), head sha, base ref, repository default branch and author
-    login, each a non-empty string, or ``GuardError``."""
+    ``PULL_STATES``), head sha (``is_sha40``), base ref and repository default
+    branch (``is_text``) and author login (``is_login``), or ``GuardError``."""
     pull = guard.run_real_gh(["api", f"repos/{repo}/pulls/{number}"])
     if not isinstance(pull, dict):
         raise guard.GuardError(f"PR #{number} is unreadable")
 
-    def text(*path: str) -> str:
+    def text(*path: str, valid: Any = is_text) -> str:
         value: Any = pull
         for key in path:
             value = value.get(key) if isinstance(value, dict) else None
-        if not isinstance(value, str) or not value:
-            raise guard.GuardError(f"PR #{number} is unreadable (no {'.'.join(path)})")
+        if not valid(value):
+            raise guard.GuardError(f"PR #{number} is unreadable (no canonical {'.'.join(path)})")
         return value
 
     state = text("state")
-    if state not in PULL_STATES:
+    if not in_enum(state, PULL_STATES):
         raise guard.GuardError(f"PR #{number} is unreadable (unknown state {state!r})")
-    return PullRecord(state, text("head", "sha"), text("base", "ref"),
-                      text("base", "repo", "default_branch"), text("user", "login"))
+    return PullRecord(state, text("head", "sha", valid=is_sha40), text("base", "ref"),
+                      text("base", "repo", "default_branch"),
+                      text("user", "login", valid=is_login))
 
 
 class Decision(NamedTuple):
@@ -237,7 +292,7 @@ def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, st
     if event_name == "pull_request_target":
         pull = event.get("pull_request")
         number = pull.get("number") if isinstance(pull, dict) else None
-        if not isinstance(number, int) or isinstance(number, bool):
+        if not is_number(number):
             raise ValueError("the pull_request_target payload names no pull request number")
         return number, None
     if event_name == "issue_comment":
@@ -253,12 +308,12 @@ def event_target(event_name: str, event: dict[str, Any]) -> tuple[int | None, st
         pulls = []
         for pull in listed:
             number = pull.get("number") if isinstance(pull, dict) else None
-            if not isinstance(number, int) or isinstance(number, bool):
+            if not is_number(number):
                 raise ValueError(f"the {event_name} payload lists a malformed pull request")
             pulls.append(number)
         head = run.get("head_sha")
-        if not isinstance(head, str) or not head:
-            raise ValueError(f"the {event_name} payload names no head")
+        if not is_sha40(head):
+            raise ValueError(f"the {event_name} payload names no canonical head sha")
         return (pulls[0] if pulls else None), head
     raise ValueError(f"unsupported event {event_name!r}")
 
@@ -358,21 +413,17 @@ def open_pulls_on(guard: ModuleType, repo: str, head: str) -> list[int]:
         if not isinstance(page, list):
             raise guard.GuardError(f"{what} are unreadable")
         for pull in page:
+            # Every row must be canonical: a row the filter below dropped
+            # could be the pull request whose HOLD decides the shared head.
             if (not isinstance(pull, dict)
-                    or not isinstance(pull.get("number"), int)
-                    or isinstance(pull.get("number"), bool)
-                    or not isinstance(pull.get("state"), str)
-                    or pull["state"] not in PULL_STATES
+                    or not is_number(pull.get("number"))
+                    or not in_enum(pull.get("state"), PULL_STATES)
                     or not isinstance(pull.get("head"), dict)
-                    or not isinstance(pull["head"].get("sha"), str)):
+                    or not is_sha40(pull["head"].get("sha"))):
                 raise guard.GuardError(f"{what} contain a malformed pull request")
         pulls.extend(page)
-    return sorted(
-        pull["number"] for pull in pulls
-        if isinstance(pull, dict) and isinstance(pull.get("number"), int)
-        and pull.get("state") == "open"
-        and ((pull.get("head") or {}).get("sha") or "").lower() == head.lower()
-    )
+    return sorted(pull["number"] for pull in pulls
+                  if pull["state"] == "open" and pull["head"]["sha"] == head.lower())
 
 
 def removed_holds(guard: ModuleType, repo: str, number: int, head: str,
@@ -435,10 +486,11 @@ def held_in_history(guard: ModuleType, repo: str, head: str) -> str | None:
 
     A HOLD makes its head un-approvable, and the head's status history keeps
     every status ever posted on it, so a HOLD later deleted or edited away
-    still holds. Only statuses this job's own creators posted count."""
+    still holds. Only statuses this job's own creators posted count, matched
+    case-insensitively (a GitHub login is), so a case variant holds too."""
     what = f"the statuses on {head[:12]}"
     marker = f"{HOLD_PREFIX}{head[:12]}".lower()
-    creators = status_creators()
+    creators = {creator.lower() for creator in status_creators()}
     for page in read_pages(guard, f"repos/{repo}/commits/{head}/statuses?per_page=100", what):
         if not isinstance(page, list):
             raise guard.GuardError(f"{what} are unreadable")
@@ -449,16 +501,17 @@ def held_in_history(guard: ModuleType, repo: str, head: str) -> str | None:
             # a null description; this job always posts one.
             creator = status.get("creator") if isinstance(status, dict) else None
             if (not isinstance(status, dict)
-                    or not isinstance(status.get("context"), str)
-                    or not isinstance(status.get("state"), str)
-                    or status["state"] not in STATUS_STATES
+                    or not is_text(status.get("context"))
+                    or not in_enum(status.get("state"), STATUS_STATES)
                     or not isinstance(creator, dict)
-                    or not isinstance(creator.get("login"), str)
+                    or not is_login(creator.get("login"))
                     or not (status.get("description") is None
                             or isinstance(status.get("description"), str))):
                 raise guard.GuardError(f"{what} contain a malformed status")
             description = status["description"]
-            if status["context"] != CONTEXT or creator["login"] not in creators:
+            # Case-insensitive on both: a variant can only hold more.
+            if (status["context"].lower() != CONTEXT
+                    or creator["login"].lower() not in creators):
                 continue
             if not isinstance(description, str):
                 raise guard.GuardError(f"{what} contain a {CONTEXT} status with no description")
@@ -521,14 +574,18 @@ def refresh_head_check(guard: ModuleType, repo: str, head: str) -> None:
             "&per_page=100", what):
         rows = page.get("workflow_runs") if isinstance(page, dict) else None
         count = page.get("total_count") if isinstance(page, dict) else None
-        if not isinstance(rows, list) or not isinstance(count, int) or isinstance(count, bool):
+        if not isinstance(rows, list) or not _is_int(count) or count < 0:
             raise guard.GuardError(f"{what} are unreadable")
         for run in rows:
+            # The listing is filtered to pull_request_target, so a row of any
+            # other event is not GitHub's answer; and a name that matches
+            # ours only in case could hide our own run behind another one.
             if (not isinstance(run, dict)
-                    or not isinstance(run.get("id"), int)
-                    or isinstance(run.get("id"), bool)
-                    or not isinstance(run.get("name"), str)
-                    or not isinstance(run.get("event"), str)):
+                    or not is_number(run.get("id"))
+                    or not is_text(run.get("name"))
+                    or not in_enum(run.get("event"), HEAD_CHECK_EVENTS)
+                    or (run["name"] != WORKFLOW_NAME
+                        and run["name"].lower() == WORKFLOW_NAME.lower())):
                 raise guard.GuardError(f"{what} contain a malformed workflow run")
         runs.extend(rows)
         total = max(total, count)
@@ -536,8 +593,7 @@ def refresh_head_check(guard: ModuleType, repo: str, head: str) -> None:
         # A truncated listing can hide the head's own run, and "no run" must
         # only ever mean there is none.
         raise guard.GuardError(f"{what} are incomplete: {len(runs)} of {total} read")
-    ours = [r for r in runs if isinstance(r, dict) and r.get("name") == WORKFLOW_NAME
-            and isinstance(r.get("id"), int)]
+    ours = [r for r in runs if r["name"] == WORKFLOW_NAME]
     if not ours:
         print(f"review-verdict: no {WORKFLOW_NAME} run on {head}; no check to refresh")
         return
