@@ -30,6 +30,8 @@ struct ExtraFile {
     loss: bool,
     /// How many of the base's added lines are missing from the head.
     missing: u64,
+    /// The first few of those lines, in the order the base added them.
+    missing_sample: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -141,13 +143,15 @@ fn analyze(cwd: &Path, args: &MergeCheckArgs) -> Result<Report, CliFailure> {
         .iter()
         .filter(|file| !pr_files.contains(&file.path))
         .map(|file| {
-            let (loss, missing) = classify(cwd, &merge_base, &base, &head, &file.path)?;
+            let (loss, missing, missing_sample) =
+                classify(cwd, &merge_base, &base, &head, &file.path)?;
             Ok(ExtraFile {
                 path: file.path.clone(),
                 added: file.added,
                 deleted: file.deleted,
                 loss,
                 missing,
+                missing_sample,
             })
         })
         .collect::<Result<Vec<_>, CliFailure>>()?;
@@ -231,6 +235,7 @@ fn numstat(cwd: &Path, from: &str, to: &str) -> Result<Vec<ExtraFile>, CliFailur
             deleted: deleted.parse().ok(),
             loss: false,
             missing: 0,
+            missing_sample: Vec::new(),
         });
     }
     Ok(files)
@@ -259,20 +264,20 @@ fn classify(
     base: &str,
     head: &str,
     path: &str,
-) -> Result<(bool, u64), CliFailure> {
+) -> Result<(bool, u64, Vec<String>), CliFailure> {
     let base_blob = blob(cwd, base, path);
     let merge_base_blob = blob(cwd, merge_base, path);
     if blob(cwd, head, path) == merge_base_blob && base_blob != merge_base_blob {
-        return Ok((true, 0));
+        return Ok((true, 0, Vec::new()));
     }
     let diff = git(
         cwd,
         &["diff", "--no-renames", "-U0", merge_base, base, "--", path],
     )?;
-    let mut added: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    let mut added: Vec<Vec<u8>> = Vec::new();
     for line in diff.split(|byte| *byte == b'\n') {
         if line.first() == Some(&b'+') && !line.starts_with(b"+++") {
-            *added.entry(line[1..].to_vec()).or_default() += 1;
+            added.push(line[1..].to_vec());
         }
     }
     let mut have: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
@@ -281,15 +286,52 @@ fn classify(
             *have.entry(line.to_vec()).or_default() += 1;
         }
     }
-    let missing = added
-        .iter()
-        .map(|(line, count)| count.saturating_sub(have.get(line).copied().unwrap_or(0)))
-        .sum::<u64>();
-    Ok((missing > 0, missing))
+    // Consume the head's lines as a multiset; what cannot be matched is missing.
+    let mut missing = 0;
+    let mut sample = Vec::new();
+    for line in added {
+        match have.get_mut(&line) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {
+                missing += 1;
+                if sample.len() < 5 {
+                    sample.push(String::from_utf8_lossy(&line).into_owned());
+                }
+            }
+        }
+    }
+    Ok((missing > 0, missing, sample))
 }
 
 fn lines(value: Option<u64>) -> String {
     value.map_or_else(|| "bin".to_owned(), |count| count.to_string())
+}
+
+/// Name the lines main added that the merge lost or changed, and the remedy.
+fn render_loss_detail<W: Write>(file: &ExtraFile, stdout: &mut W) -> Result<(), CliFailure> {
+    let io = |error: std::io::Error| CliFailure::new(2, format!("write failed: {error}"));
+    if file.missing_sample.is_empty() {
+        return Ok(());
+    }
+    writeln!(
+        stdout,
+        "\n{}: {} lines main added are missing or changed, first {}:",
+        file.path,
+        file.missing,
+        file.missing_sample.len()
+    )
+    .map_err(io)?;
+    for line in &file.missing_sample {
+        writeln!(stdout, "  + {line}").map_err(io)?;
+    }
+    writeln!(
+        stdout,
+        "Fix: redo the merge taking main's version of {}. If changing it is intended, make \
+         that edit as a separate commit after the merge so review sees it.",
+        file.path
+    )
+    .map_err(io)?;
+    Ok(())
 }
 
 fn render<W: Write>(
@@ -314,6 +356,7 @@ fn render<W: Write>(
                 "deleted": file.deleted,
                 "class": if file.loss { "base_loss" } else { "merge_only_edit" },
                 "missing_base_lines": file.missing,
+                "missing_sample": file.missing_sample,
             })).collect::<Vec<_>>(),
             "collapsed_pr_files": report.collapsed,
         });
@@ -358,6 +401,10 @@ fn render<W: Write>(
                  lines the base added that the merge result lacks.)"
             )
             .map_err(io)?;
+            for file in report.extra.iter().filter(|file| file.loss) {
+                render_loss_detail(file, stdout)?;
+            }
+            writeln!(stdout).map_err(io)?;
         }
         let edits = report.extra.len() - losses;
         if edits > 0 {
@@ -703,6 +750,31 @@ mod tests {
     }
 
     #[test]
+    fn a_rewrite_of_main_lines_names_the_file_the_lines_and_the_remedy() {
+        let temp = fixture();
+        let dir = temp.path();
+        let original = base_original(dir);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", &format!("{original}n1\nn2\n"));
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        // The merge commit rewrites one of main's lines instead of deleting it.
+        write(dir, "base.txt", &format!("{original}n1\nn2-rewritten\n"));
+        commit(dir, "merge");
+        let mut out = Vec::new();
+        let code = merge_check_command(&args(None), dir, false, &mut out).expect("ok");
+        assert_eq!(code, ExitCode::from(1));
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("base.txt: 1 lines main added"), "{text}");
+        assert!(text.contains("  + n2\n"), "{text}");
+        assert!(
+            text.contains("redo the merge taking main's version of base.txt"),
+            "{text}"
+        );
+        assert!(text.contains("separate commit after the merge"), "{text}");
+    }
+
+    #[test]
     fn human_output_lists_extra_files_in_a_table() {
         let report = Report {
             base: "a".repeat(40),
@@ -716,6 +788,7 @@ mod tests {
                 deleted: Some(1800),
                 loss: true,
                 missing: 7,
+                missing_sample: vec!["x".to_owned()],
             }],
             collapsed: vec![],
         };
