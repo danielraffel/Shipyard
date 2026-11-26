@@ -473,6 +473,14 @@ pub(super) fn judge_run(
     // fail on infra.
     let infra = |job: &Job| -> Result<bool, String> {
         let Some(check) = doc.checks.iter().find(|check| check.job_id == job.id) else {
+            // The diagnosis covers failed, cancelled and timed-out jobs only,
+            // so a required job that never started cannot be told from an
+            // advisory one: decline, as before.
+            if let Some(conclusion @ ("startup_failure" | "action_required")) =
+                job.conclusion.as_deref()
+            {
+                return Err(format!("{} ended {conclusion}", job.name));
+            }
             return Ok(false);
         };
         if check.conclusion.as_deref() != Some("failure") {
@@ -744,6 +752,32 @@ fn record_for<'a>(
     record
 }
 
+/// The outcome of a member this pass does not act on: its settled verdict
+/// and why, or `pending`.
+fn settled_outcome<'a>(
+    ledger: &StewardLedger,
+    repo: &str,
+    candidate: &Candidate,
+    next: &'a Next,
+) -> (&'a str, String) {
+    match next {
+        Next::Settled(verdict) => {
+            let why = ledger
+                .infra_reruns
+                .get(&record_key(
+                    repo,
+                    candidate.pr,
+                    &candidate.head_sha,
+                    &candidate.check,
+                ))
+                .map(|record| record.why.clone())
+                .unwrap_or_default();
+            (verdict.as_str(), why)
+        }
+        _ => ("pending", String::new()),
+    }
+}
+
 fn deadline_passed(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
@@ -841,22 +875,7 @@ pub(super) fn sweep(
         }
         if !nexts.contains(&Next::Diagnose) {
             for (candidate, next) in members.iter().zip(&nexts) {
-                let (action, detail) = match next {
-                    Next::Settled(verdict) => {
-                        let why = ledger
-                            .infra_reruns
-                            .get(&record_key(
-                                repo,
-                                candidate.pr,
-                                &candidate.head_sha,
-                                &candidate.check,
-                            ))
-                            .map(|record| record.why.clone())
-                            .unwrap_or_default();
-                        (verdict.as_str(), why)
-                    }
-                    _ => ("pending", String::new()),
-                };
+                let (action, detail) = settled_outcome(ledger, repo, candidate, next);
                 push(&mut status, candidate, action, detail);
             }
             continue;
@@ -921,15 +940,21 @@ pub(super) fn sweep(
             }
             RunVerdict::Capped => {
                 for candidate in &members {
+                    let rule = rule_of(&doc, run_id, &candidate.check);
                     let record = record_for(ledger, repo, candidate);
+                    // GitHub's attempt count is per run: a check that was
+                    // never re-run itself can still meet the run's cap.
+                    record.why = if record.reruns == 0 {
+                        format!(
+                            "not attempted: per-run cap (the run was re-run {MAX_RERUNS} times); still {rule}"
+                        )
+                    } else {
+                        format!("re-run {MAX_RERUNS} times and still {rule}")
+                    };
                     record.reruns = record.reruns.max(MAX_RERUNS);
                     "capped".clone_into(&mut record.verdict);
                     record.step = step_of(&doc, run_id, &candidate.check);
                     record.tests = tests_of(&doc, run_id, &candidate.check);
-                    record.why = format!(
-                        "re-run {MAX_RERUNS} times and still {}",
-                        rule_of(&doc, run_id, &candidate.check)
-                    );
                     push(&mut status, candidate, "capped", record.why.clone());
                 }
             }
@@ -962,37 +987,42 @@ pub(super) fn sweep(
                 let (acting, post): (Vec<&Candidate>, Post) = match &scope {
                     Scope::FailedJobs => (members.clone(), Post::FailedJobs(run_id)),
                     Scope::Jobs(jobs) => {
+                        // Only a member this pass may act on: a refused,
+                        // capped or pending one is never POSTed again.
                         let chosen = jobs
                             .iter()
                             .filter_map(|(job_id, name)| {
-                                let candidate =
-                                    members.iter().find(|candidate| candidate.check == *name)?;
+                                let (candidate, _) =
+                                    members.iter().zip(&nexts).find(|(candidate, next)| {
+                                        candidate.check == *name && **next == Next::Diagnose
+                                    })?;
                                 Some((reruns_of(candidate), *job_id, *candidate))
                             })
                             .min_by_key(|(reruns, job_id, _)| (*reruns, *job_id));
                         let Some((_, job_id, chosen)) = chosen else {
-                            for candidate in &members {
-                                push(
-                                    &mut status,
-                                    candidate,
-                                    "declined",
-                                    "no red check is among the run's infra jobs".to_owned(),
-                                );
+                            for (candidate, next) in members.iter().zip(&nexts) {
+                                let (action, detail) =
+                                    settled_outcome(ledger, repo, candidate, next);
+                                push(&mut status, candidate, action, detail);
                             }
                             continue;
                         };
-                        for candidate in &members {
-                            if candidate.check != chosen.check {
-                                push(
-                                    &mut status,
-                                    candidate,
+                        for (candidate, next) in members.iter().zip(&nexts) {
+                            if candidate.check == chosen.check {
+                                continue;
+                            }
+                            let (action, detail) = if *next == Next::Diagnose {
+                                (
                                     "deferred",
                                     format!(
                                         "one job of the run is re-run at a time; {} first",
                                         chosen.check
                                     ),
-                                );
-                            }
+                                )
+                            } else {
+                                settled_outcome(ledger, repo, candidate, next)
+                            };
+                            push(&mut status, candidate, action, detail);
                         }
                         let job_id = u64::try_from(job_id).unwrap_or_default();
                         (vec![chosen], Post::Job(job_id))

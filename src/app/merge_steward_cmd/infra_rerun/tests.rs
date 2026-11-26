@@ -1616,3 +1616,116 @@ fn near_miss_fetch_failures_stay_real() {
         "real"
     );
 }
+
+#[test]
+fn a_refused_one_job_rerun_beside_a_deferred_sibling_settles() {
+    // Two required infra jobs beside an advisory failure, and GitHub refuses
+    // every POST: each job takes its own two tries, then the run goes quiet.
+    let acts = FakeActs {
+        refuse: true,
+        ..FakeActs::default()
+    };
+    acts.set(
+        10,
+        vec![
+            job(
+                100,
+                "drift-fast",
+                10,
+                1,
+                &head(1),
+                "Install Linux dependencies",
+            ),
+            job(101, "macos", 10, 1, &head(1), "Set up job"),
+            job(102, "linux-advisory", 10, 1, &head(1), "Run tests"),
+        ],
+    );
+    let observation = observation(vec![pr(
+        1,
+        vec![
+            check("drift-fast", "FAILURE", 10, 100),
+            check("macos", "FAILURE", 10, 101),
+        ],
+        &[],
+    )]);
+    let mut ledger = StewardLedger::default();
+    for pass in 0..10 {
+        run_sweep(
+            &observation,
+            Mode::Enforce,
+            T0 + pass * BACKOFF_SECS,
+            &mut ledger,
+            &acts,
+        );
+    }
+    let settled = acts.diagnosed.borrow().len();
+    assert_eq!(settled, 4, "two tries per job");
+    for check in ["drift-fast", "macos"] {
+        let record = &ledger.infra_reruns[&record_key(&observation.repo, 1, &head(1), check)];
+        assert_eq!(record.errors, MAX_ERRORS, "{check}");
+        assert_eq!(record.reruns, 0, "{check}");
+    }
+    let status = run_sweep(
+        &observation,
+        Mode::Enforce,
+        T0 + 20 * BACKOFF_SECS,
+        &mut ledger,
+        &acts,
+    );
+    assert_eq!(actions(&status), vec!["refused", "refused"]);
+    assert_eq!(acts.diagnosed.borrow().len(), settled);
+}
+
+#[test]
+fn judge_declines_a_required_job_that_never_started() {
+    for conclusion in ["startup_failure", "action_required"] {
+        let mut broken = job(101, "macos", 10, 1, HEAD, "Set up job");
+        broken.conclusion = Some(conclusion.to_owned());
+        broken.steps = Some(Vec::new());
+        let jobs = [
+            job(100, "drift-fast", 10, 1, HEAD, "Install Linux dependencies"),
+            broken,
+        ];
+        let (doc, jobs) = diagnosed(&jobs, &[]);
+        let verdict = judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]);
+        assert!(
+            matches!(&verdict, RunVerdict::Decline(why) if why.contains(conclusion)),
+            "{conclusion}: {verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn a_check_capped_by_the_run_cap_without_its_own_rerun_says_so() {
+    let acts = FakeActs::default();
+    acts.set(
+        10,
+        vec![
+            job(
+                100,
+                "drift-fast",
+                10,
+                3,
+                &head(1),
+                "Install Linux dependencies",
+            ),
+            job(101, "linux-advisory", 10, 3, &head(1), "Run tests"),
+        ],
+    );
+    let observation = observation(vec![pr(
+        1,
+        vec![check("drift-fast", "FAILURE", 10, 100)],
+        &[],
+    )]);
+    let mut ledger = StewardLedger::default();
+    let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
+    assert_eq!(actions(&status), vec!["capped"]);
+    assert!(
+        status.outcomes[0]
+            .detail
+            .starts_with("not attempted: per-run cap"),
+        "{}",
+        status.outcomes[0].detail
+    );
+    assert!(acts.posts.borrow().is_empty());
+}

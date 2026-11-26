@@ -91,7 +91,9 @@ person notices. `--infra-rerun` (`off`, `shadow`, `enforce`; module
   in the run is the approval context, all its jobs are complete, and the run
   is of the current head (not a `gh-readonly-queue/` branch). A job that is not
   a required check may have failed for any reason: it is not re-run and no
-  longer declines the run. What is posted:
+  longer declines the run. A job that ended `startup_failure` or
+  `action_required` still declines it, since the diagnosis cannot tell a
+  required one from an advisory one. What is posted:
   - one required infra job: `POST /actions/jobs/{id}/rerun`, that job and the
     jobs that depend on it. This is why a run that contains the approval
     context is never re-run by either endpoint;
@@ -100,8 +102,10 @@ person notices. `--infra-rerun` (`off`, `shadow`, `enforce`; module
     `POST /actions/runs/{id}/rerun-failed-jobs`, which re-runs cancelled jobs
     too;
   - several required infra jobs beside a non-required failure: one job per
-    pass (fewest re-runs, then lowest job id); the others are `deferred` and
-    judged afresh once that re-run completes;
+    pass (fewest re-runs, then lowest job id, among those not already
+    `refused`, `capped` or pending); the others are `deferred` and judged
+    afresh once that re-run completes, so a refused POST settles each job
+    after its own two tries;
   - a cancelled required job beside a non-required failure: declined, since a
     one-job re-run would leave the cancelled one red.
 - Classification is `shipyard diagnose`'s. Besides lost runners, non-content
@@ -117,7 +121,8 @@ person notices. `--infra-rerun` (`off`, `shadow`, `enforce`; module
   before the POST, and GitHub's `run_attempt` fences the cap too, so a crash
   or a lost ledger cannot buy a third. `run_attempt` is per run, and a one-job re-run
   makes a new attempt of the whole run, so the fence counts every re-run of the
-  run, whichever job it re-ran: at most 2 per run. A red after the cap is classified once:
+  run, whichever job it re-ran: at most 2 per run. A check capped this way
+  without a re-run of its own reads "not attempted: per-run cap". A red after the cap is classified once:
   infra is `capped`, anything else `declined`. A refused POST or an unreadable
   diagnosis is retried after 20 minutes, twice at most (`refused`).
 - Outage finding: when a check is capped, or 3 or more open pull requests are
