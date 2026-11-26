@@ -44,8 +44,10 @@ retention and manual cause/private-corpus collection remain separate.
 ## Overdue pull requests and what lands next: `shipyard overdue`, `shipyard next`
 
 A required check that went red for an infrastructure reason (a lost runner, a
-checkout or `Install … dependencies` step, a package-mirror or GitHub 5xx) is
-re-run by the steward on its own, on any open pull request: once, then once more
+checkout or `Install … dependencies` step, a package-mirror or GitHub 5xx, a
+dependency or provenance fetch that timed out) is re-run by the steward on its
+own, on any open pull request, even when an advisory job in the same run failed
+for real (only the required job is re-run): once, then once more
 after 20 minutes, then reported as `INFRA-OUTAGE-SUSPECTED` by the operator
 pass. Do not re-run it by hand first; read `infra_rerun` in the steward's tick
 JSON. `review-verdict` is never re-run this way.
@@ -4332,7 +4334,9 @@ failing step and tests, at most five evidence groups (the root-cause line is
 in the first group in every replayed case), the runner, and a class:
 
 - `infra` (`no_runner` only on GitHub's own "not acquired by Runner" record,
-  `needs_starved`, `lost_runner`, `non_content_step`, `infra_marker`);
+  `needs_starved`, `lost_runner`, `non_content_step`, `fetch_timeout` (a
+  dependency or provenance fetch step that ran out of time, no test named),
+  `infra_marker`);
 - `interrupted` (`superseded`, `timeout`, `unknown`): a cancel is never `real`
   and never `infra` without that record;
 - `stale_base` (a configured marker such as Vellum's "not current protected

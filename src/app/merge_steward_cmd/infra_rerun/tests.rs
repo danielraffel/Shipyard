@@ -150,7 +150,10 @@ struct FakeActs {
     runs: RefCell<BTreeMap<u64, Vec<Job>>>,
     logs: RefCell<Vec<(i64, String)>>,
     diagnosed: RefCell<Vec<u64>>,
+    /// The run of every accepted re-run, of either kind.
     reran: RefCell<Vec<u64>>,
+    /// Every accepted POST: `run:<id>` (rerun-failed-jobs) or `job:<id>`.
+    posts: RefCell<Vec<String>>,
     rollups: RefCell<BTreeMap<String, Vec<StewardCheck>>>,
     rollup_reads: RefCell<usize>,
     refuse: bool,
@@ -185,6 +188,23 @@ impl Acts for FakeActs {
             return Err("HTTP 403".to_owned());
         }
         self.reran.borrow_mut().push(run_id);
+        self.posts.borrow_mut().push(format!("run:{run_id}"));
+        Ok(())
+    }
+
+    fn rerun_job(&self, job_id: u64) -> Result<(), String> {
+        if self.refuse {
+            return Err("HTTP 403".to_owned());
+        }
+        let run = self
+            .runs
+            .borrow()
+            .iter()
+            .find(|(_, jobs)| jobs.iter().any(|job| u64::try_from(job.id) == Ok(job_id)))
+            .map(|(run, _)| *run)
+            .expect("a re-run job belongs to a known run");
+        self.reran.borrow_mut().push(run);
+        self.posts.borrow_mut().push(format!("job:{job_id}"));
         Ok(())
     }
 }
@@ -410,7 +430,7 @@ fn judge_reruns_a_failed_install_dependencies_step() {
     let (doc, jobs) = diagnosed(&jobs, &[]);
     assert_eq!(
         judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]),
-        RunVerdict::Rerun
+        RunVerdict::Rerun(Scope::Jobs(vec![(100, "drift-fast".to_owned())]))
     );
 }
 
@@ -853,16 +873,105 @@ fn the_diagnosis_budget_defers_the_rest_of_a_burst() {
 }
 
 #[test]
-fn judge_declines_when_a_non_required_job_failed_for_real_in_the_run() {
-    // rerun-failed-jobs would re-run the advisory job's real failure too.
+fn judge_reruns_only_the_required_job_beside_an_advisory_real_failure() {
+    // pulp#12902's shape: the advisory Linux leg failed for real; the
+    // required job failed on infra. Only the required job is re-run, so the
+    // advisory failure no longer declines the run.
     let jobs = [
         job(100, "drift-fast", 10, 1, HEAD, "Install Linux dependencies"),
         job(101, "linux-advisory", 10, 1, HEAD, "Run tests"),
     ];
     let (doc, jobs) = diagnosed(&jobs, &[]);
+    assert_eq!(
+        judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]),
+        RunVerdict::Rerun(Scope::Jobs(vec![(100, "drift-fast".to_owned())]))
+    );
+}
+
+#[test]
+fn judge_declines_a_required_real_failure_beside_an_advisory_one() {
+    let jobs = [
+        job(100, "drift-fast", 10, 1, HEAD, "Run drift tests"),
+        job(101, "linux-advisory", 10, 1, HEAD, "Run tests"),
+    ];
+    let log = "2026-11-11T14:40:00.0000000Z ##[group]Run drift tests\n\
+               2026-11-11T14:40:01.0000000Z The following tests FAILED:\n\
+               2026-11-11T14:40:01.0000000Z \t 12 - census-drift (Failed)\n\
+               2026-11-11T14:40:02.0000000Z ##[error]Process completed with exit code 8.\n";
+    let (doc, jobs) = diagnosed(&jobs, &[(100, log)]);
     let verdict = judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]);
     assert!(
-        matches!(&verdict, RunVerdict::Decline(why) if why.contains("linux-advisory")),
+        matches!(&verdict, RunVerdict::Decline(why) if why.contains("drift-fast is real")),
+        "{verdict:?}"
+    );
+}
+
+#[test]
+fn judge_reruns_the_failed_jobs_when_several_required_jobs_failed_on_infra() {
+    let jobs = [
+        job(100, "drift-fast", 10, 1, HEAD, "Install Linux dependencies"),
+        job(101, "macos", 10, 1, HEAD, "Set up job"),
+    ];
+    let (doc, jobs) = diagnosed(&jobs, &[]);
+    assert_eq!(
+        judge_run(
+            10,
+            HEAD,
+            &doc,
+            &jobs,
+            "review-verdict",
+            &["drift-fast", "macos"]
+        ),
+        RunVerdict::Rerun(Scope::FailedJobs)
+    );
+    // Beside an advisory failure they are re-run one job at a time.
+    let jobs = [
+        job(100, "drift-fast", 10, 1, HEAD, "Install Linux dependencies"),
+        job(101, "macos", 10, 1, HEAD, "Set up job"),
+        job(102, "linux-advisory", 10, 1, HEAD, "Run tests"),
+    ];
+    let (doc, jobs) = diagnosed(&jobs, &[]);
+    assert_eq!(
+        judge_run(
+            10,
+            HEAD,
+            &doc,
+            &jobs,
+            "review-verdict",
+            &["drift-fast", "macos"]
+        ),
+        RunVerdict::Rerun(Scope::Jobs(vec![
+            (100, "drift-fast".to_owned()),
+            (101, "macos".to_owned())
+        ]))
+    );
+}
+
+#[test]
+fn judge_handles_a_cancelled_required_sibling_by_scope() {
+    // A one-job re-run would leave the cancelled required job red: with
+    // nothing else red the run's failed jobs (cancelled included) are re-run;
+    // beside an advisory failure the run is declined.
+    let mut cancelled = job(101, "macos", 10, 1, HEAD, "Build");
+    cancelled.conclusion = Some("cancelled".to_owned());
+    let jobs = [
+        job(100, "drift-fast", 10, 1, HEAD, "Install Linux dependencies"),
+        cancelled.clone(),
+    ];
+    let (doc, jobs) = diagnosed(&jobs, &[]);
+    assert_eq!(
+        judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]),
+        RunVerdict::Rerun(Scope::FailedJobs)
+    );
+    let jobs = [
+        job(100, "drift-fast", 10, 1, HEAD, "Install Linux dependencies"),
+        cancelled,
+        job(102, "linux-advisory", 10, 1, HEAD, "Run tests"),
+    ];
+    let (doc, jobs) = diagnosed(&jobs, &[]);
+    let verdict = judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]);
+    assert!(
+        matches!(&verdict, RunVerdict::Decline(why) if why.contains("macos was cancelled")),
         "{verdict:?}"
     );
 }
@@ -878,7 +987,7 @@ fn judge_tolerates_cancelled_fail_fast_siblings() {
     let (doc, jobs) = diagnosed(&jobs, &[]);
     assert_eq!(
         judge_run(10, HEAD, &doc, &jobs, "review-verdict", &["drift-fast"]),
-        RunVerdict::Rerun
+        RunVerdict::Rerun(Scope::Jobs(vec![(100, "drift-fast".to_owned())]))
     );
 }
 
@@ -1058,6 +1167,9 @@ fn a_rate_limited_diagnosis_stops_the_sweeps_reads() {
         fn rerun_failed_jobs(&self, _: u64) -> Result<(), String> {
             panic!("no re-run without a diagnosis")
         }
+        fn rerun_job(&self, _: u64) -> Result<(), String> {
+            panic!("no re-run without a diagnosis")
+        }
     }
     let observation = observation(vec![
         pr(1, vec![check("drift-fast", "FAILURE", 10, 100)], &[]),
@@ -1170,6 +1282,9 @@ fn a_newer_red_whose_diagnosis_fails_keeps_no_stale_test_names() {
         fn rerun_failed_jobs(&self, _: u64) -> Result<(), String> {
             panic!("no re-run without a diagnosis")
         }
+        fn rerun_job(&self, _: u64) -> Result<(), String> {
+            panic!("no re-run without a diagnosis")
+        }
     }
     // The red judged earlier (check id 100) named a test; a re-run made a
     // newer red (check id 200) on the same head, and its diagnosis fails.
@@ -1211,5 +1326,293 @@ fn a_newer_red_whose_diagnosis_fails_keeps_no_stale_test_names() {
         record.tests.is_empty(),
         "stale names under the new id: {:?}",
         record.tests
+    );
+}
+
+// ---- One-job re-runs in the sweep ----
+
+#[test]
+fn an_advisory_failure_beside_a_required_infra_one_reruns_only_the_required_job() {
+    let acts = FakeActs::default();
+    acts.set(
+        10,
+        vec![
+            job(100, "macos", 10, 1, &head(1), "Install macOS dependencies"),
+            job(
+                101,
+                "Linux (x64) [github-hosted]",
+                10,
+                1,
+                &head(1),
+                "Run tests",
+            ),
+        ],
+    );
+    let observation = observation(vec![pr(1, vec![check("macos", "FAILURE", 10, 100)], &[])]);
+    let mut ledger = StewardLedger::default();
+    let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
+    assert_eq!(actions(&status), vec!["rerun"]);
+    assert!(
+        status.outcomes[0].detail.ends_with("(job 100 only)"),
+        "{}",
+        status.outcomes[0].detail
+    );
+    assert_eq!(acts.posts.borrow().as_slice(), &["job:100".to_owned()]);
+    let record = &ledger.infra_reruns[&record_key(&observation.repo, 1, &head(1), "macos")];
+    assert_eq!(record.reruns, 1);
+    assert_eq!(record.verdict, "rerun");
+}
+
+#[test]
+fn a_required_real_failure_beside_an_advisory_one_is_declined_in_the_sweep() {
+    let acts = FakeActs::default();
+    acts.set(
+        10,
+        vec![
+            job(100, "macos", 10, 1, &head(1), "Run tests"),
+            job(
+                101,
+                "Linux (x64) [github-hosted]",
+                10,
+                1,
+                &head(1),
+                "Run tests",
+            ),
+        ],
+    );
+    let observation = observation(vec![pr(1, vec![check("macos", "FAILURE", 10, 100)], &[])]);
+    let mut ledger = StewardLedger::default();
+    let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
+    assert_eq!(actions(&status), vec!["declined"]);
+    assert!(acts.posts.borrow().is_empty());
+}
+
+#[test]
+fn an_approval_job_in_the_run_blocks_a_one_job_rerun_too() {
+    // The one-job endpoint re-runs dependents, which could include the
+    // approval context: a run that has one is never re-run, by either POST.
+    let acts = FakeActs::default();
+    let mut verdict_job = job(
+        102,
+        "review-verdict",
+        10,
+        1,
+        &head(1),
+        "Post review verdict",
+    );
+    verdict_job.conclusion = Some("success".to_owned());
+    acts.set(
+        10,
+        vec![
+            job(100, "macos", 10, 1, &head(1), "Install macOS dependencies"),
+            job(
+                101,
+                "Linux (x64) [github-hosted]",
+                10,
+                1,
+                &head(1),
+                "Run tests",
+            ),
+            verdict_job,
+        ],
+    );
+    let observation = observation(vec![pr(1, vec![check("macos", "FAILURE", 10, 100)], &[])]);
+    let mut ledger = StewardLedger::default();
+    let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
+    assert_eq!(actions(&status), vec!["declined"]);
+    assert!(
+        status.outcomes[0].detail.contains("review-verdict"),
+        "{}",
+        status.outcomes[0].detail
+    );
+    assert!(acts.posts.borrow().is_empty());
+}
+
+#[test]
+fn several_infra_jobs_beside_an_advisory_failure_are_rerun_one_per_pass() {
+    let acts = FakeActs::default();
+    acts.set(
+        10,
+        vec![
+            job(
+                100,
+                "drift-fast",
+                10,
+                1,
+                &head(1),
+                "Install Linux dependencies",
+            ),
+            job(101, "macos", 10, 1, &head(1), "Set up job"),
+            job(102, "linux-advisory", 10, 1, &head(1), "Run tests"),
+        ],
+    );
+    let observation = observation(vec![pr(
+        1,
+        vec![
+            check("drift-fast", "FAILURE", 10, 100),
+            check("macos", "FAILURE", 10, 101),
+        ],
+        &[],
+    )]);
+    let mut ledger = StewardLedger::default();
+    let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
+    assert_eq!(actions(&status), vec!["deferred", "rerun"]);
+    assert_eq!(acts.posts.borrow().as_slice(), &["job:100".to_owned()]);
+    assert!(
+        !ledger
+            .infra_reruns
+            .contains_key(&record_key(&observation.repo, 1, &head(1), "macos")),
+        "a deferred check keeps no record"
+    );
+
+    // The re-run made attempt 2: drift-fast passed; macos was copied into
+    // the new attempt with a new id and is still red. It is re-run next.
+    let mut passed = job(
+        200,
+        "drift-fast",
+        10,
+        2,
+        &head(1),
+        "Install Linux dependencies",
+    );
+    passed.conclusion = Some("success".to_owned());
+    acts.set(
+        10,
+        vec![
+            passed,
+            job(201, "macos", 10, 2, &head(1), "Set up job"),
+            job(202, "linux-advisory", 10, 2, &head(1), "Run tests"),
+        ],
+    );
+    let observation = observation_of(std::iter::once(pr(
+        1,
+        vec![
+            check("drift-fast", "SUCCESS", 10, 200),
+            check("macos", "FAILURE", 10, 201),
+        ],
+        &[],
+    )));
+    let status = run_sweep(&observation, Mode::Enforce, T0 + 600, &mut ledger, &acts);
+    assert_eq!(actions(&status), vec!["rerun"]);
+    assert_eq!(
+        acts.posts.borrow().as_slice(),
+        &["job:100".to_owned(), "job:201".to_owned()]
+    );
+}
+
+#[test]
+fn several_infra_jobs_and_nothing_else_red_rerun_the_failed_jobs() {
+    let acts = FakeActs::default();
+    acts.set(
+        10,
+        vec![
+            job(
+                100,
+                "drift-fast",
+                10,
+                1,
+                &head(1),
+                "Install Linux dependencies",
+            ),
+            job(101, "macos", 10, 1, &head(1), "Set up job"),
+        ],
+    );
+    let observation = observation(vec![pr(
+        1,
+        vec![
+            check("drift-fast", "FAILURE", 10, 100),
+            check("macos", "FAILURE", 10, 101),
+        ],
+        &[],
+    )]);
+    let mut ledger = StewardLedger::default();
+    let status = run_sweep(&observation, Mode::Enforce, T0, &mut ledger, &acts);
+    assert_eq!(actions(&status), vec!["rerun", "rerun"]);
+    assert_eq!(acts.posts.borrow().as_slice(), &["run:10".to_owned()]);
+}
+
+// ---- Dependency and provenance fetch timeouts ----
+
+/// Lines from pulp job 139713224768 (pulp#12902, 2026-11-26): the bounded
+/// provenance fetch ran out of time, then the ancestry check failed.
+const PROVENANCE_TIMEOUT: &str = "\
+2026-11-26T08:13:45.8765260Z ##[group]Run python3 tools/scripts/hydrate_gpu_provenance_commits.py
+2026-11-26T08:18:47.0109320Z gpu-provenance-hydration: WARN: bounded fetch failed: refs/pull/12902/merge: fetch did not finish within 300 s
+2026-11-26T08:18:47.0152710Z gpu-provenance-hydration: WARN: bounded fetch failed: refs/pull/12902/head: not fetched; the 300 s fetch budget is spent
+2026-11-26T08:18:58.1942570Z gpu-provenance-hydration: FAIL: GPU provenance commits are not ancestors of HEAD: ['0447e490ab75e9b6c4b1defef474e15624cfa885']
+2026-11-26T08:18:58.2036030Z ##[error]Process completed with exit code 1.
+";
+
+/// Lines from pulp job 139663343228 (2026-11-26): the dependency download
+/// crawled until the step's own timeout.
+const BOOTSTRAP_TIMEOUT: &str = "\
+2026-11-26T09:55:15.0203560Z  21 76.3M   21 16.6M    0     0   98k      0  0:13:10  0:02:51  0:10:19 68400
+2026-11-26T09:55:16.6472640Z  21 76.3M   21 16.6M    0     0   98k      0  0:13:11  0:02:52  0:10:19 69702
+2026-11-26T09:55:16.6868280Z ##[error]The action 'Bootstrap repository dependencies' has timed out after 15 minutes.
+";
+
+fn classified(step: &str, log: &str) -> (String, String) {
+    let jobs = [job(100, "macos", 10, 1, HEAD, step)];
+    let (doc, _) = diagnosed(&jobs, &[(100, log)]);
+    let check = &doc.checks[0];
+    (
+        check.classification.class.clone(),
+        check.classification.rule.clone(),
+    )
+}
+
+#[test]
+fn a_provenance_fetch_timeout_is_infra() {
+    assert_eq!(
+        classified("Hydrate bounded GPU provenance commits", PROVENANCE_TIMEOUT),
+        ("infra".to_owned(), "fetch_timeout".to_owned())
+    );
+}
+
+#[test]
+fn a_dependency_fetch_step_timeout_is_infra() {
+    assert_eq!(
+        classified("Bootstrap repository dependencies", BOOTSTRAP_TIMEOUT),
+        ("infra".to_owned(), "fetch_timeout".to_owned())
+    );
+}
+
+#[test]
+fn near_miss_fetch_failures_stay_real() {
+    // The same hydrate step, but the ancestry check failed with no fetch
+    // timeout: the head's provenance is wrong, not the network.
+    let no_timeout = "\
+2026-11-26T08:18:58.1942570Z gpu-provenance-hydration: FAIL: GPU provenance commits are not ancestors of HEAD: ['0447e490ab75e9b6c4b1defef474e15624cfa885']
+2026-11-26T08:18:58.2036030Z ##[error]Process completed with exit code 1.
+";
+    assert_eq!(
+        classified("Hydrate bounded GPU provenance commits", no_timeout).0,
+        "real"
+    );
+    // A prebuilt download whose hash does not match the lock (pulp job
+    // 136087916497): content, whatever the step is called.
+    let mismatch = "\
+2026-11-20T04:50:36.9860950Z ERROR: sha256 mismatch
+2026-11-20T04:50:36.9861380Z   expected: 1779c7d1ba5c73a0d6a1f33b77fbf30774bbd9f7542c1c42cc5129f57e99fbd4
+2026-11-20T04:50:36.9866460Z ERROR: private Skia cache staging failed validation
+2026-11-20T04:50:36.9940080Z ##[error]Process completed with exit code 1.
+";
+    assert_eq!(
+        classified("Fetch prebuilt Skia (macOS)", mismatch).0,
+        "real"
+    );
+    // A test step that hit its time limit is a hang, not a fetch.
+    let hung = "\
+2026-11-26T09:55:16.6868280Z ##[error]The action 'Run tests' has timed out after 15 minutes.
+";
+    assert_eq!(classified("Run tests", hung).0, "real");
+    // A dependency step that failed fast on a bad lock, with no timeout.
+    let bad_lock = "\
+2026-11-26T09:41:00.0000000Z error: lockfile does not match the manifest
+2026-11-26T09:41:00.1000000Z ##[error]Process completed with exit code 1.
+";
+    assert_eq!(
+        classified("Bootstrap repository dependencies", bad_lock).0,
+        "real"
     );
 }
