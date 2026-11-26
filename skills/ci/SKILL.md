@@ -1004,9 +1004,12 @@ treat that as unread, never as no failures.
 
 Before repairing a red required check, look at the steward row. When the row
 carries `red_everywhere` (one required check failing the same test on three or
-more open pull requests in one pass), the failure is almost certainly on the
-base: do not change code in this pull request for it. Wait for the fix on the
-base, then merge the base once and push once. The row's `next_action` says so,
+more open pull requests in one pass), read the row's `red_everywhere.base`:
+`red` (the base tip fails the same check) or `unknown` (base health could not
+be read) means the failure is probably on the base, so do not change code in
+this pull request for it: wait for the fix on the base, then merge the base
+once and push once. `green` means main passes that check, so each failure is
+its own: repair this pull request. The row's `next_action` says which,
 and `[auto_merge] red_everywhere = "enforce"` also holds the unchanged head out
 of the queue. See `docs/automated-draining.md` "Red everywhere".
 
