@@ -915,8 +915,10 @@ red_everywhere = "shadow"   # off | shadow (default) | enforce
 | Where | What it shows |
 |---|---|
 | repository report `red_everywhere` | `mode`, and one entry per episode: `check`, `test` (or `null` for the check alone), `prs`, `first_seen`, `new` |
-| row `red_everywhere` | `check`, `test`, `prs` (members), `repair_skip` (true only under enforce); `blocked_on` is unchanged |
-| row `next_action.action` | "Failing on N PRs with the same test: <check> (<test>). Likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green." The actor is unchanged |
+| row `red_everywhere` | `check`, `test`, `prs` (members), `base` (`red`, `green` or `unknown`: the base tip's newest verdict on that check), `repair_skip` (true only under enforce, and never when `base` is `green`); `blocked_on` is unchanged |
+| row `next_action.action`, base tip red on the check | "Failing on N PRs with the same test: <check> (<test>). The base tip is also failing <check>: likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green." |
+| row `next_action.action`, base tip green on the check | "Repair this PR: <check> (<test>) failed here and on N PRs with the same test, but the base tip is green on <check>, so each failure is its own. Fix the failing test in this PR." The failures are each PR's own, not a base-level cause |
+| row `next_action.action`, base tip unreadable | The cautious text: "Failing on N PRs with the same test: ... Likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green. Base health could not be read, so this is the cautious reading." |
 | `summary.log` | `red_everywhere=<episodes>` on each repository line |
 | enqueue (enforce only) | a member whose head has not changed since the episode began is not enqueued: `held_red_everywhere:<check>`. Nothing is dequeued or closed |
 

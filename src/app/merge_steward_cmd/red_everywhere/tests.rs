@@ -441,7 +441,7 @@ fn observe_before_mutation_holds_a_new_episode_and_releases_a_recovered_head() {
         Some(CHECK.to_owned())
     );
     let mut reports = vec![report(12147)];
-    pass.annotate(&mut reports);
+    pass.annotate(&mut reports, &BTreeMap::new());
     assert!(reports[0].blocked.red_everywhere.is_some());
     // The check re-runs green on the same heads of #12152 and #12160: the
     // next pass's observe prunes the episode before any enqueue reads it.
@@ -730,5 +730,80 @@ fn hold_statuses_on_many_prs_are_never_a_base_level_episode() {
         super::group(&reds(&real, &ledger, "review-verdict", &[])).len(),
         1,
         "a genuine failing check on three PRs still groups"
+    );
+}
+
+/// Run one enforce pass over the three-PR episode with the given base verdict
+/// for the check, and return the first member row.
+fn row_with_base(base: Option<BaseCheck>) -> PrReport {
+    let obs = three_red_prs();
+    let mut ledger = ledger_with_tests(&obs, "due_soon_fixture");
+    let reds = reds(&obs, &ledger, "review-verdict", &[]);
+    let mut reports = vec![report(12147), report(12152), report(12160)];
+    let pass = observe(Mode::Enforce, &obs, &reds, &mut ledger, T0);
+    assert_eq!(pass.episode_checks(), BTreeSet::from([CHECK.to_owned()]));
+    let verdicts: BTreeMap<String, BaseCheck> = base
+        .map(|base| (CHECK.to_owned(), base))
+        .into_iter()
+        .collect();
+    pass.annotate(&mut reports, &verdicts);
+    reports.remove(0)
+}
+
+#[test]
+fn shared_failure_with_a_red_base_says_wait() {
+    let row = row_with_base(Some(BaseCheck::Red));
+    let action = row.blocked.next_action.expect("next action").action;
+    assert!(action.contains("same test"), "{action}");
+    assert!(action.contains("do not repair this PR"), "{action}");
+    assert!(action.contains("also failing"), "{action}");
+    let mark = row.blocked.red_everywhere.expect("mark");
+    assert_eq!((mark.base, mark.repair_skip), (BaseCheck::Red, true));
+}
+
+#[test]
+fn shared_failure_with_a_green_base_says_repair_and_names_the_test() {
+    let row = row_with_base(Some(BaseCheck::Green));
+    let action = row.blocked.next_action.expect("next action").action;
+    assert!(action.starts_with("Repair this PR"), "{action}");
+    assert!(action.contains("due_soon_fixture"), "{action}");
+    assert!(action.contains("3 PRs with the same test"), "{action}");
+    assert!(action.contains("base tip is green"), "{action}");
+    assert!(!action.contains("do not repair"), "{action}");
+    let mark = row.blocked.red_everywhere.expect("mark");
+    assert_eq!((mark.base, mark.repair_skip), (BaseCheck::Green, false));
+}
+
+#[test]
+fn shared_failure_with_an_unreadable_base_keeps_the_cautious_text() {
+    for base in [None, Some(BaseCheck::Unknown)] {
+        let row = row_with_base(base);
+        let action = row.blocked.next_action.expect("next action").action;
+        assert!(action.contains("do not repair this PR"), "{action}");
+        assert!(action.contains("could not be read"), "{action}");
+        let mark = row.blocked.red_everywhere.expect("mark");
+        assert_eq!((mark.base, mark.repair_skip), (BaseCheck::Unknown, true));
+    }
+}
+
+#[test]
+fn only_a_read_completed_passing_verdict_is_green() {
+    use crate::base_health::fix_first::TipReading;
+    let at = Some(chrono::DateTime::from_timestamp(T0, 0).expect("time"));
+    let tip = |red, newest_at, error: Option<&str>| TipReading {
+        red,
+        newest_at,
+        error: error.map(str::to_owned),
+        ..TipReading::default()
+    };
+    assert_eq!(BaseCheck::from_tip(&tip(false, at, None)), BaseCheck::Green);
+    assert_eq!(BaseCheck::from_tip(&tip(true, at, None)), BaseCheck::Red);
+    assert_eq!(
+        BaseCheck::from_tip(&tip(false, None, None)),
+        BaseCheck::Unknown
+    );
+    assert_eq!(
+        BaseCheck::from_tip(&tip(false, at, Some("boom"))),
+        BaseCheck::Unknown
     );
 }

@@ -212,10 +212,15 @@ fn a_steady_state_pass_costs_the_admissible_pull_requests_not_the_backlog() {
     );
     // Once published, a blocked pull request costs nothing per pass: ten more
     // of them add no GitHub call, and the admissible one still costs some.
+    // The one exception is the single base tip read for a shared-failure
+    // episode's check: the 12 blocked heads fail the same check, so that
+    // episode costs one read per pass however many members it has.
     assert_eq!(
-        small.calls[1], large.calls[1],
+        small.calls[1] + 1,
+        large.calls[1],
         "steady state: 2 blocked -> {} calls, 12 blocked -> {} calls",
-        small.calls[1], large.calls[1]
+        small.calls[1],
+        large.calls[1]
     );
     assert!(
         small.calls[1] > 0,

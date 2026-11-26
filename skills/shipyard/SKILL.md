@@ -4638,13 +4638,17 @@ one issue per signature (marker on the last line, updated by comment, closed
 issues left alone, test names sanitised). Do not push a no-op head for such a
 row; fix or list the flaky test. See `docs/automated-draining.md` "Flakes".
 
-**A row marked `red_everywhere` is a base-level failure, not yours to repair.**
+**A row marked `red_everywhere` is a base-level failure only when the base is red on that check.**
 When one required check fails the same test on three or more open pull requests,
 the steward reports the episode in the repository's `red_everywhere` section and
-marks each member row (`red_everywhere: {check, test, prs, repair_skip}`), and the
-row's `next_action` reads "Failing on N PRs with the same test ... do not repair
-this PR, wait for the base fix or merge main once main is green". Do that: wait
-for the fix on the base, then merge the base once and push once. `[auto_merge]
+marks each member row (`red_everywhere: {check, test, prs, base, repair_skip}`).
+`base` is the base tip's newest verdict on that check. When it is `red` or
+`unknown`, the row's `next_action` reads "Failing on N PRs with the same test ...
+do not repair this PR, wait for the base fix or merge main once main is green":
+wait for the fix on the base, then merge the base once and push once. When it is
+`green`, the `next_action` reads "Repair this PR: ..." and names the failing test:
+main passes that check, so the failure is this pull request's own and `repair_skip`
+is false. `[auto_merge]
 red_everywhere` is `shadow` by default; under `enforce` an unchanged member head
 is not enqueued (`held_red_everywhere:<check>`) and `repair_skip` is true. See
 `docs/automated-draining.md` "Red everywhere".
