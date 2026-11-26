@@ -34,13 +34,14 @@ finding that is resolved by an explanation. The command is read-only and exits
 1 while any finding remains open, or 2 when GitHub evidence is unreadable.
 
 After merging the base into a PR branch, run `shipyard merge-check` (local,
-read-only) before pushing. With `HEAD` the merge commit it needs no arguments
-beyond the base: `shipyard merge-check --base origin/main`. It passes only when
-every file the merge changed relative to the base is one of the PR's own files,
-so a resolution that silently dropped base content exits 1 and lists the extra
-files with their `+`/`-` line counts. A PR file that now equals the base is a
-warning, not a failure. Exit 2 means it could not decide (for example a
-non-merge `HEAD` with no `--pre`).
+read-only) before pushing: `shipyard merge-check --base origin/main` with
+`HEAD` the merge commit. For each file the merge changed relative to the base
+that is not one of the PR's own files, it checks that every line the base added
+since the merge base is still there and that a changed base file was not
+reverted. Missing base content exits 1 (`base_loss`, with the missing line
+count). Extra edits that keep all of the base's lines (`merge_only_edit`) are a
+warning, as is a PR file that now equals the base. Exit 2 means it could not
+decide (for example a non-merge `HEAD` with no `--pre`).
 
 A scheduled reviewer pass works through the **must-review queue** a script computes before it starts: open,
 non-draft, green, and no verdict naming the head, with missed ones first. A 2-minute eligibility tick, which makes

@@ -6,7 +6,7 @@
 //! (`merge-base(B, P)..P`) and `drift` is `B..H`. The check passes iff
 //! `drift` is a subset of `pr_files`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
@@ -26,6 +26,10 @@ struct ExtraFile {
     path: String,
     added: Option<u64>,
     deleted: Option<u64>,
+    /// The base's change to this file was dropped by the merge.
+    loss: bool,
+    /// How many of the base's added lines are missing from the head.
+    missing: u64,
 }
 
 #[derive(Debug)]
@@ -136,12 +140,17 @@ fn analyze(cwd: &Path, args: &MergeCheckArgs) -> Result<Report, CliFailure> {
     let extra = drift
         .iter()
         .filter(|file| !pr_files.contains(&file.path))
-        .map(|file| ExtraFile {
-            path: file.path.clone(),
-            added: file.added,
-            deleted: file.deleted,
+        .map(|file| {
+            let (loss, missing) = classify(cwd, &merge_base, &base, &head, &file.path)?;
+            Ok(ExtraFile {
+                path: file.path.clone(),
+                added: file.added,
+                deleted: file.deleted,
+                loss,
+                missing,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, CliFailure>>()?;
     let drifted: BTreeSet<&str> = drift.iter().map(|file| file.path.as_str()).collect();
     let collapsed = pr_files
         .iter()
@@ -220,9 +229,63 @@ fn numstat(cwd: &Path, from: &str, to: &str) -> Result<Vec<ExtraFile>, CliFailur
             path: path.to_owned(),
             added: added.parse().ok(),
             deleted: deleted.parse().ok(),
+            loss: false,
+            missing: 0,
         });
     }
     Ok(files)
+}
+
+fn blob(cwd: &Path, rev: &str, path: &str) -> Option<String> {
+    git(
+        cwd,
+        &["rev-parse", "--verify", "--quiet", &format!("{rev}:{path}")],
+    )
+    .ok()
+    .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+}
+
+/// Decide whether the merge dropped the base's change to a file the PR did
+/// not touch. Returns `(loss, missing_lines)`.
+///
+/// Loss: the head's file is missing lines the base added since the merge base
+/// (compared as a line multiset, so reordering is fine), or the head's file is
+/// the merge base's version while the base changed it (a full revert).
+/// Otherwise the head keeps everything the base added and the difference is an
+/// edit made inside the merge commit.
+fn classify(
+    cwd: &Path,
+    merge_base: &str,
+    base: &str,
+    head: &str,
+    path: &str,
+) -> Result<(bool, u64), CliFailure> {
+    let base_blob = blob(cwd, base, path);
+    let merge_base_blob = blob(cwd, merge_base, path);
+    if blob(cwd, head, path) == merge_base_blob && base_blob != merge_base_blob {
+        return Ok((true, 0));
+    }
+    let diff = git(
+        cwd,
+        &["diff", "--no-renames", "-U0", merge_base, base, "--", path],
+    )?;
+    let mut added: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    for line in diff.split(|byte| *byte == b'\n') {
+        if line.first() == Some(&b'+') && !line.starts_with(b"+++") {
+            *added.entry(line[1..].to_vec()).or_default() += 1;
+        }
+    }
+    let mut have: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    if let Ok(content) = git(cwd, &["show", &format!("{head}:{path}")]) {
+        for line in content.split(|byte| *byte == b'\n') {
+            *have.entry(line.to_vec()).or_default() += 1;
+        }
+    }
+    let missing = added
+        .iter()
+        .map(|(line, count)| count.saturating_sub(have.get(line).copied().unwrap_or(0)))
+        .sum::<u64>();
+    Ok((missing > 0, missing))
 }
 
 fn lines(value: Option<u64>) -> String {
@@ -234,7 +297,8 @@ fn render<W: Write>(
     json_output: bool,
     stdout: &mut W,
 ) -> Result<ExitCode, CliFailure> {
-    let pass = report.extra.is_empty();
+    let losses = report.extra.iter().filter(|file| file.loss).count();
+    let pass = losses == 0;
     let io = |error: std::io::Error| CliFailure::new(2, format!("write failed: {error}"));
     if json_output {
         let value = json!({
@@ -248,6 +312,8 @@ fn render<W: Write>(
                 "path": file.path,
                 "added": file.added,
                 "deleted": file.deleted,
+                "class": if file.loss { "base_loss" } else { "merge_only_edit" },
+                "missing_base_lines": file.missing,
             })).collect::<Vec<_>>(),
             "collapsed_pr_files": report.collapsed,
         });
@@ -256,7 +322,7 @@ fn render<W: Write>(
         if pass {
             writeln!(
                 stdout,
-                "merge-check: PASS. {} left the base unchanged outside the PR's {} files.",
+                "merge-check: PASS. {} kept all base content outside the PR's {} files.",
                 &report.head[..report.head.len().min(12)],
                 report.pr_file_count
             )
@@ -264,27 +330,44 @@ fn render<W: Write>(
         } else {
             writeln!(
                 stdout,
-                "merge-check: FAIL. {} files outside the PR's own change set differ from the \
-                 base:",
-                report.extra.len()
+                "merge-check: FAIL. {losses} files outside the PR's own change set lost base \
+                 content in the merge:"
             )
             .map_err(io)?;
-            writeln!(stdout, "{:>8} {:>8}  FILE", "+", "-").map_err(io)?;
-            for file in &report.extra {
+        }
+        let table = |stdout: &mut W, loss: bool| -> Result<(), CliFailure> {
+            writeln!(stdout, "{:>8} {:>8} {:>8}  FILE", "+", "-", "MISSING").map_err(io)?;
+            for file in report.extra.iter().filter(|file| file.loss == loss) {
                 writeln!(
                     stdout,
-                    "{:>8} {:>8}  {}",
+                    "{:>8} {:>8} {:>8}  {}",
                     lines(file.added),
                     lines(file.deleted),
+                    file.missing,
                     file.path
                 )
                 .map_err(io)?;
             }
+            Ok(())
+        };
+        if losses > 0 {
+            table(stdout, true)?;
             writeln!(
                 stdout,
-                "(+/- are lines the merge result adds to / removes from the base.)"
+                "(+/- are lines the merge result adds to / removes from the base; MISSING is \
+                 lines the base added that the merge result lacks.)"
             )
             .map_err(io)?;
+        }
+        let edits = report.extra.len() - losses;
+        if edits > 0 {
+            writeln!(
+                stdout,
+                "warning: {edits} files outside the PR's change set carry edits made in the \
+                 merge commit; every line the base added is kept:"
+            )
+            .map_err(io)?;
+            table(stdout, false)?;
         }
         if !report.collapsed.is_empty() {
             writeln!(
@@ -540,6 +623,85 @@ mod tests {
         assert_eq!(paths, ["base.txt"]);
     }
 
+    fn base_original(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("base.txt")).expect("read")
+    }
+
+    #[test]
+    fn restoring_the_old_version_of_an_untouched_file_is_a_base_loss() {
+        let temp = fixture();
+        let dir = temp.path();
+        let original = base_original(dir);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", &format!("{original}n1\nn2\n"));
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        write(dir, "base.txt", &original);
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1));
+        let v = verdict(&out);
+        assert_eq!(v["extra"][0]["class"], "base_loss");
+    }
+
+    #[test]
+    fn reverting_a_base_change_that_only_removed_lines_is_a_base_loss() {
+        let temp = fixture();
+        let dir = temp.path();
+        let original = base_original(dir);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", "b0\n");
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        write(dir, "base.txt", &original);
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        assert_eq!(verdict(&out)["extra"][0]["class"], "base_loss");
+    }
+
+    #[test]
+    fn a_partial_base_loss_fails() {
+        let temp = fixture();
+        let dir = temp.path();
+        let original = base_original(dir);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", &format!("{original}n1\nn2\nn3\n"));
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        // Keep one of the three lines main added, in a different place.
+        write(dir, "base.txt", &format!("n2\n{original}"));
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1));
+        let v = verdict(&out);
+        assert_eq!(v["pass"], false);
+        assert_eq!(v["extra"][0]["missing_base_lines"], 2);
+    }
+
+    #[test]
+    fn an_edit_inside_the_merge_commit_warns_and_passes() {
+        let temp = fixture();
+        let dir = temp.path();
+        let original = base_original(dir);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", &format!("{original}n1\n"));
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        // The author's own addition, committed with the merge; reordered too.
+        write(dir, "base.txt", &format!("extra\nn1\n{original}"));
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::SUCCESS, "{out}");
+        let v = verdict(&out);
+        assert_eq!(v["pass"], true);
+        assert_eq!(v["extra"][0]["class"], "merge_only_edit");
+        assert_eq!(v["extra"][0]["missing_base_lines"], 0);
+        let mut human = Vec::new();
+        merge_check_command(&args(None), dir, false, &mut human).expect("ok");
+        assert!(String::from_utf8_lossy(&human).contains("warning: 1 files"));
+    }
+
     #[test]
     fn human_output_lists_extra_files_in_a_table() {
         let report = Report {
@@ -552,6 +714,8 @@ mod tests {
                 path: "src/x.rs".to_owned(),
                 added: Some(3),
                 deleted: Some(1800),
+                loss: true,
+                missing: 7,
             }],
             collapsed: vec![],
         };
@@ -561,6 +725,6 @@ mod tests {
             ExitCode::from(1)
         );
         let text = String::from_utf8(out).expect("utf8");
-        assert!(text.contains("1800  src/x.rs"), "{text}");
+        assert!(text.contains("1800        7  src/x.rs"), "{text}");
     }
 }
