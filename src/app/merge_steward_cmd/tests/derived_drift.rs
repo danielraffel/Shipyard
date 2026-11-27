@@ -80,23 +80,38 @@ fn pr(checks: Vec<StewardCheck>) -> StewardPullRequest {
 }
 
 fn failed_block(tests: &[&str]) -> String {
+    // The real macOS shape: the step's group header, its echo, then ctest.
     let mut log = String::from(
-        "2026-11-27T10:00:00.0000000Z Errors while running CTest\n\
-         2026-11-27T10:00:00.0000000Z The following tests FAILED:\n",
+        "2026-11-27T10:00:00.0000000Z ##[group]Run ctest -L pr-fast\n\
+         2026-11-27T10:00:00.0000000Z ctest -L pr-fast\n\
+         2026-11-27T10:00:00.0000000Z ##[endgroup]\n\
+         2026-11-27T10:00:01.0000000Z The following tests FAILED:\n",
     );
     for (number, test) in tests.iter().enumerate() {
         let _ = writeln!(
             log,
-            "2026-11-27T10:00:00.0000000Z \t{} - {test} (Failed)     pr-fast",
+            "2026-11-27T10:00:01.0000000Z \t{} - {test} (Failed)     pr-fast",
             2200 + number
         );
     }
+    log.push_str(
+        "2026-11-27T10:00:01.0000000Z Errors while running CTest\n\
+         2026-11-27T10:00:01.0000000Z ##[error]Process completed with exit code 8.\n",
+    );
     log
 }
 
-/// A GitHub reader answering the runs, artifact and job-log reads.
+/// A GitHub reader answering the runs, artifact, commit, job and job-log
+/// reads.
 struct Reads {
     artifact: bool,
+    /// The artifact's `workflow_run.head_sha`.
+    artifact_head: String,
+    /// The pull request the failed run belongs to.
+    run_pr: u64,
+    head_message: String,
+    /// Failed steps per job.
+    failed_steps: usize,
     logs: Vec<(u64, String)>,
     calls: RefCell<Vec<String>>,
 }
@@ -105,6 +120,10 @@ impl Reads {
     fn new(artifact: bool, logs: &[(u64, &[&str])]) -> Self {
         Self {
             artifact,
+            artifact_head: head(),
+            run_pr: 12,
+            head_message: "feat: change a script\n".to_owned(),
+            failed_steps: 1,
             logs: logs
                 .iter()
                 .map(|(job, tests)| (*job, failed_block(tests)))
@@ -116,14 +135,20 @@ impl Reads {
     fn read(&self, args: &[String]) -> Result<String, String> {
         let path = args.last().cloned().unwrap_or_default();
         self.calls.borrow_mut().push(path.clone());
+        let head = head();
         if path.contains("/actions/runs?head_sha=") {
             return Ok(format!(
                 r#"{{"workflow_runs": [
-                    {{"id": 500, "conclusion": "failure", "head_sha": "{}"}},
-                    {{"id": 400, "conclusion": "success", "head_sha": "{}"}}
+                    {{"id": 500, "event": "pull_request", "conclusion": "failure",
+                      "head_sha": "{head}", "head_branch": "feature",
+                      "head_repository": {{"full_name": "{REPO}"}},
+                      "pull_requests": [{{"number": {}}}]}},
+                    {{"id": 400, "event": "pull_request", "conclusion": "success",
+                      "head_sha": "{head}", "head_branch": "feature",
+                      "head_repository": {{"full_name": "{REPO}"}},
+                      "pull_requests": [{{"number": 12}}]}}
                 ]}}"#,
-                head(),
-                head()
+                self.run_pr
             ));
         }
         if path.ends_with("/actions/runs/500/artifacts?per_page=100") {
@@ -132,20 +157,47 @@ impl Reads {
             } else {
                 "ctest-logs-macos"
             };
+            let workflow_run = if self.artifact_head.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    r#", "workflow_run": {{"id": 500, "head_sha": "{}"}}"#,
+                    self.artifact_head
+                )
+            };
             return Ok(format!(
-                r#"{{"artifacts": [{{"id": 1, "name": "{name}", "expired": false}}]}}"#
+                r#"{{"artifacts": [{{"id": 1, "name": "{name}", "expired": false{workflow_run}}}]}}"#
             ));
+        }
+        if path.ends_with(&format!("/commits/{head}")) {
+            return Ok(serde_json::json!({"commit": {"message": self.head_message}}).to_string());
         }
         for (job, log) in &self.logs {
             if path.ends_with(&format!("/actions/jobs/{job}/logs")) {
                 return Ok(log.clone());
+            }
+            if path.ends_with(&format!("/actions/jobs/{job}")) {
+                let mut steps = vec![serde_json::json!({"name": "Set up job",
+                    "conclusion": "success", "started_at": "2026-11-27T09:59:00Z"})];
+                for index in 0..self.failed_steps {
+                    steps.push(serde_json::json!({"name": format!("step {index}"),
+                        "conclusion": "failure", "started_at": "2026-11-27T10:00:00Z"}));
+                }
+                return Ok(serde_json::json!({"steps": steps}).to_string());
             }
         }
         Err(format!("unexpected read {path}"))
     }
 }
 
+/// Every required check the case does not name is green.
 fn advise(reads: &Reads, checks: Vec<StewardCheck>, token: &str, config: &str) -> Option<String> {
+    let mut checks = checks;
+    for name in ["macos", "drift-fast"] {
+        if !checks.iter().any(|check| check.name == name) {
+            checks.push(check(name, "SUCCESS", 99));
+        }
+    }
     let read = |args: &[String]| reads.read(args);
     advice(&read, REPO, &pr(checks), &policy(config), token).map(|next| {
         assert_eq!(next.actor, Actor::Author);
@@ -284,6 +336,70 @@ fn a_failing_commit_status_is_not_read_as_a_job() {
     status.source = StewardCheckSource::StatusContext;
     assert_eq!(
         advise(&reads, vec![status], "required_failed:macos", CONFIG),
+        None
+    );
+}
+
+#[test]
+fn a_required_check_still_running_withholds_the_advice() {
+    let reads = Reads::new(true, &[(11, &["script-test-inputs-drift"])]);
+    let mut running = check("drift-fast", "SUCCESS", 12);
+    running.status = "IN_PROGRESS".to_owned();
+    running.conclusion = None;
+    let checks = vec![check("macos", "FAILURE", 11), running];
+    assert_eq!(
+        advise(&reads, checks, "required_failed:macos", CONFIG),
+        None
+    );
+}
+
+#[test]
+fn another_pull_requests_run_at_the_same_head_is_ignored() {
+    let mut reads = Reads::new(true, &[(11, &["script-test-inputs-drift"])]);
+    reads.run_pr = 99;
+    let checks = vec![check("macos", "FAILURE", 11)];
+    assert_eq!(
+        advise(&reads, checks, "required_failed:macos", CONFIG),
+        None
+    );
+}
+
+#[test]
+fn an_artifact_for_another_head_is_ignored() {
+    let mut reads = Reads::new(true, &[(11, &["script-test-inputs-drift"])]);
+    reads.artifact_head = "b".repeat(40);
+    let checks = vec![check("macos", "FAILURE", 11)];
+    assert_eq!(
+        advise(&reads, checks, "required_failed:macos", CONFIG),
+        None
+    ); // An artifact that reports no head at all fails closed too.
+    reads.artifact_head = String::new();
+    let checks = vec![check("macos", "FAILURE", 11)];
+    assert_eq!(
+        advise(&reads, checks, "required_failed:macos", CONFIG),
+        None
+    );
+}
+
+#[test]
+fn a_head_that_is_already_an_apply_commit_gets_no_advice() {
+    let mut reads = Reads::new(true, &[(11, &["script-test-inputs-drift"])]);
+    reads.head_message =
+        "chore: apply CI's expected derived files from run 400\n\nVersion-Bump: skip\n".to_owned();
+    let checks = vec![check("macos", "FAILURE", 11)];
+    assert_eq!(
+        advise(&reads, checks, "required_failed:macos", CONFIG),
+        None
+    );
+}
+
+#[test]
+fn a_second_failed_step_in_the_job_is_not_drift_only() {
+    let mut reads = Reads::new(true, &[(11, &["script-test-inputs-drift"])]);
+    reads.failed_steps = 2;
+    let checks = vec![check("macos", "FAILURE", 11)];
+    assert_eq!(
+        advise(&reads, checks, "required_failed:macos", CONFIG),
         None
     );
 }

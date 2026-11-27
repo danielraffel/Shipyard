@@ -62,11 +62,7 @@ pub(super) struct PrHead {
 }
 
 /// One workflow run at the head.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct RunAtHead {
-    pub(super) id: u64,
-    pub(super) conclusion: Option<String>,
-}
+pub(super) type RunAtHead = apply_derived::RunRecord;
 
 /// One artifact of a run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +78,7 @@ pub(super) struct ArtifactRef {
 /// The GitHub reads and the one download the command needs; faked in tests.
 pub(super) trait DerivedGitHub {
     fn pull_request(&self, repo: &str, number: u64) -> Result<PrHead, String>;
+    fn default_branch(&self, repo: &str) -> Result<String, String>;
     /// The base branch's `.shipyard/config.toml`, or `None` when it has none.
     fn base_config(&self, repo: &str, base: &str) -> Result<Option<String>, String>;
     fn runs_at_head(&self, repo: &str, head: &str) -> Result<Vec<RunAtHead>, String>;
@@ -116,8 +113,6 @@ pub(super) struct FileReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum Outcome {
-    /// Nothing differs from the checkout.
-    NothingToApply,
     /// Planned only (the default).
     DryRun,
     /// Written, committed and pushed.
@@ -209,9 +204,6 @@ fn render<W: Write>(report: &Report, out: &mut W) -> std::io::Result<()> {
         .filter(|file| file.change != Change::Unchanged)
         .count();
     match report.outcome {
-        Outcome::NothingToApply => {
-            writeln!(out, "Nothing to apply: the checkout already matches.")?;
-        }
         Outcome::DryRun => writeln!(
             out,
             "Dry run: {changed} file(s) would change. Nothing was written; pass --push to \
@@ -253,6 +245,20 @@ pub(super) fn run(
             pr.head_repo
         ));
     }
+    let default_branch = gh.default_branch(repo)?;
+    if pr.base_ref != default_branch {
+        return Err(format!(
+            "#{number} targets `{}`, not the default branch `{default_branch}`; only pull \
+             requests on the default branch are repaired",
+            pr.base_ref
+        ));
+    }
+    if pr.head_ref == default_branch {
+        return Err(format!(
+            "#{number}'s head branch is the default branch `{default_branch}`; refusing to push \
+             to it"
+        ));
+    }
     let text = gh
         .base_config(repo, &pr.base_ref)?
         .ok_or_else(|| format!("{} has no .shipyard/config.toml", pr.base_ref))?;
@@ -277,7 +283,7 @@ pub(super) fn run(
     }
     git.ensure_clean()?;
 
-    let (run_id, artifacts) = latest_failed_run_with_artifacts(gh, repo, &pr.head_sha, &config)?;
+    let (run_id, artifacts) = latest_failed_run_with_artifacts(gh, repo, number, &pr, &config)?;
     let files = download_files(gh, repo, &config, &artifacts)?;
     let mut reports = Vec::new();
     let mut changed: Vec<(&str, &[u8])> = Vec::new();
@@ -301,6 +307,23 @@ pub(super) fn run(
             removed,
         });
     }
+    let already: Vec<&str> = reports
+        .iter()
+        .filter(|file| file.change == Change::Unchanged)
+        .map(|file| file.path.as_str())
+        .collect();
+    if !already.is_empty() {
+        // `--emit-expected` writes only the files that differ, so a file that
+        // already matches says the artifact cannot explain this red: the
+        // drift needs a file removed, or a regeneration from a newer tree.
+        return Err(format!(
+            "run {run_id} failed, but its expected files already match the checkout for {}. \
+             The drift needs a file removed or a full regeneration, which this command cannot \
+             do: run the generator, or delete the stale derived files by hand. Nothing was \
+             written.",
+            already.join(", ")
+        ));
+    }
     ensure_head_unmoved(gh, repo, number, &pr.head_sha, "after reading the artifact")?;
     let mut report = Report {
         schema: SCHEMA,
@@ -315,35 +338,34 @@ pub(super) fn run(
         commit: None,
         pushed_to: None,
     };
-    if changed.is_empty() {
-        report.outcome = Outcome::NothingToApply;
-        return Ok(report);
-    }
     if !push {
         return Ok(report);
     }
 
-    for (path, data) in &changed {
+    let paths: Vec<&str> = changed.iter().map(|(path, _)| *path).collect();
+    for path in &paths {
         git.refuse_special_tracked(path)?;
-        write_checkout_file(git.dir(), path, data)?;
     }
-    let mut unexpected: Vec<String> = git
-        .changed_paths()?
-        .into_iter()
-        .filter(|path| !changed.iter().any(|(planned, _)| planned == path))
-        .collect();
-    unexpected.retain(|path| !path.is_empty());
-    if !unexpected.is_empty() {
+    let ignored = git.ignored(&paths)?;
+    if !ignored.is_empty() {
         return Err(format!(
-            "writing the derived files changed paths outside the plan ({}); nothing was \
-             committed. Inspect the checkout and restore it with `git checkout -- .`",
-            unexpected.join(", ")
+            "the checkout's ignore rules cover {}; nothing was written",
+            ignored.join(", ")
         ));
     }
-    let paths: Vec<&str> = changed.iter().map(|(path, _)| *path).collect();
-    git.add(&paths)?;
-    let message = apply_derived::commit_message(run_id, &git.tip_trailers()?, &config);
-    let commit = git.commit(&message)?;
+    let mut undo = Undo::default();
+    let commit = match write_and_commit(git, &changed, &mut undo, run_id, &config) {
+        Ok(commit) => commit,
+        Err(error) => {
+            return Err(match undo.restore(git) {
+                Ok(()) => format!("{error}. The checkout was restored; nothing was committed."),
+                Err(restore) => format!(
+                    "{error}. Restoring the checkout also failed ({restore}); inspect it before \
+                     reusing it."
+                ),
+            });
+        }
+    };
     ensure_head_unmoved(gh, repo, number, &pr.head_sha, "before pushing")
         .map_err(|error| format!("{error}. Local commit {} was not pushed.", short(&commit)))?;
     let remote = git.push_remote(repo)?;
@@ -353,6 +375,80 @@ pub(super) fn run(
     report.commit = Some(commit);
     report.pushed_to = Some(format!("{remote} {target}"));
     Ok(report)
+}
+
+/// What a refused write must put back: each written path (and whether it
+/// was new) and each directory created for one.
+#[derive(Default)]
+struct Undo {
+    files: Vec<(String, bool)>,
+    dirs: Vec<PathBuf>,
+}
+
+impl Undo {
+    fn restore(&self, git: &Git) -> Result<(), String> {
+        let mut problems = Vec::new();
+        let paths: Vec<&str> = self.files.iter().map(|(path, _)| path.as_str()).collect();
+        if !paths.is_empty() {
+            let specs: Vec<String> = paths.iter().map(|path| format!(":(icase){path}")).collect();
+            let mut args = vec!["reset", "-q", "--"];
+            args.extend(specs.iter().map(String::as_str));
+            if let Err(error) = git.run(&args) {
+                problems.push(error);
+            }
+        }
+        for (path, new) in &self.files {
+            let result = if *new {
+                std::fs::remove_file(git.dir().join(path)).map_err(|error| error.to_string())
+            } else {
+                // `icase`: on a case-insensitive filesystem the planned name
+                // can differ in case from the tracked file it landed on.
+                git.run(&["checkout", "--", &format!(":(icase){path}")])
+                    .map(drop)
+            };
+            if let Err(error) = result {
+                problems.push(format!("{path}: {error}"));
+            }
+        }
+        for dir in self.dirs.iter().rev() {
+            let _ = std::fs::remove_dir(dir);
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+}
+
+fn write_and_commit(
+    git: &Git,
+    changed: &[(&str, &[u8])],
+    undo: &mut Undo,
+    run_id: u64,
+    config: &DerivedFilesConfig,
+) -> Result<String, String> {
+    for (path, data) in changed {
+        let new = read_checkout_file(git.dir(), path)?.is_none();
+        check_parents(git.dir(), path, Some(&mut undo.dirs))?;
+        undo.files.push(((*path).to_owned(), new));
+        write_checkout_file(git.dir(), path, data)?;
+    }
+    let unexpected: Vec<String> = git
+        .changed_paths()?
+        .into_iter()
+        .filter(|path| !path.is_empty() && !changed.iter().any(|(planned, _)| planned == path))
+        .collect();
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "writing the derived files changed paths outside the plan ({})",
+            unexpected.join(", ")
+        ));
+    }
+    let paths: Vec<&str> = changed.iter().map(|(path, _)| *path).collect();
+    git.add(&paths)?;
+    let message = apply_derived::commit_message(run_id, &git.tip_trailers()?, config);
+    git.commit(&message)
 }
 
 fn ensure_head_unmoved(
@@ -379,13 +475,15 @@ fn ensure_head_unmoved(
 fn latest_failed_run_with_artifacts(
     gh: &dyn DerivedGitHub,
     repo: &str,
-    head: &str,
+    number: u64,
+    pr: &PrHead,
     config: &DerivedFilesConfig,
 ) -> Result<(u64, Vec<ArtifactRef>), String> {
+    let head = pr.head_sha.as_str();
     let mut runs: Vec<RunAtHead> = gh
         .runs_at_head(repo, head)?
         .into_iter()
-        .filter(|run| run.conclusion.as_deref() == Some("failure"))
+        .filter(|run| apply_derived::run_belongs(run, repo, number, head, &pr.head_ref))
         .collect();
     runs.sort_by_key(|run| std::cmp::Reverse(run.id));
     for run in runs {
@@ -398,7 +496,7 @@ fn latest_failed_run_with_artifacts(
                     && artifact
                         .head_sha
                         .as_deref()
-                        .is_none_or(|sha| sha.eq_ignore_ascii_case(head))
+                        .is_some_and(|sha| sha.eq_ignore_ascii_case(head))
             })
             .collect();
         if !artifacts.is_empty() {
@@ -407,7 +505,7 @@ fn latest_failed_run_with_artifacts(
     }
     let names: Vec<&str> = config.artifacts.iter().map(|a| a.name.as_str()).collect();
     Err(format!(
-        "no failed run at {} carries an unexpired expected-files artifact ({})",
+        "no failed run of #{number} at {} carries an unexpired expected-files artifact ({})",
         short(head),
         names.join(", ")
     ))
@@ -480,7 +578,11 @@ fn line_delta(old: &[u8], new: &[u8]) -> (usize, usize) {
 
 /// Each existing directory on the way to `rel` must be a real directory,
 /// never a symlink or a file.
-fn check_parents(root: &Path, rel: &str, create: bool) -> Result<bool, String> {
+fn check_parents(
+    root: &Path,
+    rel: &str,
+    mut created: Option<&mut Vec<PathBuf>>,
+) -> Result<bool, String> {
     let segments: Vec<&str> = rel.split('/').collect();
     let mut dir = root.to_path_buf();
     for segment in &segments[..segments.len().saturating_sub(1)] {
@@ -494,11 +596,12 @@ fn check_parents(root: &Path, rel: &str, create: bool) -> Result<bool, String> {
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !create {
+                let Some(created) = created.as_deref_mut() else {
                     return Ok(false);
-                }
+                };
                 std::fs::create_dir(&dir)
                     .map_err(|error| format!("create {}: {error}", dir.display()))?;
+                created.push(dir.clone());
             }
             Err(error) => return Err(format!("read {}: {error}", dir.display())),
         }
@@ -509,7 +612,7 @@ fn check_parents(root: &Path, rel: &str, create: bool) -> Result<bool, String> {
 /// The checkout's current bytes at `rel`, `None` when absent. Refuses a path
 /// that crosses a symlink or is not a regular file.
 fn read_checkout_file(root: &Path, rel: &str) -> Result<Option<Vec<u8>>, String> {
-    if !check_parents(root, rel, false)? {
+    if !check_parents(root, rel, None)? {
         return Ok(None);
     }
     let path = root.join(rel);
@@ -524,7 +627,9 @@ fn read_checkout_file(root: &Path, rel: &str) -> Result<Option<Vec<u8>>, String>
 }
 
 fn write_checkout_file(root: &Path, rel: &str, data: &[u8]) -> Result<(), String> {
-    check_parents(root, rel, true)?;
+    if !check_parents(root, rel, None)? {
+        return Err(format!("the directory for {rel} does not exist"));
+    }
     let path = root.join(rel);
     #[cfg(unix)]
     let mode = match std::fs::symlink_metadata(&path) {
@@ -699,14 +804,50 @@ impl Git {
         self.status()
     }
 
+    /// Refuse `path` when it, or any directory above it, is tracked as a
+    /// symlink (120000) or a submodule (160000).
     fn refuse_special_tracked(&self, path: &str) -> Result<(), String> {
-        let staged = self.run(&["ls-files", "-s", "--", path])?;
-        for line in staged.lines() {
-            if line.starts_with("120000 ") || line.starts_with("160000 ") {
-                return Err(format!("`{path}` is tracked as a symlink or submodule"));
+        let segments: Vec<&str> = path.split('/').collect();
+        let wanted: Vec<String> = (1..=segments.len())
+            .map(|end| segments[..end].join("/"))
+            .collect();
+        let mut args = vec!["ls-files", "-s", "--"];
+        args.extend(wanted.iter().map(String::as_str));
+        for line in self.run(&args)?.lines() {
+            let Some((meta, name)) = line.split_once('\t') else {
+                continue;
+            };
+            let special = meta.starts_with("120000 ") || meta.starts_with("160000 ");
+            if special && wanted.iter().any(|want| want == name) {
+                return Err(format!(
+                    "`{name}` is tracked as a symlink or submodule; refusing to write `{path}`"
+                ));
             }
         }
         Ok(())
+    }
+
+    /// The paths among `paths` the checkout's ignore rules cover (a new file
+    /// there would be written and then refused by `git add`).
+    fn ignored(&self, paths: &[&str]) -> Result<Vec<String>, String> {
+        let mut args = vec!["check-ignore", "--"];
+        args.extend_from_slice(paths);
+        let output = self
+            .command(&args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("git check-ignore: {error}"))?;
+        match output.status.code() {
+            Some(0) => Ok(String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()),
+            Some(1) => Ok(Vec::new()),
+            _ => Err(format!(
+                "git check-ignore failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        }
     }
 
     fn add(&self, paths: &[&str]) -> Result<(), String> {
@@ -810,6 +951,16 @@ impl DerivedGitHub for LiveGitHub {
         Ok(head)
     }
 
+    fn default_branch(&self, repo: &str) -> Result<String, String> {
+        let settings = self.json(&format!("repos/{repo}"))?;
+        let branch = text(&settings, "/default_branch");
+        if branch.is_empty() {
+            Err(format!("{repo}: repository read has no default branch"))
+        } else {
+            Ok(branch)
+        }
+    }
+
     fn base_config(&self, repo: &str, base: &str) -> Result<Option<String>, String> {
         let path = format!(
             "repos/{repo}/contents/.shipyard/config.toml?ref={}",
@@ -834,16 +985,7 @@ impl DerivedGitHub for LiveGitHub {
     }
 
     fn runs_at_head(&self, repo: &str, head: &str) -> Result<Vec<RunAtHead>, String> {
-        Ok(self
-            .actions
-            .workflow_runs_for_head_sha(repo, head)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .map(|run| RunAtHead {
-                id: run.id,
-                conclusion: run.conclusion,
-            })
-            .collect())
+        apply_derived::runs_at_head(&|path| self.json(path), repo, head)
     }
 
     fn run_artifacts(&self, repo: &str, run_id: u64) -> Result<Vec<ArtifactRef>, String> {

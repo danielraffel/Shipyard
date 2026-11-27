@@ -2281,9 +2281,11 @@ fn annotate_names_apply_derived_for_a_drift_only_red() {
             &format!(
                 r#"
 case "$*" in
-  *"actions/runs?head_sha={HEAD}"*) printf '%s' '{{"workflow_runs":[{{"id":500,"conclusion":"failure","head_sha":"{HEAD}"}}]}}' ;;
-  *"actions/runs/500/artifacts"*) printf '%s' '{{"artifacts":[{{"id":1,"name":"{artifact}","expired":false}}]}}' ;;
-  *"actions/jobs/11/logs"*) printf '%s\n' '2026-11-26T17:13:18.1510910Z The following tests FAILED:' '2026-11-26T17:13:18.1511600Z 	2380 - script-test-inputs-drift (Failed)                 gate-inventory pr-fast' ;;
+  *"actions/runs?head_sha={HEAD}"*) printf '%s' '{{"workflow_runs":[{{"id":500,"event":"pull_request","conclusion":"failure","head_sha":"{HEAD}","head_branch":"feature","head_repository":{{"full_name":"owner/repo"}},"pull_requests":[{{"number":77}}]}}]}}' ;;
+  *"actions/runs/500/artifacts"*) printf '%s' '{{"artifacts":[{{"id":1,"name":"{artifact}","expired":false,"workflow_run":{{"head_sha":"{HEAD}"}}}}]}}' ;;
+  *"commits/{HEAD}"*) printf '%s' '{{"commit":{{"message":"feat: change a script"}}}}' ;;
+  *"actions/jobs/11/logs"*) printf '%s\n' '2026-11-26T17:13:10.0000000Z ##[group]Run ctest' '2026-11-26T17:13:10.0000000Z ##[endgroup]' '2026-11-26T17:13:18.1510910Z The following tests FAILED:' '2026-11-26T17:13:18.1511600Z 	2380 - script-test-inputs-drift (Failed)                 gate-inventory pr-fast' '2026-11-26T17:13:18.1518220Z Errors while running CTest' '2026-11-26T17:13:18.1569700Z ##[error]Process completed with exit code 8.' ;;
+  *"actions/jobs/11"*) printf '%s' '{{"steps":[{{"name":"drift","conclusion":"failure","started_at":"2026-11-26T17:13:10Z"}}]}}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
 "#

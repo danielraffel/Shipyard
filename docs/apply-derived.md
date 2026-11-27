@@ -27,42 +27,59 @@ target is under 0.5 h.
 
 ## What it reads and checks
 
-1. The pull request: head SHA, head branch, base. A closed pull request, or
-   one whose head lives in a fork, is refused.
+1. The pull request: head SHA, head branch, base. A closed pull request, one
+   whose head lives in a fork, one whose base is not the repository's default
+   branch, and one whose head branch is the default branch are refused.
 2. The **base** branch's `.shipyard/config.toml` `[derived_files]` table. The
    pull request's own config is never read, because it could widen the
    allowlist. The `gh` client is built from machine-global config only, for
    the same reason.
 3. The checkout: `HEAD` must equal the pull request's head, and
    `git status --untracked-files=all` must be empty.
-4. The newest **failed** workflow run at that exact head that uploaded an
-   unexpired artifact named in the config. An artifact whose run reports a
-   different head is ignored.
+4. The newest **failed** workflow run of **this pull request** at that exact
+   head that uploaded an unexpired artifact named in the config: its head
+   repository is the repository, and it is either a `pull_request` run whose
+   `pull_requests` names this pull request or a `push` run of its head branch.
+   Another pull request opened from the same commit (perhaps onto a base its
+   author wrote, with its own workflow) never supplies the files. The
+   artifact must report this head; one with no head or another head is
+   ignored. Up to 300 runs at the head are read.
 5. Each such artifact's zip, parsed in memory (never extracted by a shell
    tool):
    - Only stored or deflated regular files. Symlinks, devices, setuid,
      setgid and sticky bits, encryption, zip64, multi-disk archives,
      overlapping entries and duplicate names (compared case-insensitively)
      are refused. CRC-32 is verified.
-   - Every name is normalized: `..`, `.`, empty segments, absolute paths,
-     drive letters, backslashes, NUL, control characters and any `.git`
-     segment are refused.
+   - Every name is normalized: each segment may hold only ASCII letters,
+     digits, `.`, `_` and `-`, so absolute paths, drive letters, backslashes,
+     NUL, control and bidi characters and Unicode normalization pairs are
+     refused, and so are `..`, `.`, empty segments and any segment starting
+     with `.git` (`.git`, `.gitattributes`, `.gitmodules`, `.github`).
    - The name, joined to its artifact's `root`, must fall inside the
      allowlist (`paths`).
    - Limits: 16 MiB per archive, 4096 entries, 2 MiB per file and 64 MiB in
      total, enforced while inflating.
-6. The pull request's head is read again. If it moved, the command stops.
+6. If any file in the artifact already matches the checkout, the command
+   refuses (exit 1) and names those files. `--emit-expected` writes only the
+   files that differ, so a match means the artifact cannot explain this red:
+   the drift needs a file removed or a regeneration, which this command
+   cannot do. It never reports such a run as fixed, and nothing is written.
+7. The pull request's head is read again. If it moved, the command stops.
 
 A dry run stops here and prints each file as `new`, `modified` or
 `unchanged` with its added and removed line counts.
 
 With `--push`:
 
+- A path the checkout's ignore rules cover, or that git tracks (or has an
+  ancestor tracked) as a symlink or submodule, is refused before anything is
+  written.
 - Each changed file is written through a temporary file and a rename. A path
-  that crosses a symlink or a file in the checkout, or that git tracks as a
-  symlink or submodule, is refused. New files get mode 0644, and existing
+  that crosses a symlink or a file in the checkout is refused. New files get mode 0644, and existing
   files keep their mode; incoming permission bits are ignored.
 - `git status` must then show only the planned paths.
+- Any refusal after the first write restores the checkout: the written files
+  are reset and checked out again, new files and new directories removed.
 - The commit message is fixed: `chore: apply CI's expected derived files from
   run <id>`. Its trailers are the previous tip commit's trailers whose key is
   in `carry_trailers`, then `commit_trailers`. They are carried because the
@@ -109,12 +126,20 @@ A `required_failed:<contexts>` row keeps its token. Its next action becomes
 only when all of these hold, each read spent only if the previous one passed:
 
 1. The base config's `[derived_files]` names artifacts and `drift_tests`.
-2. Every failing required check other than the approval context has a check
-   run id.
-3. A failed run at the exact head (newest five) uploaded a configured,
-   unexpired artifact.
-4. Each failing check's job log lists at least one test under `The following
-   tests FAILED:`, and every one of them is in `drift_tests`.
+2. Every required check other than the approval context has completed (one
+   still running withholds the advice), and each failing one is a check run
+   with an id.
+3. A failed run of this pull request at the exact head (the same binding as
+   the command, newest five) uploaded a configured, unexpired artifact for
+   that head.
+4. The head commit is not itself an apply-derived commit. If it is, the last
+   apply did not clear the drift, and naming the command again would loop.
+5. Each failing check's job (`actions/jobs/<id>`) has exactly one failed step,
+   and that step's `The following tests FAILED:` blocks list at least one
+   test, every one of them in `drift_tests`.
+
+A drift step that fails stops the steps behind it, so tests later in that job
+are unknown until the next round.
 
 Any read that fails, a failure that names no test (a compile error, a crashed
 step), or any other failing test or check leaves the ordinary

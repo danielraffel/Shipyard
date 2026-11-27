@@ -178,8 +178,11 @@ checkout at the pull request's head. It downloads the artifact from the newest
 failed run at that head, accepts only regular files inside the base branch's
 `[derived_files] paths` allowlist, commits `chore: apply CI's expected derived
 files from run <id>` with the tip's gate trailers carried, and pushes. Without
-`--push` it is a dry run that writes nothing. It refuses a moved head, a dirty
-tree, a fork, symlinks and `..`, and it runs no repository code. Full
+`--push` it is a dry run that writes nothing. It uses only a failed run of
+that pull request (not another PR from the same commit), refuses a moved head,
+a dirty tree, a fork, a non-default base, symlinks, `..` and non-ASCII names,
+and refuses (exit 1) when the artifact already matches the checkout: that
+drift needs a deletion or a regeneration. It runs no repository code. Full
 reference and the Pulp gaps: `docs/apply-derived.md`.
 
 ## The fleet status page publishes itself

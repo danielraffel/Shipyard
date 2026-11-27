@@ -252,10 +252,13 @@ fn normalize_allowlist_entry(raw: &str) -> Result<String, String> {
 /// Normalize one relative path from the artifact or the config, refusing
 /// anything that could name a path outside the checkout or inside `.git`.
 ///
-/// Accepted: `/`-separated segments of printable characters with no `\`,
-/// no NUL, no `.` or `..` and no empty segment, not starting with `/` or a
-/// drive letter, with no `.git` segment in any case, at most
-/// [`MAX_PATH_BYTES`] long. The path is returned unchanged.
+/// Accepted: `/`-separated segments of ASCII letters, digits, `.`, `_` and
+/// `-` only, with no `.` or `..` segment, no empty segment and no segment
+/// starting with `.git` in any case (`.git`, `.gitattributes`,
+/// `.gitmodules`, `.github`), at most [`MAX_PATH_BYTES`] long. ASCII only
+/// means no Unicode normalization pairs (NFC and NFD of one name collapse to
+/// one file on APFS), no bidi overrides and no control characters. The path
+/// is returned unchanged.
 pub fn normalize_path(path: &str) -> Result<String, String> {
     if path.is_empty() {
         return Err("empty path".to_owned());
@@ -263,25 +266,28 @@ pub fn normalize_path(path: &str) -> Result<String, String> {
     if path.len() > MAX_PATH_BYTES {
         return Err(format!("path longer than {MAX_PATH_BYTES} bytes"));
     }
-    if path
-        .chars()
-        .any(|c| c == '\\' || c == '\0' || c.is_control())
-    {
-        return Err("path holds a backslash, NUL or control character".to_owned());
-    }
     if path.starts_with('/') {
         return Err("absolute path".to_owned());
-    }
-    let bytes = path.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-        return Err("drive-letter path".to_owned());
     }
     for segment in path.split('/') {
         match segment {
             "" => return Err("empty path segment".to_owned()),
             "." | ".." => return Err(format!("`{segment}` path segment")),
-            _ if segment.eq_ignore_ascii_case(".git") => {
-                return Err("`.git` path segment".to_owned());
+            _ if segment
+                .get(..4)
+                .is_some_and(|start| start.eq_ignore_ascii_case(".git")) =>
+            {
+                return Err(format!("`{segment}`: a segment starting with `.git`"));
+            }
+            _ if !segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')) =>
+            {
+                return Err(
+                    "path segments may hold only ASCII letters, digits, `.`, `_` and `-` \
+                     (no backslash, drive letter, NUL, control, bidi or non-ASCII character)"
+                        .to_owned(),
+                );
             }
             _ => {}
         }
@@ -395,6 +401,108 @@ pub fn drift_only(config: &DerivedFilesConfig, failing: &[FailingCheck], artifac
                         .all(|test| config.drift_tests.iter().any(|drift| drift == test))
             })
         })
+}
+
+/// One workflow run at a head, as the runs API reports it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RunRecord {
+    /// Run id.
+    pub id: u64,
+    /// `pull_request`, `push`, ...
+    pub event: String,
+    /// The run's conclusion, once completed.
+    pub conclusion: Option<String>,
+    /// The commit it ran on.
+    pub head_sha: String,
+    /// The branch it ran for.
+    pub head_branch: String,
+    /// `OWNER/REPO` of the head.
+    pub head_repo: String,
+    /// The pull requests GitHub attributes the run to.
+    pub pull_requests: Vec<u64>,
+}
+
+/// The `workflow_runs` of one page of `actions/runs`.
+#[must_use]
+pub fn parse_runs(value: &serde_json::Value) -> Vec<RunRecord> {
+    use serde_json::Value;
+    let text = |run: &Value, pointer: &str| {
+        run.pointer(pointer)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    value
+        .get("workflow_runs")
+        .and_then(Value::as_array)
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|run| {
+                    Some(RunRecord {
+                        id: run.get("id")?.as_u64()?,
+                        event: text(run, "/event"),
+                        conclusion: run
+                            .get("conclusion")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        head_sha: text(run, "/head_sha"),
+                        head_branch: text(run, "/head_branch"),
+                        head_repo: text(run, "/head_repository/full_name"),
+                        pull_requests: run
+                            .get("pull_requests")
+                            .and_then(Value::as_array)
+                            .map(|prs| {
+                                prs.iter()
+                                    .filter_map(|pr| pr.get("number").and_then(Value::as_u64))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `run` is a failed run of *this* pull request at `head`: its head
+/// is `head` in `repo`, and it is a `pull_request` run GitHub attributes to
+/// `number`, or a `push` run of the pull request's head branch. A run another
+/// pull request from the same commit triggered (with a workflow from a base
+/// its author chose) never matches.
+#[must_use]
+pub fn run_belongs(run: &RunRecord, repo: &str, number: u64, head: &str, head_ref: &str) -> bool {
+    run.conclusion.as_deref() == Some("failure")
+        && run.head_sha.eq_ignore_ascii_case(head)
+        && run.head_repo.eq_ignore_ascii_case(repo)
+        && match run.event.as_str() {
+            "pull_request" => run.pull_requests.contains(&number),
+            "push" => run.head_branch == head_ref,
+            _ => false,
+        }
+}
+
+/// Pages of `actions/runs?head_sha=` read, 100 runs each.
+pub const MAX_RUN_PAGES: u32 = 3;
+
+/// Every run at `head`, paging through `read` (one `gh api` path per page).
+pub fn runs_at_head(
+    read: &dyn Fn(&str) -> Result<serde_json::Value, String>,
+    repo: &str,
+    head: &str,
+) -> Result<Vec<RunRecord>, String> {
+    let mut runs = Vec::new();
+    for page in 1..=MAX_RUN_PAGES {
+        let value = read(&format!(
+            "repos/{repo}/actions/runs?head_sha={head}&per_page=100&page={page}"
+        ))?;
+        let batch = parse_runs(&value);
+        let done = batch.len() < 100;
+        runs.extend(batch);
+        if done {
+            break;
+        }
+    }
+    Ok(runs)
 }
 
 #[cfg(test)]

@@ -85,7 +85,7 @@ fn destination_maps_inside_the_allowlist_only() {
         name: "anything".to_owned(),
         root: String::new(),
     };
-    let error = destination(&config, &root, ".github/workflows/evil.yml").unwrap_err();
+    let error = destination(&config, &root, "docs/evil.md").unwrap_err();
     assert!(
         error.contains("outside the derived-file allowlist"),
         "{error}"
@@ -227,4 +227,139 @@ fn drift_only_needs_every_failure_to_be_drift() {
     assert!(!drift_only(&config, &[], true));
     // Unconfigured.
     assert!(!drift_only(&DerivedFilesConfig::default(), &drift, true));
+}
+
+#[test]
+fn normalize_refuses_unicode_bidi_and_git_metadata_names() {
+    for bad in [
+        "tests/\u{e9}.json",
+        "tests/e\u{301}.json",
+        "tests/a\u{202e}nosj.json",
+        "tests/.gitattributes",
+        "tests/.gitmodules",
+        ".github/workflows/x.yml",
+        "tests/a b.json",
+    ] {
+        assert!(normalize_path(bad).is_err(), "{bad:?}");
+    }
+    assert!(normalize_path("tests/fixture--0a1b2c3d4e.json").is_ok());
+}
+
+#[test]
+fn refuses_overlapping_entries() {
+    // Entry `b` sits inside entry `a`'s stored data, and the central
+    // directory points at both: each parses alone, so only the overlap
+    // check refuses it.
+    let b_body = b"inner";
+    let mut b_local = Vec::new();
+    b_local.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+    b_local.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut crc = flate2::Crc::new();
+    crc.update(b_body);
+    let b_crc = crc.sum();
+    b_local.extend_from_slice(&b_crc.to_le_bytes());
+    b_local.extend_from_slice(&5_u32.to_le_bytes());
+    b_local.extend_from_slice(&5_u32.to_le_bytes());
+    b_local.extend_from_slice(&1_u16.to_le_bytes());
+    b_local.extend_from_slice(&0_u16.to_le_bytes());
+    b_local.extend_from_slice(b"b");
+    b_local.extend_from_slice(b_body);
+    let a_body = b_local.clone();
+    let mut crc = flate2::Crc::new();
+    crc.update(&a_body);
+    let a_crc = crc.sum();
+    let a_len = u32::try_from(a_body.len()).unwrap();
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+    out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(&a_crc.to_le_bytes());
+    out.extend_from_slice(&a_len.to_le_bytes());
+    out.extend_from_slice(&a_len.to_le_bytes());
+    out.extend_from_slice(&1_u16.to_le_bytes());
+    out.extend_from_slice(&0_u16.to_le_bytes());
+    out.extend_from_slice(b"a");
+    let b_offset = u32::try_from(out.len()).unwrap();
+    out.extend_from_slice(&a_body);
+    let cd_offset = u32::try_from(out.len()).unwrap();
+    let central = |out: &mut Vec<u8>, name: &[u8], crc: u32, size: u32, offset: u32| {
+        out.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        out.extend_from_slice(&0x0314_u16.to_le_bytes());
+        out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&1_u16.to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(&(0o100_644_u32 << 16).to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.extend_from_slice(name);
+    };
+    central(&mut out, b"a", a_crc, a_len, 0);
+    central(&mut out, b"b", b_crc, 5, b_offset);
+    let cd_size = u32::try_from(out.len()).unwrap() - cd_offset;
+    out.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&2_u16.to_le_bytes());
+    out.extend_from_slice(&2_u16.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0_u16.to_le_bytes());
+    let error = safe_zip::read(&out, &Limits::DEFAULT).unwrap_err();
+    assert!(error.contains("overlaps"), "{error}");
+}
+
+fn run_record(event: &str, conclusion: &str, prs: &[u64]) -> RunRecord {
+    RunRecord {
+        id: 1,
+        event: event.to_owned(),
+        conclusion: Some(conclusion.to_owned()),
+        head_sha: "a".repeat(40),
+        head_branch: "feature".to_owned(),
+        head_repo: "acme/widgets".to_owned(),
+        pull_requests: prs.to_vec(),
+    }
+}
+
+#[test]
+fn a_run_belongs_only_to_its_own_pull_request() {
+    let head = "a".repeat(40);
+    let belongs = |run: &RunRecord| run_belongs(run, "acme/widgets", 12, &head, "feature");
+    assert!(belongs(&run_record("pull_request", "failure", &[12])));
+    assert!(belongs(&run_record("push", "failure", &[])));
+    assert!(!belongs(&run_record("pull_request", "failure", &[99])));
+    assert!(!belongs(&run_record("pull_request", "failure", &[])));
+    assert!(!belongs(&run_record("pull_request", "success", &[12])));
+    assert!(!belongs(&run_record("workflow_dispatch", "failure", &[12])));
+    let mut fork = run_record("pull_request", "failure", &[12]);
+    fork.head_repo = "mallory/widgets".to_owned();
+    assert!(!belongs(&fork));
+    let mut other_branch = run_record("push", "failure", &[]);
+    other_branch.head_branch = "main".to_owned();
+    assert!(!belongs(&other_branch));
+    let mut other_head = run_record("pull_request", "failure", &[12]);
+    other_head.head_sha = "b".repeat(40);
+    assert!(!belongs(&other_head));
+}
+
+#[test]
+fn runs_at_head_pages_until_a_short_page() {
+    let pages = std::cell::RefCell::new(Vec::new());
+    let read = |path: &str| {
+        pages.borrow_mut().push(path.to_owned());
+        let page = pages.borrow().len();
+        let count = if page == 1 { 100 } else { 3 };
+        let runs: Vec<serde_json::Value> = (0..count)
+            .map(|index| serde_json::json!({"id": page * 1000 + index, "event": "push"}))
+            .collect();
+        Ok(serde_json::json!({"workflow_runs": runs}))
+    };
+    let runs = runs_at_head(&read, "acme/widgets", "abc").unwrap();
+    assert_eq!(runs.len(), 103);
+    assert_eq!(pages.borrow().len(), 2);
+    assert!(
+        pages.borrow()[1].ends_with("&page=2"),
+        "{:?}",
+        pages.borrow()
+    );
 }

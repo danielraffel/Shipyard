@@ -8,16 +8,23 @@
 //! 1. A base config whose `[derived_files]` table names artifacts and drift
 //!    tests ([`crate::apply_derived::DerivedFilesConfig::advises`]). Without
 //!    one nothing is read.
-//! 2. Every failing required check (the approval context aside: a verdict
-//!    waits for green) is a check run with an id (a commit status has no
-//!    job log).
-//! 3. A failed workflow run at the exact head uploaded a configured,
-//!    unexpired artifact: one runs read, then one artifact listing per failed
-//!    run, newest first, at most [`MAX_RUNS`].
-//! 4. Each failing check's job log names at least one failed test, all of
+//! 2. Every required check other than the approval context (a verdict waits
+//!    for green) has completed, and each failing one is a check run with an
+//!    id (a commit status has no job log).
+//! 3. A failed run of *this* pull request at the exact head
+//!    ([`crate::apply_derived::run_belongs`]) uploaded a configured,
+//!    unexpired artifact for that head: the runs read, then one artifact
+//!    listing per matching run, newest first, at most [`MAX_RUNS`].
+//! 4. The head commit is not itself an apply-derived commit: one that is
+//!    already applied the artifact and the drift stayed, so applying again
+//!    would loop.
+//! 5. Each failing check's job has exactly one failed step, and that step's
+//!    `The following tests FAILED:` blocks name at least one test, all of
 //!    them drift tests ([`crate::apply_derived::drift_only`]).
 //!
-//! Any read that fails leaves the ordinary `required_failed` advice.
+//! Any read that fails leaves the ordinary `required_failed` advice. A drift
+//! step that fails stops the steps behind it, so tests later in that job are
+//! unknown until the next round.
 
 use serde_json::Value;
 
@@ -27,7 +34,7 @@ use crate::merge_steward::{
     StewardCheckSource, StewardPolicy, StewardPullRequest, selected_required_check,
 };
 
-/// Failed runs at the head whose artifacts are listed.
+/// Matching failed runs at the head whose artifacts are listed.
 pub(super) const MAX_RUNS: usize = 5;
 
 type Read<'a> = &'a dyn Fn(&[String]) -> Result<String, String>;
@@ -53,11 +60,10 @@ pub(super) fn advice(
         if required.context.eq_ignore_ascii_case(approval) {
             continue;
         }
-        let Some(check) = selected_required_check(&pr.checks, required) else {
-            continue;
-        };
+        let check = selected_required_check(&pr.checks, required)?;
         if !check.status.eq_ignore_ascii_case("COMPLETED") {
-            continue;
+            // Still running: "nothing else is red" is not known yet.
+            return None;
         }
         let conclusion = check.conclusion.as_deref().unwrap_or_default();
         if ["SUCCESS", "NEUTRAL", "SKIPPED"]
@@ -75,51 +81,48 @@ pub(super) fn advice(
     if failing.is_empty() {
         return None;
     }
-    let run_id = run_with_artifact(read, repo, &pr.head_sha, config)?;
+    let run_id = run_with_artifact(read, repo, pr, config)?;
+    if head_is_apply_commit(read, repo, &pr.head_sha)? {
+        return None;
+    }
     let checks: Vec<FailingCheck> = failing
         .into_iter()
         .map(|(context, job_id)| FailingCheck {
             context,
-            failed_tests: failed_tests(read, repo, job_id),
+            failed_tests: failed_step_tests(read, repo, job_id),
         })
         .collect();
     apply_derived::drift_only(config, &checks, true)
         .then(|| NextAction::derived_drift(repo, pr.number, &pr.head_sha, run_id))
 }
 
-fn json(read: Read<'_>, path: String) -> Option<Value> {
-    serde_json::from_str(&read(&["api".to_owned(), path]).ok()?).ok()
+fn json(read: Read<'_>, path: &str) -> Result<Value, String> {
+    serde_json::from_str(&read(&["api".to_owned(), path.to_owned()])?)
+        .map_err(|error| error.to_string())
 }
 
-/// The newest failed run at `head` that uploaded a configured artifact.
+/// The newest failed run of this pull request at its head that uploaded a
+/// configured artifact for that head.
 fn run_with_artifact(
     read: Read<'_>,
     repo: &str,
-    head: &str,
+    pr: &StewardPullRequest,
     config: &apply_derived::DerivedFilesConfig,
 ) -> Option<u64> {
-    let runs = json(
-        read,
-        format!("repos/{repo}/actions/runs?head_sha={head}&per_page=50"),
-    )?;
-    let mut failed: Vec<u64> = runs
-        .get("workflow_runs")?
-        .as_array()?
+    let head = pr.head_sha.as_str();
+    let runs = apply_derived::runs_at_head(&|path| json(read, path), repo, head).ok()?;
+    let mut ids: Vec<u64> = runs
         .iter()
-        .filter(|run| run.get("conclusion").and_then(Value::as_str) == Some("failure"))
-        .filter(|run| {
-            run.get("head_sha")
-                .and_then(Value::as_str)
-                .is_none_or(|sha| sha.eq_ignore_ascii_case(head))
-        })
-        .filter_map(|run| run.get("id").and_then(Value::as_u64))
+        .filter(|run| apply_derived::run_belongs(run, repo, pr.number, head, &pr.head_branch))
+        .map(|run| run.id)
         .collect();
-    failed.sort_unstable_by(|a, b| b.cmp(a));
-    failed.into_iter().take(MAX_RUNS).find(|run_id| {
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids.into_iter().take(MAX_RUNS).find(|run_id| {
         json(
             read,
-            format!("repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"),
+            &format!("repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"),
         )
+        .ok()
         .and_then(|listing| {
             Some(
                 listing
@@ -132,6 +135,10 @@ fn run_with_artifact(
                             .and_then(Value::as_str)
                             .is_some_and(|name| config.mapping(name).is_some())
                             && artifact.get("expired").and_then(Value::as_bool) == Some(false)
+                            && artifact
+                                .pointer("/workflow_run/head_sha")
+                                .and_then(Value::as_str)
+                                .is_some_and(|sha| sha.eq_ignore_ascii_case(head))
                     }),
             )
         })
@@ -139,14 +146,29 @@ fn run_with_artifact(
     })
 }
 
-/// The tests a job's log lists as failed; `None` when it cannot be read.
-fn failed_tests(read: Read<'_>, repo: &str, job_id: u64) -> Option<Vec<String>> {
+/// Whether the head commit is an apply-derived commit; `None` when unread.
+fn head_is_apply_commit(read: Read<'_>, repo: &str, head: &str) -> Option<bool> {
+    let commit = json(read, &format!("repos/{repo}/commits/{head}")).ok()?;
+    let message = commit.pointer("/commit/message")?.as_str()?;
+    Some(message.starts_with(apply_derived::COMMIT_SUBJECT_PREFIX))
+}
+
+/// The tests the job's one failed step lists as failed; `None` when the job
+/// or its log cannot be read, or it has other than exactly one failed step.
+fn failed_step_tests(read: Read<'_>, repo: &str, job_id: u64) -> Option<Vec<String>> {
+    let job = json(read, &format!("repos/{repo}/actions/jobs/{job_id}")).ok()?;
+    let failed: Vec<&Value> = job
+        .get("steps")?
+        .as_array()?
+        .iter()
+        .filter(|step| step.get("conclusion").and_then(Value::as_str) == Some("failure"))
+        .collect();
+    let [step] = failed.as_slice() else {
+        return None;
+    };
+    let started_at = step.get("started_at")?.as_str()?;
     let log = crate::gate_cost::fetch_job_log(read, repo, job_id).ok()?;
-    let log = crate::gate_cost::ctest_log::JobLog::new(&log);
-    Some(
-        crate::gate_cost::ctest_log::failed_tests(log.lines())
-            .into_iter()
-            .map(|failure| failure.name)
-            .collect(),
-    )
+    Some(crate::environment_requeue::failed_tests_in_step(
+        &log, started_at,
+    ))
 }
