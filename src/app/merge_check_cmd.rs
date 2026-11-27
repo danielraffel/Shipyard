@@ -338,6 +338,10 @@ fn classify(
     if oid(&head_entry) == oid(&merge_base_entry) && oid(&base_entry) != oid(&merge_base_entry) {
         return Ok((true, 0, Vec::new()));
     }
+    // The head deleted a file the base changed (content or mode only).
+    if head_entry.is_none() && base_entry.is_some() && base_entry != merge_base_entry {
+        return Ok((true, 0, Vec::new()));
+    }
     if base_entry.is_some()
         && head_entry.is_some()
         && mode(&base_entry) != mode(&merge_base_entry)
@@ -347,18 +351,31 @@ fn classify(
     }
     let diff = git(
         cwd,
-        &["diff", "--no-renames", "-U0", merge_base, base, "--", path],
+        &[
+            // A plain patch whatever the user's config: color, an external
+            // diff or a textconv filter would hide the `@@` / `+` prefixes.
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "-U0",
+            merge_base,
+            base,
+            "--",
+            path,
+        ],
     )?;
     let (added, binary) = added_lines(&diff);
     if binary && oid(&head_entry) != oid(&base_entry) {
         return Ok((true, 0, Vec::new()));
     }
     let base_counts = match &base_entry {
-        Some(_) => count_lines(&git(cwd, &["show", &format!("{base}:{path}")])?),
+        Some(_) => count_lines(&git(cwd, &["cat-file", "blob", &format!("{base}:{path}")])?),
         None => BTreeMap::new(),
     };
     let head_counts = match &head_entry {
-        Some(_) => count_lines(&git(cwd, &["show", &format!("{head}:{path}")])?),
+        Some(_) => count_lines(&git(cwd, &["cat-file", "blob", &format!("{head}:{path}")])?),
         None => BTreeMap::new(),
     };
     // For each line the base added, the head must hold as many occurrences as
@@ -1004,6 +1021,43 @@ mod tests {
         assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
         assert_eq!(verdict(&out)["extra"][0]["path"], "blob.bin");
         assert_eq!(verdict(&out)["extra"][0]["class"], "base_loss");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_a_file_whose_base_change_was_mode_only_is_a_base_loss() {
+        let temp = fixture();
+        let dir = temp.path();
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        run(dir, &["checkout", "-q", "main"]);
+        set_mode(dir, "base.txt", 0o755);
+        commit(dir, "make executable");
+        run(dir, &["checkout", "-q", "pr"]);
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        run(dir, &["rm", "-q", "-f", "base.txt"]);
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        assert_eq!(verdict(&out)["extra"][0]["class"], "base_loss");
+    }
+
+    #[test]
+    fn colored_diff_config_does_not_hide_a_partial_loss() {
+        let temp = fixture();
+        let dir = temp.path();
+        run(dir, &["config", "color.ui", "always"]);
+        run(dir, &["config", "color.diff", "always"]);
+        let original = base_original(dir);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", &format!("{original}n1\nn2\n"));
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        write(dir, "base.txt", &format!("{original}n1\n"));
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        assert_eq!(verdict(&out)["extra"][0]["missing_base_lines"], 1);
     }
 
     #[test]
