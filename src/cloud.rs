@@ -1027,6 +1027,19 @@ impl GitHubActions {
         self.run_gh(&args).map(|_| ())
     }
 
+    /// Re-run one job of a workflow run, and the jobs that depend on it
+    /// (`POST /actions/jobs/{job_id}/rerun`). Other failed jobs of the run
+    /// are left as they are.
+    pub fn rerun_job(&self, repository: &str, job_id: u64) -> Result<(), GitHubError> {
+        let args = vec![
+            "api".to_owned(),
+            "-X".to_owned(),
+            "POST".to_owned(),
+            format!("repos/{repository}/actions/jobs/{job_id}/rerun"),
+        ];
+        self.run_gh(&args).map(|_| ())
+    }
+
     /// Fetch raw status + conclusion for a workflow run as `(status,
     /// conclusion)`. Both fields are returned as raw strings, e.g.
     /// `("completed", "failure")` or `("in_progress", "")`. Used by the runner

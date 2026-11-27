@@ -86,16 +86,43 @@ person notices. `--infra-rerun` (`off`, `shadow`, `enforce`; module
   At most 8 runs per repository pass, newest first, inside the pass budget; a
   rate-limit error stops the sweep's reads. The ledger remembers the check id
   it judged, so a declined red is never re-read.
-- A run is re-run (`POST /actions/runs/{id}/rerun-failed-jobs`) only when every
-  failed, timed-out or startup-failed job in it, required or not, is a
-  diagnosed infra failure of a required job (cancelled fail-fast siblings are
-  tolerated), no job in it is the approval context, all its jobs are complete,
-  and it is of the current head. `rerun-failed-jobs` re-runs every failed job
-  and its dependents, so one real failure anywhere declines the whole run.
+- A required job is re-run only when every failed, timed-out or
+  startup-failed required job in its run is a diagnosed infra failure, no job
+  in the run is the approval context, all its jobs are complete, and the run
+  is of the current head (not a `gh-readonly-queue/` branch). A job that is not
+  a required check may have failed for any reason: it is not re-run and no
+  longer declines the run. A job that ended `startup_failure` or
+  `action_required` still declines it, since the diagnosis cannot tell a
+  required one from an advisory one. What is posted:
+  - one required infra job: `POST /actions/jobs/{id}/rerun`, that job and the
+    jobs that depend on it. This is why a run that contains the approval
+    context is never re-run by either endpoint;
+  - several required infra jobs and nothing else red, or a required job
+    cancelled as a fail-fast sibling with nothing else red:
+    `POST /actions/runs/{id}/rerun-failed-jobs`, which re-runs cancelled jobs
+    too;
+  - several required infra jobs beside a non-required failure: one job per
+    pass (fewest re-runs, then lowest job id, among those not already
+    `refused`, `capped` or pending); the others are `deferred` and judged
+    afresh once that re-run completes, so a refused POST settles each job
+    after its own two tries;
+  - a cancelled required job beside a non-required failure: declined, since a
+    one-job re-run would leave the cancelled one red.
+- Classification is `shipyard diagnose`'s. Besides lost runners, non-content
+  steps and transport markers, `fetch_timeout` calls a red infra when no test
+  is named, the failing step fetches dependencies or provenance (`Bootstrap`,
+  `Fetch`, `Hydrate`, `Download` or `Clone` with `dependenc`, `provenance` or
+  `submodule` in its name), and the step's own log shows the fetch ran out of
+  time (`The action '<step>' has timed out after N minutes`, or `bounded fetch
+  failed: ... did not finish within N s`). A hash or lock mismatch in the same
+  step, or a timeout in any other step, stays `real`.
 - Budget per (head SHA, check): one re-run; a second only after 20 minutes and
   only if the re-run failed as infra again; then `capped`. The intent is saved
   before the POST, and GitHub's `run_attempt` fences the cap too, so a crash
-  or a lost ledger cannot buy a third. A red after the cap is classified once:
+  or a lost ledger cannot buy a third. `run_attempt` is per run, and a one-job re-run
+  makes a new attempt of the whole run, so the fence counts every re-run of the
+  run, whichever job it re-ran: at most 2 per run. A check capped this way
+  without a re-run of its own reads "not attempted: per-run cap". A red after the cap is classified once:
   infra is `capped`, anything else `declined`. A refused POST or an unreadable
   diagnosis is retried after 20 minutes, twice at most (`refused`).
 - Outage finding: when a check is capped, or 3 or more open pull requests are

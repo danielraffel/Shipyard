@@ -3,7 +3,7 @@
 //!
 //! | class | means | acts on |
 //! |---|---|---|
-//! | `infra` | the runner or a service failed, proven by GitHub's own record or a non-content step | nothing by itself |
+//! | `infra` | the runner or a service failed, proven by GitHub's own record, a non-content step, or a fetch step that timed out | nothing by itself |
 //! | `interrupted` | cancelled: `superseded`, `timeout`, or `unknown` | nothing by itself |
 //! | `stale_base` | the head is behind the protected base (configured marker) | nothing by itself |
 //! | `flake_candidate` | every failing test also failed on other pull requests' heads | never exonerates |
@@ -47,7 +47,7 @@ pub struct Classification {
     pub class: String,
     /// The rule: `no_runner`, `superseded`, `timeout`, `unknown`,
     /// `needs_starved`, `lost_runner`, `stale_marker`, `non_content_step`,
-    /// `infra_marker`, `failed_on_other_heads`, or `default`.
+    /// `fetch_timeout`, `infra_marker`, `failed_on_other_heads`, or `default`.
     pub rule: String,
     /// Why, in one line.
     pub why: String,
@@ -110,6 +110,29 @@ static INFRA_MARKERS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // window keeps it honest: a red test step is the failing step, so
         // a stall printed by a later upload never reaches this check.
         r"Upload progress stalled",
+    ]
+    .into_iter()
+    .map(pattern)
+    .collect()
+});
+
+/// A step whose only job is to fetch dependencies or provenance over the
+/// network: "Bootstrap repository dependencies", "Hydrate bounded GPU
+/// provenance commits", "Fetch ... dependencies". A step name alone proves
+/// nothing (a changed lock breaks a fetch step too), so it counts only with a
+/// [`FETCH_TIMEOUTS`] line in its own window.
+static FETCH_STEPS: LazyLock<Regex> = LazyLock::new(|| {
+    pattern(
+        r"(?i)^(?:bootstrap|fetch|hydrate|download|clone)\b.*\b(?:dependenc|provenance|submodule)",
+    )
+});
+
+/// A fetch that ran out of time: the runner's step timeout, or a bounded
+/// fetch's own deadline. Never a hash or lock mismatch, which is content.
+static FETCH_TIMEOUTS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"The action '[^']+' has timed out after \d+ minutes",
+        r"bounded fetch failed: .*\bdid not finish within \d+ ?s\b",
     ]
     .into_iter()
     .map(pattern)
@@ -283,6 +306,13 @@ pub fn classify(
         );
     }
     if tests.is_empty() {
+        if FETCH_STEPS.is_match(step_name)
+            && let Some(hit) = window
+                .iter()
+                .find(|line| FETCH_TIMEOUTS.iter().any(|rx| rx.is_match(line)))
+        {
+            return Classification::new(INFRA, "fetch_timeout", short(hit));
+        }
         if let Some(hit) = window
             .iter()
             .find(|line| INFRA_MARKERS.iter().any(|rx| rx.is_match(line)))

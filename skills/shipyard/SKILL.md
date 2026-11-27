@@ -3898,9 +3898,12 @@ Use `shipyard runner steward` for agent-neutral merge-on-green reconciliation.
 It observes by default; `--apply` enables exact-head guarded queue admission,
 reruns, and narrowly policy-scoped capacity-preemption mutations. `--infra-rerun`
 (default `enforce` under `--apply`) re-runs a required check that failed for an
-infra reason (per `shipyard diagnose`) on any open pull request, never
+infra reason (per `shipyard diagnose`, including a dependency or provenance
+fetch step that timed out, rule `fetch_timeout`) on any open pull request, never
 `review-verdict`, at most twice per head and check with a 20-minute backoff, and
-reports "infra outage suspected" in `infra_rerun.findings`; see
+reports "infra outage suspected" in `infra_rerun.findings`. It re-runs only that
+job (`POST /actions/jobs/{id}/rerun`), so an advisory job that failed for real in
+the same run no longer blocks it; see
 [references/merge-steward.md](references/merge-steward.md#infra-reruns---infra-rerun-every-open-pull-request).
 Every pass also reports tick-start invariants in `repos[].invariants`
 (`{id, ok, detail, fix}`: `required_context_producer`,
