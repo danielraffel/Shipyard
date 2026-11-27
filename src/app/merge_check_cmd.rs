@@ -363,7 +363,8 @@ fn classify(
             merge_base,
             base,
             "--",
-            path,
+            // Paths come from the repository root; `cwd` may be a subdirectory.
+            &format!(":(top,literal){path}"),
         ],
     )?;
     let (added, binary) = added_lines(&diff);
@@ -1058,6 +1059,46 @@ mod tests {
         let (result, out) = check(dir, &args(None));
         assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
         assert_eq!(verdict(&out)["extra"][0]["missing_base_lines"], 1);
+    }
+
+    #[test]
+    fn a_partial_loss_is_caught_from_a_subdirectory() {
+        let temp = fixture();
+        let dir = temp.path();
+        std::fs::create_dir(dir.join("sub")).expect("mkdir");
+        write(dir, "sub/keep.txt", "k\n");
+        write(dir, "sub/*.txt", "glob\n");
+        commit(dir, "sub");
+        run(dir, &["checkout", "-q", "main"]);
+        run(dir, &["merge", "-q", "--no-ff", "-m", "sync", "pr"]);
+        run(dir, &["checkout", "-q", "pr"]);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        run(dir, &["checkout", "-q", "main"]);
+        write(dir, "sub/keep.txt", "k\nn1\nn2\n");
+        write(dir, "sub/*.txt", "glob\ng1\n");
+        commit(dir, "base change");
+        run(dir, &["checkout", "-q", "pr"]);
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        write(dir, "sub/keep.txt", "k\nn1\nextra\n");
+        write(dir, "sub/*.txt", "glob\nother\n");
+        commit(dir, "merge");
+        let (result, out) = check(&dir.join("sub"), &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        let v = verdict(&out);
+        let missing: BTreeMap<String, u64> = v["extra"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|file| {
+                (
+                    file["path"].as_str().expect("path").to_owned(),
+                    file["missing_base_lines"].as_u64().expect("count"),
+                )
+            })
+            .collect();
+        assert_eq!(missing.get("sub/keep.txt"), Some(&1), "{out}");
+        assert_eq!(missing.get("sub/*.txt"), Some(&1), "{out}");
     }
 
     #[test]
