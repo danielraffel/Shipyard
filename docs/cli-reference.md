@@ -143,6 +143,14 @@ shipyard review-verdict --pr 123 [--repo OWNER/REPO] [--head SHA] [--no-rebase-c
                                              #   excluded human approvals, and the fix
 shipyard repair-check --pr 123 --repo OWNER/REPO [--answer ID=REASON]... [--comment-body] [--json]
                                              # refuse a repaired: marker while the latest bot HOLD finding is open
+shipyard merge-check [--base REF] [--pre REF] [--head REF] [--json]
+                                             # local, read-only: after merging the base into a PR branch, fail (exit 1)
+                                             # if a file outside the PR's own change set lost lines the base added
+                                             # (by occurrence count), reverted a base change or mode change, or
+                                             # differs from a binary file the base changed; files the PR touched
+                                             # are not checked line by line; other edits and PR files that collapsed to
+                                             # the base are warnings. --pre defaults to
+                                             # HEAD^1 when HEAD merges the base tip; exit 2 when undecidable
 shipyard reviewer-dispatch record --repo OWNER/REPO --pr 123 --head SHA \
   --reviewer infra-review2 --attempt-id ID --launcher-identity ID \
   --dispatch-id ID --started-at TIME --deadline-at TIME \

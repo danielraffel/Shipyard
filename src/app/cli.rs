@@ -568,6 +568,24 @@ pub(super) enum Command {
         #[arg(long)]
         no_rebase_carry: bool,
     },
+    /// Check that merging the base into a PR branch did not drop base content
+    /// outside the PR's own files. Local and read-only. Exits 0 on pass (edits
+    /// made in the merge commit that keep every base line are warnings), 1
+    /// when a file outside the PR's change set lost base content, 2 on error.
+    MergeCheck {
+        /// The base that was merged. Use the merged base commit if the base has
+        /// moved on since: the head must contain it.
+        #[arg(long, value_name = "REF", default_value = "origin/main")]
+        base: String,
+        /// The PR head before the merge. Defaults to `HEAD^1` when the head is
+        /// a merge commit whose second parent is the base tip; otherwise
+        /// required.
+        #[arg(long, value_name = "REF")]
+        pre: Option<String>,
+        /// The post-merge head.
+        #[arg(long, value_name = "REF", default_value = "HEAD")]
+        head: String,
+    },
     /// Check the latest HOLD findings against the repair diff. Read-only.
     RepairCheck {
         /// Pull request number.

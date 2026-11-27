@@ -54,6 +54,7 @@ mod inspect_cmd;
 mod landability_cmd;
 mod landing_cmd;
 mod local_linux_lease_cmd;
+mod merge_check_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
 mod metrics_cmd;
@@ -634,6 +635,14 @@ where
                 stdout,
             );
         }
+        Command::MergeCheck { base, pre, head } => {
+            return merge_check_cmd::merge_check_command(
+                &merge_check_cmd::MergeCheckArgs { base, pre, head },
+                &cwd,
+                cli.json,
+                stdout,
+            );
+        }
         Command::RepairCheck {
             pr,
             repo,
@@ -1130,6 +1139,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Advance { .. }
         | Command::ReviewVerdict { .. }
         | Command::RepairCheck { .. }
+        | Command::MergeCheck { .. }
         | Command::ReviewerDispatch { .. }
         | Command::ReviewerClaim { .. }
         | Command::Who { .. }
