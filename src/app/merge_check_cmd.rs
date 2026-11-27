@@ -3,8 +3,14 @@
 //!
 //! Rule, with no thresholds: given base `B`, pre-merge head `P` and post-merge
 //! head `H`, `pr_files` is the PR's own change set before the merge
-//! (`merge-base(B, P)..P`) and `drift` is `B..H`. The check passes iff
-//! `drift` is a subset of `pr_files`.
+//! (`merge-base(B, P)..P`) and `drift` is `B..H`. Every drifted file outside
+//! `pr_files` is classified. It is a `base_loss` (exit 1) when the head lacks
+//! an occurrence of a line the base added, reverts the base's whole change,
+//! reverts a base mode change, or differs from a binary file the base
+//! changed. Otherwise it is a `merge_only_edit`: a warning, and the check
+//! still passes. Files inside `pr_files` are not checked line by line, so a
+//! base change inside a file the PR also touched is the PR author's to
+//! resolve; a PR file that now equals the base is reported as collapsed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -112,7 +118,18 @@ fn analyze(cwd: &Path, args: &MergeCheckArgs) -> Result<Report, CliFailure> {
     let base = rev_parse(cwd, "base", &args.base)?;
     let head = rev_parse(cwd, "head", &args.head)?;
     let pre = match &args.pre {
-        Some(pre) => rev_parse(cwd, "pre-merge head", pre)?,
+        Some(spec) => {
+            let pre = rev_parse(cwd, "pre-merge head", spec)?;
+            // An unrelated or post-merge ref would pick the wrong merge base
+            // and exempt the wrong files.
+            if pre == head || !is_ancestor(cwd, &pre, &head)? {
+                return Err(CliFailure::new(
+                    2,
+                    format!("pre-merge head `{spec}` must be a proper ancestor of head {head}"),
+                ));
+            }
+            pre
+        }
         None => default_pre(cwd, &head, &base)?,
     };
     // `B..H` only means "drift" when H contains B. A base that moved on after
@@ -241,23 +258,71 @@ fn numstat(cwd: &Path, from: &str, to: &str) -> Result<Vec<ExtraFile>, CliFailur
     Ok(files)
 }
 
-fn blob(cwd: &Path, rev: &str, path: &str) -> Option<String> {
-    git(
-        cwd,
-        &["rev-parse", "--verify", "--quiet", &format!("{rev}:{path}")],
-    )
-    .ok()
-    .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+/// The `(mode, object id)` of `path` at `rev`, or `None` when the path does
+/// not exist there. A git failure is an error, never an absent path.
+fn entry(cwd: &Path, rev: &str, path: &str) -> Result<Option<(String, String)>, CliFailure> {
+    let out = git(cwd, &["ls-tree", "-z", "--full-tree", rev, "--", path])?;
+    for record in out.split(|byte| *byte == 0) {
+        let text = String::from_utf8_lossy(record);
+        let Some((meta, name)) = text.split_once('\t') else {
+            continue;
+        };
+        if name != path {
+            continue;
+        }
+        let mut fields = meta.split(' ');
+        let (Some(mode), Some(_kind), Some(oid)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(CliFailure::new(
+                2,
+                format!("unreadable git ls-tree record: {text}"),
+            ));
+        };
+        return Ok(Some((mode.to_owned(), oid.to_owned())));
+    }
+    Ok(None)
+}
+
+fn count_lines(content: &[u8]) -> BTreeMap<Vec<u8>, u64> {
+    let mut counts: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+    for line in content.split(|byte| *byte == b'\n') {
+        *counts.entry(line.to_vec()).or_default() += 1;
+    }
+    counts
+}
+
+/// The lines a `-U0` diff adds, in order, and whether git reported it as a
+/// binary change. Only hunk bodies count, so an added line whose content
+/// starts with `++` is not mistaken for the `+++` file header.
+fn added_lines(diff: &[u8]) -> (Vec<Vec<u8>>, bool) {
+    let mut added = Vec::new();
+    let mut binary = false;
+    let mut in_hunk = false;
+    for line in diff.split(|byte| *byte == b'\n') {
+        if line.starts_with(b"diff --git ") {
+            in_hunk = false;
+        } else if line.starts_with(b"@@") {
+            in_hunk = true;
+        } else if !in_hunk {
+            binary |= line.starts_with(b"Binary files ");
+        } else if line.first() == Some(&b'+') {
+            added.push(line[1..].to_vec());
+        }
+    }
+    (added, binary)
 }
 
 /// Decide whether the merge dropped the base's change to a file the PR did
-/// not touch. Returns `(loss, missing_lines)`.
+/// not touch. Returns `(loss, missing_lines, sample)`.
 ///
-/// Loss: the head's file is missing lines the base added since the merge base
-/// (compared as a line multiset, so reordering is fine), or the head's file is
-/// the merge base's version while the base changed it (a full revert).
-/// Otherwise the head keeps everything the base added and the difference is an
-/// edit made inside the merge commit.
+/// Loss: the head's file has fewer occurrences of a line the base added than
+/// the base's file has (compared as a line multiset, so reordering is fine and
+/// a pre-existing copy cannot stand in for a new one); the head's file is the
+/// merge base's version while the base changed it (a full revert); the head
+/// reverts a base mode change; or the base changed a binary file and the head
+/// differs from it (binary content cannot be shown to be kept). Otherwise the
+/// head keeps everything the base added and the difference is an edit made
+/// inside the merge commit.
 fn classify(
     cwd: &Path,
     merge_base: &str,
@@ -265,38 +330,62 @@ fn classify(
     head: &str,
     path: &str,
 ) -> Result<(bool, u64, Vec<String>), CliFailure> {
-    let base_blob = blob(cwd, base, path);
-    let merge_base_blob = blob(cwd, merge_base, path);
-    if blob(cwd, head, path) == merge_base_blob && base_blob != merge_base_blob {
+    let base_entry = entry(cwd, base, path)?;
+    let merge_base_entry = entry(cwd, merge_base, path)?;
+    let head_entry = entry(cwd, head, path)?;
+    let oid = |e: &Option<(String, String)>| e.as_ref().map(|(_, oid)| oid.clone());
+    let mode = |e: &Option<(String, String)>| e.as_ref().map(|(mode, _)| mode.clone());
+    if oid(&head_entry) == oid(&merge_base_entry) && oid(&base_entry) != oid(&merge_base_entry) {
+        return Ok((true, 0, Vec::new()));
+    }
+    if base_entry.is_some()
+        && head_entry.is_some()
+        && mode(&base_entry) != mode(&merge_base_entry)
+        && mode(&head_entry) == mode(&merge_base_entry)
+    {
         return Ok((true, 0, Vec::new()));
     }
     let diff = git(
         cwd,
         &["diff", "--no-renames", "-U0", merge_base, base, "--", path],
     )?;
-    let mut added: Vec<Vec<u8>> = Vec::new();
-    for line in diff.split(|byte| *byte == b'\n') {
-        if line.first() == Some(&b'+') && !line.starts_with(b"+++") {
-            added.push(line[1..].to_vec());
+    let (added, binary) = added_lines(&diff);
+    if binary && oid(&head_entry) != oid(&base_entry) {
+        return Ok((true, 0, Vec::new()));
+    }
+    let base_counts = match &base_entry {
+        Some(_) => count_lines(&git(cwd, &["show", &format!("{base}:{path}")])?),
+        None => BTreeMap::new(),
+    };
+    let head_counts = match &head_entry {
+        Some(_) => count_lines(&git(cwd, &["show", &format!("{head}:{path}")])?),
+        None => BTreeMap::new(),
+    };
+    // For each line the base added, the head must hold as many occurrences as
+    // the base does; a shortfall (capped at what the base added) is missing.
+    let mut added_counts: BTreeMap<&[u8], u64> = BTreeMap::new();
+    for line in &added {
+        *added_counts.entry(line.as_slice()).or_default() += 1;
+    }
+    let mut shortfall: BTreeMap<&[u8], u64> = BTreeMap::new();
+    for (line, count) in &added_counts {
+        let want = base_counts.get(*line).copied().unwrap_or(0);
+        let have = head_counts.get(*line).copied().unwrap_or(0);
+        let short = want.saturating_sub(have).min(*count);
+        if short > 0 {
+            shortfall.insert(line, short);
         }
     }
-    let mut have: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-    if let Ok(content) = git(cwd, &["show", &format!("{head}:{path}")]) {
-        for line in content.split(|byte| *byte == b'\n') {
-            *have.entry(line.to_vec()).or_default() += 1;
-        }
-    }
-    // Consume the head's lines as a multiset; what cannot be matched is missing.
     let mut missing = 0;
     let mut sample = Vec::new();
-    for line in added {
-        match have.get_mut(&line) {
-            Some(count) if *count > 0 => *count -= 1,
-            _ => {
-                missing += 1;
-                if sample.len() < 5 {
-                    sample.push(String::from_utf8_lossy(&line).into_owned());
-                }
+    for line in &added {
+        if let Some(short) = shortfall.get_mut(line.as_slice())
+            && *short > 0
+        {
+            *short -= 1;
+            missing += 1;
+            if sample.len() < 5 {
+                sample.push(String::from_utf8_lossy(line).into_owned());
             }
         }
     }
@@ -772,6 +861,149 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("separate commit after the merge"), "{text}");
+    }
+
+    #[test]
+    fn a_pre_existing_copy_does_not_mask_a_lost_base_added_line() {
+        // 1692-r2-f1: merge base `shared old`, base adds a second `shared`,
+        // the merge drops it and adds `extra`.
+        let temp = fixture();
+        let dir = temp.path();
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        run(dir, &["checkout", "-q", "main"]);
+        write(dir, "dup.txt", "shared\nold\n");
+        commit(dir, "dup root");
+        run(dir, &["checkout", "-q", "pr"]);
+        run(dir, &["merge", "-q", "--no-ff", "-m", "sync", "main"]);
+        base_changes(dir, "dup.txt", "shared\nold\nshared\n");
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        write(dir, "dup.txt", "shared\nold\nextra\n");
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        let v = verdict(&out);
+        assert_eq!(v["extra"][0]["path"], "dup.txt");
+        assert_eq!(v["extra"][0]["class"], "base_loss");
+        assert_eq!(v["extra"][0]["missing_base_lines"], 1);
+        assert_eq!(v["extra"][0]["missing_sample"], json!(["shared"]));
+    }
+
+    #[test]
+    fn an_added_line_starting_with_plus_plus_is_counted() {
+        // 1692-r2-f2: `++counter;` is hunk content, not a `+++` header.
+        let temp = fixture();
+        let dir = temp.path();
+        let original = base_original(dir);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", &format!("{original}++counter;\n"));
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        write(dir, "base.txt", &format!("{original}extra\n"));
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        assert_eq!(
+            verdict(&out)["extra"][0]["missing_sample"],
+            json!(["++counter;"])
+        );
+    }
+
+    #[test]
+    fn a_pre_that_is_not_an_ancestor_of_the_head_is_an_error() {
+        // 1692-r2-f4
+        let temp = fixture();
+        let dir = temp.path();
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", "base moved\n");
+        run(dir, &["merge", "-q", "--no-ff", "-m", "merge", "main"]);
+        let head = run(dir, &["rev-parse", "HEAD"]);
+        run(dir, &["checkout", "-q", "-b", "unrelated", "main~1"]);
+        write(dir, "other.txt", "elsewhere\n");
+        commit(dir, "unrelated");
+        let unrelated = run(dir, &["rev-parse", "HEAD"]);
+        run(dir, &["checkout", "-q", "pr"]);
+        for pre in [unrelated.as_str(), head.as_str()] {
+            let (result, _) = check(dir, &args(Some(pre)));
+            assert_eq!(result.expect_err("error").code, 2, "pre {pre}");
+        }
+    }
+
+    #[test]
+    fn unreadable_evidence_is_an_error_not_an_absent_file() {
+        // 1692-r2-f5: a missing object must not read as "file absent".
+        let temp = fixture();
+        let dir = temp.path();
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", "base moved\n");
+        run(
+            dir,
+            &[
+                "merge", "-q", "--no-ff", "-s", "ours", "-m", "merge", "main",
+            ],
+        );
+        let tree = run(dir, &["rev-parse", "main^{tree}"]);
+        let object = dir.join(".git/objects").join(&tree[..2]).join(&tree[2..]);
+        std::fs::remove_file(object).expect("remove tree object");
+        let merge_base = run(dir, &["merge-base", "main", "HEAD^1"]);
+        let head = run(dir, &["rev-parse", "HEAD"]);
+        let main = run(dir, &["rev-parse", "main"]);
+        let result = classify(dir, &merge_base, &main, &head, "base.txt");
+        assert_eq!(result.expect_err("error").code, 2);
+    }
+
+    #[cfg(unix)]
+    fn set_mode(dir: &Path, name: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(mode))
+            .expect("chmod");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reverting_a_base_mode_change_is_a_base_loss() {
+        // 1692-r2-f6
+        let temp = fixture();
+        let dir = temp.path();
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        run(dir, &["checkout", "-q", "main"]);
+        set_mode(dir, "base.txt", 0o755);
+        commit(dir, "make executable");
+        run(dir, &["checkout", "-q", "pr"]);
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        set_mode(dir, "base.txt", 0o644);
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        assert_eq!(verdict(&out)["extra"][0]["class"], "base_loss");
+    }
+
+    #[test]
+    fn a_partially_lost_binary_change_is_a_base_loss() {
+        // 1692-r2-f6
+        let temp = fixture();
+        let dir = temp.path();
+        std::fs::write(dir.join("blob.bin"), b"\x00\x01root\x00").expect("write");
+        commit(dir, "binary");
+        run(dir, &["checkout", "-q", "main"]);
+        run(dir, &["merge", "-q", "--no-ff", "-m", "sync", "pr"]);
+        run(dir, &["checkout", "-q", "pr"]);
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        run(dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("blob.bin"), b"\x00\x01base\x00").expect("write");
+        commit(dir, "base binary");
+        run(dir, &["checkout", "-q", "pr"]);
+        run(dir, &["merge", "--no-commit", "--no-ff", "main"]);
+        std::fs::write(dir.join("blob.bin"), b"\x00\x01other\x00").expect("write");
+        commit(dir, "merge");
+        let (result, out) = check(dir, &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        assert_eq!(verdict(&out)["extra"][0]["path"], "blob.bin");
+        assert_eq!(verdict(&out)["extra"][0]["class"], "base_loss");
     }
 
     #[test]

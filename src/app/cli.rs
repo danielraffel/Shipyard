@@ -568,9 +568,10 @@ pub(super) enum Command {
         #[arg(long)]
         no_rebase_carry: bool,
     },
-    /// Check that merging the base into a PR branch did not drop or alter base
-    /// content outside the PR's own files. Local and read-only. Exits 0 on
-    /// pass, 1 when base content was dropped or diverged, 2 on error.
+    /// Check that merging the base into a PR branch did not drop base content
+    /// outside the PR's own files. Local and read-only. Exits 0 on pass (edits
+    /// made in the merge commit that keep every base line are warnings), 1
+    /// when a file outside the PR's change set lost base content, 2 on error.
     MergeCheck {
         /// The base that was merged. Use the merged base commit if the base has
         /// moved on since: the head must contain it.

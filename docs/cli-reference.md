@@ -146,7 +146,9 @@ shipyard repair-check --pr 123 --repo OWNER/REPO [--answer ID=REASON]... [--comm
 shipyard merge-check [--base REF] [--pre REF] [--head REF] [--json]
                                              # local, read-only: after merging the base into a PR branch, fail (exit 1)
                                              # if a file outside the PR's own change set lost lines the base added
-                                             # or reverted a base change; other edits and PR files that collapsed to
+                                             # (by occurrence count), reverted a base change or mode change, or
+                                             # differs from a binary file the base changed; files the PR touched
+                                             # are not checked line by line; other edits and PR files that collapsed to
                                              # the base are warnings. --pre defaults to
                                              # HEAD^1 when HEAD merges the base tip; exit 2 when undecidable
 shipyard reviewer-dispatch record --repo OWNER/REPO --pr 123 --head SHA \

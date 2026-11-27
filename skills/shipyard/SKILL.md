@@ -37,8 +37,9 @@ After merging the base into a PR branch, run `shipyard merge-check` (local,
 read-only) before pushing: `shipyard merge-check --base origin/main` with
 `HEAD` the merge commit. For each file the merge changed relative to the base
 that is not one of the PR's own files, it checks that every line the base added
-since the merge base is still there and that a changed base file was not
-reverted. Missing base content exits 1 (`base_loss`, with the missing line
+since the merge base is still there as often as in the base (a pre-existing
+copy does not count for a new one), that a changed base file or mode was not
+reverted, and that a binary file the base changed is kept exactly. Missing base content exits 1 (`base_loss`, with the missing line
 count). Extra edits that keep all of the base's lines (`merge_only_edit`) are a
 warning, as is a PR file that now equals the base. Exit 2 means it could not
 decide (for example a non-merge `HEAD` with no `--pre`).
