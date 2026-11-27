@@ -749,6 +749,31 @@ pub(super) enum Command {
         #[arg(long = "max-runs", value_name = "COUNT")]
         max_runs: Option<usize>,
     },
+    /// Commit CI's expected derived files to a pull request whose drift
+    /// check failed.
+    ///
+    /// Reads the base branch's `[derived_files]` table, finds the newest
+    /// failed run at the pull request's exact head that uploaded a configured
+    /// expected-files artifact, and checks every entry: regular files only,
+    /// inside the allowlist, no `..`, absolute paths or symlinks. Run it in a
+    /// clean checkout at that head. It runs no repository code. Dry run by
+    /// default; `--push` commits `chore: apply CI's expected derived files
+    /// from run <id>` and pushes the head branch.
+    #[command(name = "apply-derived")]
+    ApplyDerived {
+        /// Pull request to repair.
+        #[arg(long = "pr", value_name = "PR")]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the checkout's `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// The pull request's checkout. Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        path: Option<std::path::PathBuf>,
+        /// Write, commit and push. Without it nothing is written.
+        #[arg(long)]
+        push: bool,
+    },
     /// Bounded diagnosis of a red pull request or workflow run.
     ///
     /// For each failing REQUIRED check: the failing step, the failing tests,
@@ -4625,6 +4650,17 @@ mod tests {
             .join()
             .expect("Cli::parse_from on a 2 MiB thread");
         assert!(matches!(cli.command, Command::Daemon { .. }));
+    }
+
+    #[test]
+    fn apply_derived_needs_a_pr_and_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from(["shipyard", "apply-derived", "--pr", "12", "--repo", "o/r"])
+            .expect("apply-derived parses");
+        let Command::ApplyDerived { pr, push, repo, .. } = cli.command else {
+            panic!("not apply-derived");
+        };
+        assert_eq!((pr, push, repo.as_deref()), (12, false, Some("o/r")));
+        assert!(Cli::try_parse_from(["shipyard", "apply-derived"]).is_err());
     }
 
     #[test]

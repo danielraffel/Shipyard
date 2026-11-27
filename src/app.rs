@@ -12,6 +12,7 @@ use crate::ship_state::ShipStateStore;
 use clap::Parser;
 
 mod advance_cmd;
+mod apply_derived_cmd;
 mod auth_cmd;
 mod auto_merge_cmd;
 mod base_health_cmd;
@@ -512,6 +513,25 @@ where
                 base,
                 pr,
                 cli.json,
+                stdout,
+            );
+        }
+        Command::ApplyDerived {
+            pr,
+            repo,
+            path,
+            push,
+        } => {
+            return apply_derived_cmd::apply_derived_command(
+                &apply_derived_cmd::ApplyDerivedArgs {
+                    pr,
+                    repo,
+                    path,
+                    push,
+                    json: cli.json,
+                },
+                cli.mode.into(),
+                &cwd,
                 stdout,
             );
         }
@@ -1150,6 +1170,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Relay { .. }
         | Command::BaseHealth { .. }
         | Command::Diagnose { .. }
+        | Command::ApplyDerived { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }
         | Command::MergeQueue { .. }

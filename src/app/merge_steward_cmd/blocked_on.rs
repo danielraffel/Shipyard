@@ -1475,6 +1475,16 @@ pub(super) fn annotate(
             },
             &blocked,
         ));
+        let read = |args: &[String]| actions.run_gh(args).map_err(|error| error.to_string());
+        if let Some(advice) = super::derived_drift::advice(
+            &read,
+            &observation.repo,
+            &pr.fact,
+            policy,
+            &blocked.blocked_on,
+        ) {
+            blocked.next_action = Some(advice);
+        }
         report.blocked = blocked;
     }
 }

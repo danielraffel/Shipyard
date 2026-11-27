@@ -168,6 +168,20 @@ probably dropped the PR's changes, so restore them from an earlier head or close
 2026-11-18 repair merges emptied four PRs (Pulp #12547 and #12549, skia-builder #63, v8-builder #71) that
 would otherwise have merged as no-ops. Unknown counts never block; only an observed 0 with commits does.
 
+## Derived-file drift: `shipyard apply-derived`
+
+When a pull request is red only because a derived file is stale (Pulp's
+`script-test-inputs-drift` or `changed-surface-script-families-drift`) and CI
+uploaded the expected files, the steward's next action reads "Derived-file
+drift only: run `shipyard apply-derived --pr N --push`". Run it in a clean
+checkout at the pull request's head. It downloads the artifact from the newest
+failed run at that head, accepts only regular files inside the base branch's
+`[derived_files] paths` allowlist, commits `chore: apply CI's expected derived
+files from run <id>` with the tip's gate trailers carried, and pushes. Without
+`--push` it is a dry run that writes nothing. It refuses a moved head, a dirty
+tree, a fork, symlinks and `..`, and it runs no repository code. Full
+reference and the Pulp gaps: `docs/apply-derived.md`.
+
 ## The fleet status page publishes itself
 
 The m3 steward tick runs `shipyard fleet-report --publish-issue "$SHIPYARD_FLEET_REPORT_ISSUE"` after each pass
