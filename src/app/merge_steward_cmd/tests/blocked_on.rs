@@ -2267,3 +2267,79 @@ fn the_gate_refuses_a_head_the_steward_ledger_holds() {
         "{blocker:?}"
     );
 }
+
+/// The steward's own rows carry the apply-derived advice: `annotate` swaps a
+/// drift-only `required_failed` row's next action, keeps its token, and
+/// leaves a red with no expected-files artifact on the ordinary advice.
+#[cfg(unix)]
+#[test]
+fn annotate_names_apply_derived_for_a_drift_only_red() {
+    let run = |artifact: &str| {
+        let temp = tempfile::tempdir().expect("temp");
+        let actions = fake_gh(
+            &temp,
+            &format!(
+                r#"
+case "$*" in
+  *"actions/runs?head_sha={HEAD}"*) printf '%s' '{{"workflow_runs":[{{"id":500,"conclusion":"failure","head_sha":"{HEAD}"}}]}}' ;;
+  *"actions/runs/500/artifacts"*) printf '%s' '{{"artifacts":[{{"id":1,"name":"{artifact}","expired":false}}]}}' ;;
+  *"actions/jobs/11/logs"*) printf '%s\n' '2026-11-26T17:13:18.1510910Z The following tests FAILED:' '2026-11-26T17:13:18.1511600Z 	2380 - script-test-inputs-drift (Failed)                 gate-inventory pr-fast' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#
+            ),
+        );
+        let mut policy = queue_policy();
+        let table: toml::Table = r#"
+[derived_files]
+paths = ["test/ctest_script_inputs/"]
+drift_tests = ["script-test-inputs-drift"]
+[[derived_files.artifacts]]
+name = "script-inputs-expected"
+root = "test/ctest_script_inputs"
+"#
+        .parse()
+        .expect("toml");
+        policy.ejection_guards = crate::merge_steward::EjectionGuards::from_table(&table, true);
+        let pr = pr_with(
+            77,
+            &[],
+            "BLOCKED",
+            &json!([{"__typename": "CheckRun", "name": "macos", "status": "COMPLETED",
+                     "conclusion": "FAILURE", "completedAt": CHECKS_GREEN_AT,
+                     "detailsUrl": "https://github.com/owner/repo/actions/runs/500/job/11"}]),
+        );
+        let observation = observation_for(pr.clone(), true);
+        let decision = classify_pr(&pr.fact, &policy, &BTreeMap::new());
+        let mut reports = vec![PrReport {
+            number: 77,
+            head_sha: HEAD.to_owned(),
+            decision,
+            mutation: None,
+            error: None,
+            blocked: Stall::default(),
+            required_checks: Vec::new(),
+        }];
+        blocked_on::annotate(
+            &actions,
+            &observation,
+            &policy,
+            &StewardLedger::default(),
+            &BTreeMap::new(),
+            false,
+            &mut reports,
+        );
+        reports.remove(0).blocked
+    };
+    let drift = run("script-inputs-expected");
+    assert_eq!(drift.blocked_on, "required_failed:macos");
+    let action = drift.next_action.expect("next action").action;
+    assert!(
+        action.starts_with("Derived-file drift only: run `shipyard apply-derived --pr 77 --push`"),
+        "{action}"
+    );
+    let other = run("ctest-logs-macos");
+    assert_eq!(other.blocked_on, "required_failed:macos");
+    let action = other.next_action.expect("next action").action;
+    assert!(!action.contains("apply-derived"), "{action}");
+}

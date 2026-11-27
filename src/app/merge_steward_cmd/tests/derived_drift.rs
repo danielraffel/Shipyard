@@ -276,3 +276,14 @@ fn other_tokens_and_unconfigured_bases_read_nothing() {
         reads.calls.borrow()
     );
 }
+
+#[test]
+fn a_failing_commit_status_is_not_read_as_a_job() {
+    let reads = Reads::new(true, &[(11, &["script-test-inputs-drift"])]);
+    let mut status = check("macos", "FAILURE", 11);
+    status.source = StewardCheckSource::StatusContext;
+    assert_eq!(
+        advise(&reads, vec![status], "required_failed:macos", CONFIG),
+        None
+    );
+}

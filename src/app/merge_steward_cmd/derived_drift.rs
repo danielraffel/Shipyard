@@ -9,7 +9,8 @@
 //!    tests ([`crate::apply_derived::DerivedFilesConfig::advises`]). Without
 //!    one nothing is read.
 //! 2. Every failing required check (the approval context aside: a verdict
-//!    waits for green) carries a check-run id.
+//!    waits for green) is a check run with an id (a commit status has no
+//!    job log).
 //! 3. A failed workflow run at the exact head uploaded a configured,
 //!    unexpired artifact: one runs read, then one artifact listing per failed
 //!    run, newest first, at most [`MAX_RUNS`].
@@ -22,7 +23,9 @@ use serde_json::Value;
 
 use super::next_action::NextAction;
 use crate::apply_derived::{self, FailingCheck};
-use crate::merge_steward::{StewardPolicy, StewardPullRequest, selected_required_check};
+use crate::merge_steward::{
+    StewardCheckSource, StewardPolicy, StewardPullRequest, selected_required_check,
+};
 
 /// Failed runs at the head whose artifacts are listed.
 pub(super) const MAX_RUNS: usize = 5;
@@ -62,6 +65,10 @@ pub(super) fn advice(
             .any(|ok| conclusion.eq_ignore_ascii_case(ok))
         {
             continue;
+        }
+        // A commit status's id is not a job id: only a check run has a log.
+        if check.source != StewardCheckSource::CheckRun {
+            return None;
         }
         failing.push((check.name.clone(), check.check_id?));
     }
