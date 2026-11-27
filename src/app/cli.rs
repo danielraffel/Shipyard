@@ -568,6 +568,24 @@ pub(super) enum Command {
         #[arg(long)]
         no_rebase_carry: bool,
     },
+    /// Check that merging the base into a PR branch did not drop base content
+    /// outside the PR's own files. Local and read-only. Exits 0 on pass (edits
+    /// made in the merge commit that keep every base line are warnings), 1
+    /// when a file outside the PR's change set lost base content, 2 on error.
+    MergeCheck {
+        /// The base that was merged. Use the merged base commit if the base has
+        /// moved on since: the head must contain it.
+        #[arg(long, value_name = "REF", default_value = "origin/main")]
+        base: String,
+        /// The PR head before the merge. Defaults to `HEAD^1` when the head is
+        /// a merge commit whose second parent is the base tip; otherwise
+        /// required.
+        #[arg(long, value_name = "REF")]
+        pre: Option<String>,
+        /// The post-merge head.
+        #[arg(long, value_name = "REF", default_value = "HEAD")]
+        head: String,
+    },
     /// Check the latest HOLD findings against the repair diff. Read-only.
     RepairCheck {
         /// Pull request number.
@@ -730,6 +748,31 @@ pub(super) enum Command {
         /// observe their runner (two API calls each). Defaults to 8.
         #[arg(long = "max-runs", value_name = "COUNT")]
         max_runs: Option<usize>,
+    },
+    /// Commit CI's expected derived files to a pull request whose drift
+    /// check failed.
+    ///
+    /// Reads the base branch's `[derived_files]` table, finds the newest
+    /// failed run at the pull request's exact head that uploaded a configured
+    /// expected-files artifact, and checks every entry: regular files only,
+    /// inside the allowlist, no `..`, absolute paths or symlinks. Run it in a
+    /// clean checkout at that head. It runs no repository code. Dry run by
+    /// default; `--push` commits `chore: apply CI's expected derived files
+    /// from run <id>` and pushes the head branch.
+    #[command(name = "apply-derived")]
+    ApplyDerived {
+        /// Pull request to repair.
+        #[arg(long = "pr", value_name = "PR")]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the checkout's `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// The pull request's checkout. Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        path: Option<std::path::PathBuf>,
+        /// Write, commit and push. Without it nothing is written.
+        #[arg(long)]
+        push: bool,
     },
     /// Bounded diagnosis of a red pull request or workflow run.
     ///
@@ -4607,6 +4650,17 @@ mod tests {
             .join()
             .expect("Cli::parse_from on a 2 MiB thread");
         assert!(matches!(cli.command, Command::Daemon { .. }));
+    }
+
+    #[test]
+    fn apply_derived_needs_a_pr_and_defaults_to_dry_run() {
+        let cli = Cli::try_parse_from(["shipyard", "apply-derived", "--pr", "12", "--repo", "o/r"])
+            .expect("apply-derived parses");
+        let Command::ApplyDerived { pr, push, repo, .. } = cli.command else {
+            panic!("not apply-derived");
+        };
+        assert_eq!((pr, push, repo.as_deref()), (12, false, Some("o/r")));
+        assert!(Cli::try_parse_from(["shipyard", "apply-derived"]).is_err());
     }
 
     #[test]

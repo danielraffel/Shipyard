@@ -12,6 +12,7 @@ use crate::ship_state::ShipStateStore;
 use clap::Parser;
 
 mod advance_cmd;
+mod apply_derived_cmd;
 mod auth_cmd;
 mod auto_merge_cmd;
 mod base_health_cmd;
@@ -54,6 +55,7 @@ mod inspect_cmd;
 mod landability_cmd;
 mod landing_cmd;
 mod local_linux_lease_cmd;
+mod merge_check_cmd;
 mod merge_queue_control_cmd;
 mod merge_steward_cmd;
 mod metrics_cmd;
@@ -514,6 +516,25 @@ where
                 stdout,
             );
         }
+        Command::ApplyDerived {
+            pr,
+            repo,
+            path,
+            push,
+        } => {
+            return apply_derived_cmd::apply_derived_command(
+                &apply_derived_cmd::ApplyDerivedArgs {
+                    pr,
+                    repo,
+                    path,
+                    push,
+                    json: cli.json,
+                },
+                cli.mode.into(),
+                &cwd,
+                stdout,
+            );
+        }
         Command::Diagnose {
             pr,
             pr_flag,
@@ -631,6 +652,14 @@ where
                     rebase_carry: !no_rebase_carry,
                     json: cli.json,
                 },
+                stdout,
+            );
+        }
+        Command::MergeCheck { base, pre, head } => {
+            return merge_check_cmd::merge_check_command(
+                &merge_check_cmd::MergeCheckArgs { base, pre, head },
+                &cwd,
+                cli.json,
                 stdout,
             );
         }
@@ -1130,6 +1159,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Advance { .. }
         | Command::ReviewVerdict { .. }
         | Command::RepairCheck { .. }
+        | Command::MergeCheck { .. }
         | Command::ReviewerDispatch { .. }
         | Command::ReviewerClaim { .. }
         | Command::Who { .. }
@@ -1140,6 +1170,7 @@ fn handle_operational_variant<W: Write>(
         | Command::Relay { .. }
         | Command::BaseHealth { .. }
         | Command::Diagnose { .. }
+        | Command::ApplyDerived { .. }
         | Command::Doctor { .. }
         | Command::Daemon { .. }
         | Command::MergeQueue { .. }

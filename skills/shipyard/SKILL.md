@@ -33,6 +33,17 @@ that exact head with the current PR head, and reports each finding as
 finding that is resolved by an explanation. The command is read-only and exits
 1 while any finding remains open, or 2 when GitHub evidence is unreadable.
 
+After merging the base into a PR branch, run `shipyard merge-check` (local,
+read-only) before pushing: `shipyard merge-check --base origin/main` with
+`HEAD` the merge commit. For each file the merge changed relative to the base
+that is not one of the PR's own files, it checks that every line the base added
+since the merge base is still there as often as in the base (a pre-existing
+copy does not count for a new one), that a changed base file or mode was not
+reverted, and that a binary file the base changed is kept exactly. Missing base content exits 1 (`base_loss`, with the missing line
+count). Extra edits that keep all of the base's lines (`merge_only_edit`) are a
+warning, as is a PR file that now equals the base. Exit 2 means it could not
+decide (for example a non-merge `HEAD` with no `--pre`).
+
 A scheduled reviewer pass works through the **must-review queue** a script computes before it starts: open,
 non-draft, green, and no verdict naming the head, with missed ones first. A 2-minute eligibility tick, which makes
 no model call, starts a pass when a pull request becomes reviewable, or queues one follow-up behind a running pass.
@@ -156,6 +167,23 @@ changed_files == 0 and commits > 0). It reports `blocked_on: empty_diff` with th
 probably dropped the PR's changes, so restore them from an earlier head or close the PR as superseded. On
 2026-11-18 repair merges emptied four PRs (Pulp #12547 and #12549, skia-builder #63, v8-builder #71) that
 would otherwise have merged as no-ops. Unknown counts never block; only an observed 0 with commits does.
+
+## Derived-file drift: `shipyard apply-derived`
+
+When a pull request is red only because a derived file is stale (Pulp's
+`script-test-inputs-drift` or `changed-surface-script-families-drift`) and CI
+uploaded the expected files, the steward's next action reads "Derived-file
+drift only: run `shipyard apply-derived --pr N --push`". Run it in a clean
+checkout at the pull request's head. It downloads the artifact from the newest
+failed run at that head, accepts only regular files inside the base branch's
+`[derived_files] paths` allowlist, commits `chore: apply CI's expected derived
+files from run <id>` with the tip's gate trailers carried, and pushes. Without
+`--push` it is a dry run that writes nothing. It uses only a failed run of
+that pull request (not another PR from the same commit), refuses a moved head,
+a dirty tree, a fork, a non-default base, symlinks, `..` and non-ASCII names,
+and refuses (exit 1) when the artifact already matches the checkout: that
+drift needs a deletion or a regeneration. It runs no repository code. Full
+reference and the Pulp gaps: `docs/apply-derived.md`.
 
 ## The fleet status page publishes itself
 
@@ -4638,13 +4666,17 @@ one issue per signature (marker on the last line, updated by comment, closed
 issues left alone, test names sanitised). Do not push a no-op head for such a
 row; fix or list the flaky test. See `docs/automated-draining.md` "Flakes".
 
-**A row marked `red_everywhere` is a base-level failure, not yours to repair.**
+**A row marked `red_everywhere` is a base-level failure only when the base is red on that check.**
 When one required check fails the same test on three or more open pull requests,
 the steward reports the episode in the repository's `red_everywhere` section and
-marks each member row (`red_everywhere: {check, test, prs, repair_skip}`), and the
-row's `next_action` reads "Failing on N PRs with the same test ... do not repair
-this PR, wait for the base fix or merge main once main is green". Do that: wait
-for the fix on the base, then merge the base once and push once. `[auto_merge]
+marks each member row (`red_everywhere: {check, test, prs, base, repair_skip}`).
+`base` is the base tip's newest verdict on that check. When it is `red` or
+`unknown`, the row's `next_action` reads "Failing on N PRs with the same test ...
+do not repair this PR, wait for the base fix or merge main once main is green":
+wait for the fix on the base, then merge the base once and push once. When it is
+`green`, the `next_action` reads "Repair this PR: ..." and names the failing test:
+main passes that check, so the failure is this pull request's own and `repair_skip`
+is false. `[auto_merge]
 red_everywhere` is `shadow` by default; under `enforce` an unchanged member head
 is not enqueued (`held_red_everywhere:<check>`) and `repair_skip` is true. See
 `docs/automated-draining.md` "Red everywhere".

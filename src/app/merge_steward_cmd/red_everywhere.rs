@@ -75,8 +75,41 @@ pub(super) struct RowMark {
     pub(super) test: Option<String>,
     /// Open pull requests in the episode.
     pub(super) prs: usize,
-    /// The repair lane should not repair this pull request (enforce only).
+    /// The repair lane should not repair this pull request (enforce only,
+    /// and never when the base tip is green on the check).
     pub(super) repair_skip: bool,
+    /// What the base tip says about this check: `red`, `green` or `unknown`.
+    pub(super) base: BaseCheck,
+}
+
+/// The base tip's verdict on one required check. A shared failure is a
+/// base-level cause only when the base itself is failing that check.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum BaseCheck {
+    /// The base tip's newest completed verdict is a failure.
+    Red,
+    /// The base tip was read and its newest completed verdict passed.
+    Green,
+    /// The base tip could not be read, or has no completed verdict.
+    #[default]
+    Unknown,
+}
+
+impl BaseCheck {
+    /// Classify a base tip reading: green needs a read without error and a
+    /// completed verdict that passed. Anything else is not green.
+    pub(super) fn from_tip(tip: &crate::base_health::fix_first::TipReading) -> Self {
+        if tip.error.is_some() {
+            Self::Unknown
+        } else if tip.red {
+            Self::Red
+        } else if tip.newest_at.is_some() {
+            Self::Green
+        } else {
+            Self::Unknown
+        }
+    }
 }
 
 /// One red required check on a current head, with its failing tests.
@@ -289,6 +322,7 @@ pub(super) fn observe(
                 test: test.clone(),
                 prs: count,
                 repair_skip: mode == Mode::Enforce,
+                base: BaseCheck::Unknown,
             });
         }
         pass.status.groups.push(Group {
@@ -324,12 +358,28 @@ impl Pass {
         out
     }
 
-    /// Mark each member's row and return the report section.
-    pub(super) fn annotate(mut self, reports: &mut [PrReport]) -> RepoStatus {
+    /// The distinct checks with an episode this pass.
+    pub(super) fn episode_checks(&self) -> BTreeSet<String> {
+        self.marks.values().map(|mark| mark.check.clone()).collect()
+    }
+
+    /// Mark each member's row and return the report section. `base` holds the
+    /// base tip's verdict per episode check; a check missing from it is
+    /// [`BaseCheck::Unknown`].
+    pub(super) fn annotate(
+        mut self,
+        reports: &mut [PrReport],
+        base: &BTreeMap<String, BaseCheck>,
+    ) -> RepoStatus {
         for report in reports.iter_mut() {
-            let Some(mark) = self.marks.remove(&report.number) else {
+            let Some(mut mark) = self.marks.remove(&report.number) else {
                 continue;
             };
+            mark.base = base.get(&mark.check).copied().unwrap_or_default();
+            if mark.base == BaseCheck::Green {
+                // The base is fine, so this failure is the pull request's own.
+                mark.repair_skip = false;
+            }
             if let Some(next) = report.blocked.next_action.as_mut() {
                 next.action = advice(&mark);
             }
@@ -350,7 +400,7 @@ pub(super) fn run(
     reports: &mut [PrReport],
     now_epoch: i64,
 ) -> RepoStatus {
-    observe(mode, observation, reds, ledger, now_epoch).annotate(reports)
+    observe(mode, observation, reds, ledger, now_epoch).annotate(reports, &BTreeMap::new())
 }
 
 /// The row's next action while it is in an episode.
@@ -359,11 +409,25 @@ pub(super) fn advice(mark: &RowMark) -> String {
         || mark.check.clone(),
         |test| format!("{} ({test})", mark.check),
     );
-    format!(
-        "Failing on {} PRs with the same test: {what}. Likely a base-level cause; do not repair \
-         this PR, wait for the base fix or merge main once main is green.",
-        mark.prs
-    )
+    match mark.base {
+        BaseCheck::Green => format!(
+            "Repair this PR: {what} failed here and on {} PRs with the same test, but the base \
+             tip is green on {}, so each failure is its own. Fix the failing test in this PR.",
+            mark.prs, mark.check
+        ),
+        BaseCheck::Red => format!(
+            "Failing on {} PRs with the same test: {what}. The base tip is also failing {}: \
+             likely a base-level cause; do not repair this PR, wait for the base fix or merge \
+             main once main is green.",
+            mark.prs, mark.check
+        ),
+        BaseCheck::Unknown => format!(
+            "Failing on {} PRs with the same test: {what}. Likely a base-level cause; do not \
+             repair this PR, wait for the base fix or merge main once main is green. Base health \
+             could not be read, so this is the cautious reading.",
+            mark.prs
+        ),
+    }
 }
 
 /// Under enforce, the check whose episode holds this exact head, if any:

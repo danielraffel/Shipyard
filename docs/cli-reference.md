@@ -84,6 +84,11 @@ shipyard diagnose 123 --annotate plan|post   # check-run annotations on the fail
                                              #   output.text carries each failing required job's ci.cause/v1 record, one JSON per line
                                              # config: [diagnose] stale_base_markers / fail_closed_markers = ["regex", ...]
 
+# Red only on derived-file drift? Commit CI's expected files (shipyard.apply-derived/v1); see docs/apply-derived.md
+shipyard apply-derived --pr 123              # dry run in a clean checkout at the PR head: files that would change
+shipyard apply-derived --pr 123 --push       # write, commit "chore: apply CI's expected derived files from run <id>", push
+                                             # config: base branch [derived_files] paths / artifacts / drift_tests / carry_trailers
+
 # Name a failed job's cause (ci.cause/v1, a superset of C2's c2.cause.v0) and keep it; see docs/cause-records.md
 shipyard cause extract --log FILE            # the job's record as JSON; where it ran from --repo/--run-id/--attempt/--job/
                                              #   --head-sha/--event/--pr, else GITHUB_*; --job-json FILE reads the failing step
@@ -143,6 +148,14 @@ shipyard review-verdict --pr 123 [--repo OWNER/REPO] [--head SHA] [--no-rebase-c
                                              #   excluded human approvals, and the fix
 shipyard repair-check --pr 123 --repo OWNER/REPO [--answer ID=REASON]... [--comment-body] [--json]
                                              # refuse a repaired: marker while the latest bot HOLD finding is open
+shipyard merge-check [--base REF] [--pre REF] [--head REF] [--json]
+                                             # local, read-only: after merging the base into a PR branch, fail (exit 1)
+                                             # if a file outside the PR's own change set lost lines the base added
+                                             # (by occurrence count), reverted a base change or mode change, or
+                                             # differs from a binary file the base changed; files the PR touched
+                                             # are not checked line by line; other edits and PR files that collapsed to
+                                             # the base are warnings. --pre defaults to
+                                             # HEAD^1 when HEAD merges the base tip; exit 2 when undecidable
 shipyard reviewer-dispatch record --repo OWNER/REPO --pr 123 --head SHA \
   --reviewer infra-review2 --attempt-id ID --launcher-identity ID \
   --dispatch-id ID --started-at TIME --deadline-at TIME \
