@@ -122,10 +122,15 @@ fn analyze(cwd: &Path, args: &MergeCheckArgs) -> Result<Report, CliFailure> {
             let pre = rev_parse(cwd, "pre-merge head", spec)?;
             // An unrelated or post-merge ref would pick the wrong merge base
             // and exempt the wrong files.
-            if pre == head || !is_ancestor(cwd, &pre, &head)? {
+            // A ref that already contains the base (the merge itself or a
+            // later commit) would put the base's own changes in `pr_files`.
+            if pre == head || !is_ancestor(cwd, &pre, &head)? || is_ancestor(cwd, &base, &pre)? {
                 return Err(CliFailure::new(
                     2,
-                    format!("pre-merge head `{spec}` must be a proper ancestor of head {head}"),
+                    format!(
+                        "pre-merge head `{spec}` must be a proper ancestor of head {head} \
+                         that does not already contain base {base}"
+                    ),
                 ));
             }
             pre
@@ -206,7 +211,18 @@ fn default_pre(cwd: &Path, head: &str, base: &str) -> Result<String, CliFailure>
 
 /// Paths the PR changed before the merge, both sides of every rename.
 fn pr_files(cwd: &Path, merge_base: &str, pre: &str) -> Result<BTreeSet<String>, CliFailure> {
-    let out = git(cwd, &["diff", "--name-status", "-z", "-M", merge_base, pre])?;
+    let out = git(
+        cwd,
+        &[
+            "diff",
+            "--no-relative",
+            "--name-status",
+            "-z",
+            "-M",
+            merge_base,
+            pre,
+        ],
+    )?;
     let mut fields = out
         .split(|byte| *byte == 0)
         .map(|field| String::from_utf8_lossy(field).into_owned());
@@ -231,7 +247,18 @@ fn pr_files(cwd: &Path, merge_base: &str, pre: &str) -> Result<BTreeSet<String>,
 }
 
 fn numstat(cwd: &Path, from: &str, to: &str) -> Result<Vec<ExtraFile>, CliFailure> {
-    let out = git(cwd, &["diff", "--numstat", "-z", "--no-renames", from, to])?;
+    let out = git(
+        cwd,
+        &[
+            "diff",
+            "--no-relative",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            from,
+            to,
+        ],
+    )?;
     let mut files = Vec::new();
     for record in out.split(|byte| *byte == 0) {
         if record.is_empty() {
@@ -358,6 +385,7 @@ fn classify(
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
+            "--no-relative",
             "--no-renames",
             "-U0",
             merge_base,
@@ -1099,6 +1127,48 @@ mod tests {
             .collect();
         assert_eq!(missing.get("sub/keep.txt"), Some(&1), "{out}");
         assert_eq!(missing.get("sub/*.txt"), Some(&1), "{out}");
+    }
+
+    #[test]
+    fn a_post_merge_pre_is_an_error() {
+        let temp = fixture();
+        let dir = temp.path();
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", "base moved\n");
+        run(
+            dir,
+            &[
+                "merge", "-q", "--no-ff", "-s", "ours", "-m", "merge", "main",
+            ],
+        );
+        let merge = run(dir, &["rev-parse", "HEAD"]);
+        write(dir, "pr.txt", "follow-up\n");
+        commit(dir, "follow-up");
+        let (result, _) = check(dir, &args(Some(&merge)));
+        assert_eq!(result.expect_err("error").code, 2);
+    }
+
+    #[test]
+    fn relative_diff_config_does_not_hide_a_loss_outside_the_subdirectory() {
+        let temp = fixture();
+        let dir = temp.path();
+        run(dir, &["config", "diff.relative", "true"]);
+        std::fs::create_dir(dir.join("sub")).expect("mkdir");
+        write(dir, "sub/keep.txt", "k\n");
+        commit(dir, "sub");
+        write(dir, "pr.txt", "changed\n");
+        commit(dir, "pr");
+        base_changes(dir, "base.txt", "base moved\n");
+        run(
+            dir,
+            &[
+                "merge", "-q", "--no-ff", "-s", "ours", "-m", "merge", "main",
+            ],
+        );
+        let (result, out) = check(&dir.join("sub"), &args(None));
+        assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
+        assert_eq!(verdict(&out)["extra"][0]["path"], "base.txt");
     }
 
     #[test]
