@@ -619,7 +619,34 @@ pub(super) fn apply_repo_plan(
     );
     // Mark the member rows of this pass's red-everywhere episodes, computed
     // before the PR mutations above.
-    let red_everywhere_status = red_everywhere_pass.annotate(&mut reports);
+    // One tip read per episode check that the base-poison pass did not read.
+    let red_everywhere_base: std::collections::BTreeMap<String, super::red_everywhere::BaseCheck> =
+        red_everywhere_pass
+            .episode_checks()
+            .into_iter()
+            .map(|check| {
+                let tip = base_poison
+                    .as_ref()
+                    .and_then(|poison| poison.tip.get(&check).cloned())
+                    .unwrap_or_else(|| {
+                        super::base_poison::read_tip(
+                            &|argv: &[String]| {
+                                actions.run_gh(argv).map_err(|error| error.to_string())
+                            },
+                            &observation.repo,
+                            &observation.base,
+                            &check,
+                            observation
+                                .required_checks
+                                .iter()
+                                .find(|rule| rule.context == check)
+                                .and_then(|rule| rule.app_id),
+                        )
+                    });
+                (check, super::red_everywhere::BaseCheck::from_tip(&tip))
+            })
+            .collect();
+    let red_everywhere_status = red_everywhere_pass.annotate(&mut reports, &red_everywhere_base);
     // Flake-classified ejections decided by the enqueue path above, each
     // signature's root cause, and (under apply) its one issue.
     let flake_requeue_status = super::flake_requeue::finish(
