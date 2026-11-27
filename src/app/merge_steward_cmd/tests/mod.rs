@@ -234,6 +234,7 @@ mod capacity;
 #[cfg(unix)]
 mod code_owner_wait;
 mod defect_fix_removals;
+mod derived_drift;
 mod dwell;
 #[cfg(unix)]
 mod ejected_retry;

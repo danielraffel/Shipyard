@@ -175,6 +175,23 @@ impl NextAction {
         )
     }
 
+    /// A head whose every failing required check failed only derived-file
+    /// drift tests, with CI's expected files uploaded at that head (see
+    /// [`super::derived_drift`]).
+    #[must_use]
+    pub fn derived_drift(repo: &str, number: u64, head: &str, run_id: u64) -> Self {
+        let short = head.get(..12).unwrap_or(head);
+        Self::new(
+            Actor::Author,
+            format!(
+                "Derived-file drift only: run `shipyard apply-derived --pr {number} --push` in a \
+                 clean checkout of the PR branch at {short} (add `--repo {repo}` outside it). It \
+                 commits CI's expected files from run {run_id}; nothing else is red. Push nothing \
+                 else with it."
+            ),
+        )
+    }
+
     /// A row the pass could not match to an observed pull request.
     #[must_use]
     pub fn unclassified() -> Self {

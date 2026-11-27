@@ -1414,6 +1414,29 @@ impl GitHubActions {
         self.run_gh_with_timeout_output_limits(args, timeout, None, &[], false)
     }
 
+    /// Run `gh` and return its raw stdout bytes, refusing more than
+    /// `max_stdout_bytes`. Never served from a cache or in process: it is for
+    /// binary downloads such as a workflow artifact's zip.
+    pub(crate) fn run_gh_bytes_bounded(
+        &self,
+        args: &[String],
+        timeout: Duration,
+        max_stdout_bytes: usize,
+    ) -> Result<Vec<u8>, GitHubError> {
+        let output = self.run_gh_with_timeout_output_limits_via(
+            args,
+            timeout,
+            Some((max_stdout_bytes.max(1), 64 * 1024)),
+            &[],
+            false,
+            false,
+        )?;
+        if !output.success() {
+            return Err(output.command_error(args));
+        }
+        Ok(output.stdout)
+    }
+
     pub(crate) fn run_gh_with_timeout_bounded(
         &self,
         args: &[String],

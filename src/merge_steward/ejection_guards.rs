@@ -178,6 +178,10 @@ pub struct EjectionGuards {
     /// the coordinator (`[auto_merge] repair_unstable_reds`, default off).
     /// It routes; it never admits anything.
     pub repair_unstable_reds: bool,
+    /// The base config's `[derived_files]` table: which drift reds
+    /// `shipyard apply-derived` can fix ([`crate::apply_derived`]). The
+    /// default is unconfigured, and then the steward never names the command.
+    pub derived_files: crate::apply_derived::DerivedFilesConfig,
     /// Why the base config could not be read, when it could not. The guards
     /// then keep their merge-queue defaults (on) with no generated paths.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,6 +214,7 @@ impl EjectionGuards {
             unstable_advisory_checks: None,
             unstable_advisory_checks_error: None,
             repair_unstable_reds: false,
+            derived_files: crate::apply_derived::DerivedFilesConfig::default(),
             read_error: None,
         }
     }
@@ -221,6 +226,7 @@ impl EjectionGuards {
         let mut guards = Self::for_base(merge_queue);
         guards.base_poison = crate::base_health::BasePoisonPolicy::from_table(table, merge_queue);
         guards.flake_requeue = super::flake_requeue::FlakePolicy::from_table(table, merge_queue);
+        guards.derived_files = crate::apply_derived::DerivedFilesConfig::from_table(table);
         if merge_queue {
             let value = table
                 .get("merge_queue")

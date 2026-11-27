@@ -84,6 +84,11 @@ shipyard diagnose 123 --annotate plan|post   # check-run annotations on the fail
                                              #   output.text carries each failing required job's ci.cause/v1 record, one JSON per line
                                              # config: [diagnose] stale_base_markers / fail_closed_markers = ["regex", ...]
 
+# Red only on derived-file drift? Commit CI's expected files (shipyard.apply-derived/v1); see docs/apply-derived.md
+shipyard apply-derived --pr 123              # dry run in a clean checkout at the PR head: files that would change
+shipyard apply-derived --pr 123 --push       # write, commit "chore: apply CI's expected derived files from run <id>", push
+                                             # config: base branch [derived_files] paths / artifacts / drift_tests / carry_trailers
+
 # Name a failed job's cause (ci.cause/v1, a superset of C2's c2.cause.v0) and keep it; see docs/cause-records.md
 shipyard cause extract --log FILE            # the job's record as JSON; where it ran from --repo/--run-id/--attempt/--job/
                                              #   --head-sha/--event/--pr, else GITHUB_*; --job-json FILE reads the failing step

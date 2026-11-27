@@ -17,6 +17,9 @@
 pub(crate) mod advance;
 /// CLI entrypoint and command dispatch.
 pub mod app;
+/// Apply CI's expected derived files to a pull request, and recognize a red
+/// that is derived-file drift only.
+pub mod apply_derived;
 /// Immutable artifact manifests, resumable receiver-pull planning, and verified publication.
 pub mod artifact_transport;
 /// Which release the installed `ghapp` wrapper generation comes from.
