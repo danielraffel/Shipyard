@@ -209,6 +209,20 @@ fn default_pre(cwd: &Path, head: &str, base: &str) -> Result<String, CliFailure>
     ))
 }
 
+/// A git output field as text. A filename that is not UTF-8 cannot be passed
+/// back to git unchanged, so it is undecidable rather than silently rewritten.
+fn utf8_field(field: &[u8]) -> Result<String, CliFailure> {
+    String::from_utf8(field.to_vec()).map_err(|_| {
+        CliFailure::new(
+            2,
+            format!(
+                "git reported a path that is not UTF-8 ({}); merge-check cannot check it",
+                String::from_utf8_lossy(field)
+            ),
+        )
+    })
+}
+
 /// Paths the PR changed before the merge, both sides of every rename.
 fn pr_files(cwd: &Path, merge_base: &str, pre: &str) -> Result<BTreeSet<String>, CliFailure> {
     let out = git(
@@ -223,9 +237,11 @@ fn pr_files(cwd: &Path, merge_base: &str, pre: &str) -> Result<BTreeSet<String>,
             pre,
         ],
     )?;
-    let mut fields = out
+    let fields = out
         .split(|byte| *byte == 0)
-        .map(|field| String::from_utf8_lossy(field).into_owned());
+        .map(utf8_field)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut fields = fields.into_iter();
     let mut files = BTreeSet::new();
     while let Some(status) = fields.next() {
         if status.is_empty() {
@@ -264,7 +280,7 @@ fn numstat(cwd: &Path, from: &str, to: &str) -> Result<Vec<ExtraFile>, CliFailur
         if record.is_empty() {
             continue;
         }
-        let text = String::from_utf8_lossy(record);
+        let text = utf8_field(record)?;
         let mut parts = text.splitn(3, '\t');
         let (Some(added), Some(deleted), Some(path)) = (parts.next(), parts.next(), parts.next())
         else {
@@ -1169,6 +1185,28 @@ mod tests {
         let (result, out) = check(&dir.join("sub"), &args(None));
         assert_eq!(result.expect("ok"), ExitCode::from(1), "{out}");
         assert_eq!(verdict(&out)["extra"][0]["path"], "base.txt");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_non_utf8_path_is_an_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = fixture();
+        let dir = temp.path();
+        let name = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+        std::fs::write(dir.join(name), "x\n").expect("write");
+        commit(dir, "bad name");
+        let pre = run(dir, &["rev-parse", "HEAD"]);
+        base_changes(dir, "base.txt", "base moved\n");
+        run(dir, &["merge", "-q", "--no-ff", "-m", "merge", "main"]);
+        let (result, _) = check(dir, &args(Some(&pre)));
+        assert_eq!(result.expect_err("error").code, 2);
+    }
+
+    #[test]
+    fn utf8_field_rejects_invalid_bytes() {
+        assert_eq!(utf8_field(b"ok.txt").expect("ok"), "ok.txt");
+        assert_eq!(utf8_field(b"bad\xff.txt").expect_err("error").code, 2);
     }
 
     #[test]
