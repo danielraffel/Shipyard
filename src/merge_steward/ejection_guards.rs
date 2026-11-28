@@ -40,6 +40,7 @@
 //! red_everywhere = "shadow"           # off | shadow (default) | enforce
 //! flake_requeue = "shadow"            # off | shadow | apply (see `flake_requeue`)
 //! unstable_advisory_checks = ["zizmor (report only)"]  # default: unset
+//! mq_stall_recover = "off"            # off (default) | shadow | apply (see `mq_stall`)
 //! ```
 //!
 //! `red_everywhere` is not an ejection guard but lives in the same table: it
@@ -163,6 +164,10 @@ pub struct EjectionGuards {
     /// ejected along with another pull request's
     /// ([`super::flake_requeue::FlakePolicy`]).
     pub flake_requeue: super::flake_requeue::FlakePolicy,
+    /// What the steward does when GitHub never gives the queue head's
+    /// merge-group job a runner (`[auto_merge] mq_stall_recover`, default
+    /// off). See [`super::mq_stall`].
+    pub mq_stall: super::mq_stall::MqStallPolicy,
     /// On a base with no merge queue, the checks that are not required and
     /// may be red or pending on a head GitHub reports `UNSTABLE` that the
     /// steward still merges (`[auto_merge] unstable_advisory_checks`). `None`
@@ -211,6 +216,7 @@ impl EjectionGuards {
             },
             dequeue_doomed_groups_error: None,
             flake_requeue: super::flake_requeue::FlakePolicy::for_base(merge_queue),
+            mq_stall: super::mq_stall::MqStallPolicy::default(),
             unstable_advisory_checks: None,
             unstable_advisory_checks_error: None,
             repair_unstable_reds: false,
@@ -227,6 +233,9 @@ impl EjectionGuards {
         guards.base_poison = crate::base_health::BasePoisonPolicy::from_table(table, merge_queue);
         guards.flake_requeue = super::flake_requeue::FlakePolicy::from_table(table, merge_queue);
         guards.derived_files = crate::apply_derived::DerivedFilesConfig::from_table(table);
+        if merge_queue {
+            guards.mq_stall = super::mq_stall::MqStallPolicy::from_table(table);
+        }
         if merge_queue {
             let value = table
                 .get("merge_queue")

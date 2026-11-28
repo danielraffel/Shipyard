@@ -677,7 +677,60 @@ pub(super) fn apply_repo_plan(
         args.apply,
         Utc::now(),
     );
+    // The queue head's merge-group job GitHub never gave a runner: prove
+    // earlier cancels first (after this pass's admissions, so a re-enqueue
+    // above counts), then detect and, under apply, cancel. See `mq_stall`.
+    let mq_stall_status = {
+        let mq_policy = &policy.ejection_guards.mq_stall;
+        let acts = super::mq_stall::GitHubActs {
+            actions,
+            control: mutation_control,
+            observation,
+            ledger_path,
+        };
+        let now = Utc::now();
+        let applying = args.apply && mutation_control.is_some();
+        let (newly_unrecovered, progress_lines) = if applying {
+            super::mq_stall::progress(&acts, observation, &reports, ledger, now)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let detection = super::mq_stall::detect(
+            &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
+            observation,
+            (mq_policy.pr_mode != crate::merge_steward::mq_stall::MqStallMode::Off)
+                .then_some(policy.approval_context.as_str()),
+            mq_policy.minutes,
+            now,
+        );
+        let opted_out = super::opted_out_pull_requests(&observation.prs, &args.opt_out_label);
+        let stall_actions = super::mq_stall::act(
+            &detection,
+            mq_policy,
+            applying,
+            &opted_out,
+            observation,
+            ledger,
+            if applying {
+                &acts
+            } else {
+                &super::mq_stall::NoActs
+            },
+            now,
+        );
+        super::mq_stall::status(
+            mq_policy,
+            detection,
+            stall_actions,
+            progress_lines,
+            newly_unrecovered,
+            ledger,
+            &observation.repo,
+        )
+    };
+    let mq_stall_errors = mq_stall_status.errors();
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
+        || !mq_stall_errors.is_empty()
         || native_arm_failed
         || infra_rerun_failed
         || pr_mutation_failed
@@ -777,6 +830,7 @@ pub(super) fn apply_repo_plan(
     (
         RepoReport {
             base_poison: base_poison_report,
+            mq_stall: Some(mq_stall_status),
             merge_group_stalled: Some(serde_json::json!({
                 "mode": stall_pass.mode,
                 "config_error": policy.ejection_guards.dequeue_doomed_groups_error,
@@ -828,6 +882,7 @@ pub(super) fn apply_repo_plan(
                 .chain(wedge_reconcile_error)
                 .chain(wedge_observation_error)
                 .chain(superseded_rate_limit)
+                .chain(mq_stall_errors)
                 .collect(),
         },
         unhealthy,

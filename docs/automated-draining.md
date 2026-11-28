@@ -886,6 +886,100 @@ record. A file that cannot be read never stalls the queue: the last good read
 only a head that left the queue since that read is held
 (`defect_fix_removed:unjudged`); after that the error is only logged.
 
+## Jobs GitHub never gives a runner
+
+Sometimes the queue head's merge-group job stays `queued` with no runner
+while later jobs with the same labels get runners. Under an `ALLGREEN` merge
+queue that holds every entry behind it until the ruleset's check timeout (360
+minutes on Vellum). On 2026-11-28 Vellum run 46104476461 (#825) waited 69
+minutes while a job created 11 minutes after it (#791's, 04:08:34) started
+at 04:11:24, and it was cancelled by hand.
+
+Most long waits are not this. A runner label with more jobs than runners is
+served out of order, and a job created in the same batch as the waiting one
+getting the free runner proves only that runners were short. At 07:38Z the
+same day #825's head job waited 32 minutes while its batch sibling (#816,
+created two seconds later) ran, then got a runner and #825 merged by itself.
+The seven Vellum pull request GPU jobs queued from 05:12Z were the same kind
+of backlog on their label, and cancelling and re-running them only reset
+their place.
+
+Each pass on a merge-queue base the steward reads the queue head entry only:
+its unfinished `merge_group` runs on its current group head. With
+`pr_stall_recover` not `off` it also reads open, non-draft pull requests
+whose head the approval context (`review-verdict`) reports green, and their
+`pull_request` runs on that exact head that are still `queued`; these are
+never acted on.
+
+A target run is read only once it is older than the threshold (at most 15 per
+pass). A job is stalled when it is `queued`, has no runner (runner id absent
+or 0 and no runner name), has labels, has waited `mq_stall_minutes` (20) since
+it was created, and no other job of its run is `in_progress`. A pull request
+job must produce a required check. It counts only with a witness: a job of
+the same repository created at least 5 minutes after it, whose labels include
+all of the stalled job's, that started on a runner. Witnesses come from the
+pass's run census and one listing of the stalled workflow's runs since the
+stalled job, so a witness run that already completed counts; at most 10 job
+reads, and the scan stops once every stall has one. Jobs are read once per
+pass. A failed or partial read, or a job whose runner fields or labels have
+the wrong type, decides nothing (`detection.unread`).
+
+The tick's summary line names each stall as
+`mq_stall=#<pr>:run:<id>:job:<id>:<age>m` (queue head) or `pr_stall=...`
+(pull request), what the recovery did as `stall_act=<outcome>:#<pr>:run:<id>`,
+failed recoveries as `mq_stall_unrecovered=#<pr>:run:<id>`, and failures of
+the step itself as `stall_error=` (`unread`, `cancel_failed:#<pr>:run:<id>`,
+`intent_not_saved:...`); those also go to the repository's `errors` and make
+the pass unhealthy. Each field is
+printed only when it has a value. The repository report's `mq_stall` section
+carries the detection, the actions and the progress lines.
+
+```toml
+[auto_merge]
+mq_stall_recover = "off"          # off (default) | shadow | apply: the queue head
+pr_stall_recover = "off"          # off (default) | shadow: approved PR heads, report only
+mq_stall_minutes = 20             # 5..=360
+mq_stall_max_cancels_per_hour = 3 # 1..=20 per repository
+```
+
+Read from the base branch's config. A value that does not parse keeps the
+default and is reported as `config_error`; `pr_stall_recover = "apply"` is read
+as `shadow` and reported the same way. `shadow`, or `apply` on a pass that
+does not apply, reports `would_cancel` and changes nothing.
+
+Under `mq_stall_recover = "apply"` the steward cancels the stalled head run,
+once per run id, under the run mutation guard, after a fresh read shows the
+entry is still the head on the same group and the job is still queued with no
+runner, and every other job of the run is unstarted or done (all of the
+run's jobs are read again; a sibling that started since detection refuses
+the cancel). It never cancels a run whose job has a runner, a non-head queue entry,
+a pull request stall, a pull request carrying the opt-out label, or anything
+after an incomplete read. At most one cancel per repository per pass, one per
+pull request in six hours (a re-enqueued head gets a new run id), and
+`mq_stall_max_cancels_per_hour` per repository per hour. Each attempt is a
+receipt in the steward ledger (`mq_stall_cancels`), saved as an intent
+before the cancel: when the save fails nothing is cancelled
+(`intent_not_saved`), and an intent a later pass finds with no outcome reads
+`cancel_unknown` and counts against every limit.
+
+A head cancel is not free. The cancelled required check ejects the entry,
+every group behind it is rebuilt (after the 04:56 hand cancel #769's finished
+58-minute GPU job was discarded), and the normal admission path re-enqueues
+the head (#825 came back 37 minutes later).
+
+Later passes prove it from a fresh read of the run, starting a minute after
+the act: recovered when the run concluded `cancelled` and the pull request
+moved (it left the open set, is queued on a different group, has a newer
+merge-group run, or this pass enqueued it again). A receipt that has not moved
+stays pending for an hour, then reads `unrecovered: ...`; the run is never
+cancelled again and the summary names it. A run read that keeps failing holds
+the receipt pending for an hour, then it is unrecovered.
+
+Before turning `apply` on, run `shadow` for at least 48 hours and compare
+every `would_cancel` with what happened: count how many of those jobs later
+got a runner unaided and how many of those heads merged without help. Turn it
+on only when the stalls it names are ones that did not clear by themselves.
+
 ## Red everywhere: one cause on the base
 
 When one required check fails the same way on three or more open pull requests
@@ -922,6 +1016,7 @@ red_everywhere = "shadow"   # off | shadow (default) | enforce
 | row `next_action.action`, base tip unreadable | The cautious text: "Failing on N PRs with the same test: ... Likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green. Base health could not be read, so this is the cautious reading." |
 | `summary.log` | `red_everywhere=<episodes>` on each repository line |
 | `summary.log` | `recovery_store=<active>/<limit>` on each repository line: the recovery store's fill after the pass retired requests for pull requests that closed, merged or moved head (or aged past 7 days). `!FULL` means it cannot take another request; `ERROR` means the prune failed; `off` means recovery publication is disabled |
+| `summary.log` | `mq_stall=`, `pr_stall=`, `stall_act=`, `mq_stall_unrecovered=` and `stall_error=` on a repository line only when set: jobs GitHub never gave a runner and what the recovery did. See [Jobs GitHub never gives a runner](#jobs-github-never-gives-a-runner) |
 | enqueue (enforce only) | a member whose head has not changed since the episode began is not enqueued: `held_red_everywhere:<check>`. Nothing is dequeued or closed |
 
 A member that pushes a new head leaves the episode; the episode ends (and is

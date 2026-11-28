@@ -366,6 +366,46 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.run_tick()
         self.assertNotIn("advisory_not_green", self.summary_line())
 
+    def steward_prints_repo(self, repo_fields):
+        body = json.dumps({"repos": [dict({"repo": "acme/repo", "prs": [], "errors": []}, **repo_fields)]})
+        (self.home / "pass.json").write_text(body)
+        stub = self.home / ".local" / "bin" / "shipyard"
+        stub.write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = --version ]; then echo 'shipyard 1.0'; exit 0; fi\n"
+            f"cat '{self.home / 'pass.json'}'\n"
+        )
+        stub.chmod(0o755)
+
+    def test_a_dispatch_stall_and_its_recovery_are_summary_fields(self):
+        self.steward_prints_repo({"mq_stall": {"summary": {
+            "mq_stall": ["#825:run:46104476461:job:140854026289:68m"],
+            "pr_stall": ["#842:run:46111057074:job:140874457840:257m"],
+            "act": ["cancelled:#825:run:46104476461", "deferred:#842:run:46111057074"],
+            "mq_stall_unrecovered": [],
+            "pr_stall_unrecovered": ["#833:run:46118730933"],
+            "errors": ["unread", "cancel_failed:#825:run:46104476461"],
+        }}})
+        self.run_tick()
+        line = self.summary_line()
+        self.assertIn(" mq_stall=#825:run:46104476461:job:140854026289:68m", line)
+        self.assertIn(" pr_stall=#842:run:46111057074:job:140874457840:257m", line)
+        self.assertIn(" stall_act=cancelled:#825:run:46104476461,deferred:#842:run:46111057074", line)
+        self.assertIn(" pr_stall_unrecovered=#833:run:46118730933", line)
+        self.assertNotIn("mq_stall_unrecovered=", line)
+        self.assertIn(" stall_error=unread,cancel_failed:#825:run:46104476461", line)
+
+    def test_no_stall_fields_from_an_older_binary_or_a_quiet_pass(self):
+        self.steward_prints([], rc=0)
+        self.run_tick()
+        for field in (" mq_stall=", " pr_stall=", " stall_act=", "_unrecovered=", " stall_error="):
+            self.assertNotIn(field, self.summary_line())
+        self.steward_prints_repo({"mq_stall": {"summary": {
+            "mq_stall": [], "pr_stall": [], "act": [], "mq_stall_unrecovered": [], "pr_stall_unrecovered": []}}})
+        self.run_tick()
+        for field in (" mq_stall=", " pr_stall=", " stall_act=", "_unrecovered=", " stall_error="):
+            self.assertNotIn(field, self.summary_line())
+
     def test_clean_pass_reports_zero_for_both(self):
         self.steward_prints([{"number": 1, "mutation": "enqueued"}], rc=0)
         self.run_tick()
