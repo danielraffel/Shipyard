@@ -405,13 +405,16 @@ step with neither a known `timeout-minutes` nor any green history is never
 cancelled (the job timeout still bounds it). Heal uses a normal cancel
 (force-cancel would skip the keychain restore), waits up to 8 minutes for the
 run to stop, re-runs it, confirms from the API that `run_attempt` increased,
-and comments on an open `release-blocked` issue. Before it cancels, heal writes a marker comment on the run's
-head commit naming the run id, attempt and a nonce; if that write fails it
-does not cancel. If a pass dies or gives up after its cancel, the next pass
-re-runs the run only when that marker, posted by `github-actions[bot]`, names
-the exact run id and attempt and a cancelled step had run past its threshold.
-A run a maintainer or the concurrency group cancelled has no marker and is
-left for a human, as is any run whose markers cannot be read. At attempt 3 it neither cancels nor re-runs; it
+and comments on an open `release-blocked` issue. Heal records each cancel in two commit comments on the run's head
+commit, posted by `github-actions[bot]`: an intent marker before `POST /cancel`
+(if it cannot be written, heal does not cancel), and an accepted marker with
+the same nonce once GitHub accepts the cancel. A refused cancel, including a
+409 for a run already stopping, writes no accepted marker and re-runs nothing.
+If a pass dies or gives up after an accepted cancel, the next pass re-runs the
+run only when both markers name the exact run id, attempt and nonce and a
+cancelled step had run past its threshold. An intent marker alone, a run a
+maintainer or the concurrency group cancelled, and a run whose markers cannot
+be read are all left for a human. At attempt 3 it neither cancels nor re-runs; it
 fails with the reason. To keep a stalled run dead, unset the variable or
 delete the draft. If `release.yml` at the run's commit cannot be read, that
 pass judges no stall and cancels or resumes nothing.

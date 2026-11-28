@@ -548,42 +548,55 @@ def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Sta
     return 0
 
 
-# Durable proof that heal itself cancelled a run: a commit comment on the
-# run's head commit, written before the cancel and by the workflow token.
-# A later pass resumes a cancelled run only with this marker for its exact
-# run id and attempt; a run a maintainer or the concurrency group cancelled
-# has none and is left for a human.
-MARKER_RE = re.compile(r"<!-- release-heal-cancel run=(\d+) attempt=(\d+) nonce=([0-9a-f]{16}) -->")
+# Durable proof that heal itself cancelled a run, in two phases, as commit
+# comments on the run's head commit written by the workflow token:
+# - intent, before POST /cancel;
+# - accepted, after GitHub accepted that POST, with the same nonce.
+# A later pass resumes a cancelled run only with an accepted marker whose
+# nonce matches an intent marker for that exact run id and attempt. An intent
+# alone (the cancel was refused, or the pass died before or after the POST)
+# proves nothing about who cancelled, so that run is left for a human, as is a
+# run a maintainer or the concurrency group cancelled.
+INTENT_KIND = "release-heal-cancel"
+ACCEPTED_KIND = "release-heal-cancel-accepted"
+MARKER_RE = re.compile(
+    r"<!-- (release-heal-cancel(?:-accepted)?) run=(\d+) attempt=(\d+) nonce=([0-9a-f]{16}) -->")
 MARKER_AUTHOR = "github-actions[bot]"
 MARKER_PAGES = 10
 
 
-def write_cancel_marker(repo: str, run: dict, stall: Stall) -> str | None:
-    """Record the intent to cancel ``run``; the nonce, or None when it could not be written."""
+def marker_line(kind: str, run_id: int, attempt: int, nonce: str) -> str:
+    return f"<!-- {kind} run={run_id} attempt={attempt} nonce={nonce} -->"
+
+
+def write_cancel_marker(repo: str, run: dict, kind: str, text: str, nonce: str) -> bool:
+    """Post one marker comment on the run's head commit; False when it could not be written."""
     sha = run.get("head_sha")
     if not sha:
-        return None
-    nonce = secrets.token_hex(8)
+        return False
     attempt = int(run.get("run_attempt") or 1)
-    body = (f"release-heal is cancelling stalled release run {run['id']} (attempt {attempt}): job "
-            f"`{stall.job_name}` step `{stall.step_name}` ran {int(stall.elapsed_secs // 60)} min, over its "
-            f"{int(stall.threshold_secs // 60)} min threshold. A later heal pass may re-run it.\n\n"
-            f"<!-- release-heal-cancel run={run['id']} attempt={attempt} nonce={nonce} -->")
+    body = f"{text}\n\n{marker_line(kind, run['id'], attempt, nonce)}"
     try:
         _gh("api", "-X", "POST", f"repos/{repo}/commits/{sha}/comments", "-f", f"body={body}")
     except subprocess.CalledProcessError as exc:
-        print(f"::warning::could not record the cancel intent for run {run['id']}: {(exc.stderr or '').strip()}")
-        return None
-    print(f"recorded cancel intent for run {run['id']} attempt {attempt} (nonce {nonce})")
-    return nonce
+        print(f"::warning::could not record {kind} for run {run['id']}: {(exc.stderr or '').strip()}")
+        return False
+    print(f"recorded {kind} for run {run['id']} attempt {attempt} (nonce {nonce})")
+    return True
 
 
 def has_cancel_marker(repo: str, run: dict) -> bool | None:
-    """True when heal recorded a cancel of this exact run id and attempt; None if unreadable."""
+    """True when heal recorded an accepted cancel of this exact run id and attempt.
+
+    Needs an accepted marker whose nonce matches an intent marker, both for
+    this run id and attempt and both from the workflow token. None when the
+    markers cannot be read.
+    """
     sha = run.get("head_sha")
     if not sha:
         return None
     want = (str(run["id"]), str(run.get("run_attempt")))
+    nonces: dict[str, set[str]] = {INTENT_KIND: set(), ACCEPTED_KIND: set()}
     try:
         for page in range(1, MARKER_PAGES + 1):
             comments = json.loads(_gh("api", f"repos/{repo}/commits/{sha}/comments?per_page=100&page={page}"))
@@ -591,10 +604,10 @@ def has_cancel_marker(repo: str, run: dict) -> bool | None:
                 if (comment.get("user") or {}).get("login") != MARKER_AUTHOR:
                     continue
                 for match in MARKER_RE.finditer(comment.get("body") or ""):
-                    if (match.group(1), match.group(2)) == want:
-                        return True
+                    if (match.group(2), match.group(3)) == want:
+                        nonces[match.group(1)].add(match.group(4))
             if len(comments) < 100:
-                return False
+                return bool(nonces[INTENT_KIND] & nonces[ACCEPTED_KIND])
     except (subprocess.CalledProcessError, json.JSONDecodeError, AttributeError, TypeError) as exc:
         print(f"::warning::could not read the cancel markers on {sha}: {exc}")
         return None
@@ -605,31 +618,37 @@ def cancel_and_rerun(repo: str, tag: str, run: dict, stall: Stall, *, sleep=None
     """Cancel a stalled run, wait for it to settle, then re-run it.
 
     A normal cancel, never force-cancel: force-cancel skips the job's
-    ``if: always()`` keychain restore. If this pass dies or gives up after the
-    cancel, the next pass finds the cancelled stalled step
-    (find_cancelled_stall) and re-runs it, so no cancel strands the release.
+    ``if: always()`` keychain restore. The intent marker is written first (no
+    marker, no cancel) and the accepted marker only after GitHub accepted the
+    cancel. If this pass dies or gives up after that, the next pass finds both
+    markers and the cancelled stalled step (find_cancelled_stall) and re-runs
+    the run.
     """
     run_id = run["id"]
     attempt = int(run.get("run_attempt") or 1)
-    # The marker first: without it a later pass could never tell this cancel
-    # from a maintainer's, so no marker means no cancel.
-    if write_cancel_marker(repo, run, stall) is None:
+    nonce = secrets.token_hex(8)
+    summary = (f"`{stall.job_name}` step `{stall.step_name}` ran {int(stall.elapsed_secs // 60)} min, "
+               f"over its {int(stall.threshold_secs // 60)} min threshold")
+    if not write_cancel_marker(repo, run, INTENT_KIND,
+                               f"release-heal is about to cancel stalled release run {run_id} "
+                               f"(attempt {attempt}): job {summary}.", nonce):
         print(f"::error title=Release {tag} heal did not cancel stalled run {run_id}::"
               "could not record the cancel intent on the run's commit")
         return 1
     try:
         _gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
-        print(f"cancel requested for run {run_id}")
     except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or "").strip()
-        m = re.search(r"\(HTTP (\d{3})\)", detail)
-        if not (m and m.group(1) == "409"):
-            # Not "already stopping": nothing was cancelled, so do not wait for it.
-            print(f"::error title=Release {tag} heal could not cancel stalled run {run_id}::"
-                  f"{detail or 'no detail'}")
-            return 1
-        # A 409 when the run is already stopping; the settle wait decides.
-        print(f"cancel request for run {run_id} refused as already stopping: {detail}", file=sys.stderr)
+        # Refused, including 409 (already stopping, so not by heal): heal did
+        # not cancel it, so it writes no accepted marker and re-runs nothing.
+        print(f"::error title=Release {tag} heal could not cancel stalled run {run_id}::"
+              f"{(exc.stderr or '').strip() or 'no detail'}; left for a human")
+        return 1
+    print(f"cancel accepted for run {run_id}")
+    if not write_cancel_marker(repo, run, ACCEPTED_KIND,
+                               f"GitHub accepted release-heal's cancel of run {run_id} (attempt {attempt}). "
+                               "A later heal pass may re-run it.", nonce):
+        print(f"::warning::the cancel of run {run_id} is not recorded as accepted; "
+              "if this pass stops before the re-run, a human must re-run it")
 
     def settled() -> bool:
         latest = _try_run(repo, run_id)

@@ -1203,7 +1203,8 @@ without it a stall only fails the heal run with the reason. Do not set it
 until one cancel has been exercised (RELEASING.md). Step limits are read from
 the run's own commit, a step with no known limit and no green history is never
 cancelled, and a later pass re-runs a heal cancel whose re-run never happened
-only when heal's marker commit comment names that exact run id and attempt.
+only when heal's intent and accepted marker commit comments name that exact
+run id, attempt and nonce.
 The signing step refuses binaries whose SHA-256 differs from the build step's.
 The macOS release build runs in its own step, "Build release binaries under a
 hard time limit" (`scripts/release_build_guard.py`): cargo stops after

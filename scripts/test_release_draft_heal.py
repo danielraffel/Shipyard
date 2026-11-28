@@ -298,7 +298,8 @@ class FakeGitHub:
                  poll_errors: int = 0, workflow_unreadable: bool = False,
                  cancel_refusal: str | None = None, fail_reads_after_rerun: bool = False,
                  attempt_after_rerun=None, markers: list | None = None, marker_read_fails: bool = False,
-                 marker_write_fails: bool = False) -> None:
+                 marker_write_fails: bool = False, die_on_cancel: bool = False,
+                 die_on_accepted: bool = False) -> None:
         self.now = datetime.now(timezone.utc)
         self.step_minutes_ago = step_minutes_ago
         self.step = step
@@ -322,6 +323,8 @@ class FakeGitHub:
         self.markers: list = list(markers or [])
         self.marker_read_fails = marker_read_fails
         self.marker_write_fails = marker_write_fails
+        self.die_on_cancel = die_on_cancel
+        self.die_on_accepted = die_on_accepted
         self.posts: list[str] = []
         self.reads: list[str] = []
         self.cancelled_at: str | None = None
@@ -343,9 +346,13 @@ class FakeGitHub:
                 if self.marker_write_fails:
                     raise subprocess.CalledProcessError(1, ["gh"], stderr="Forbidden (HTTP 403)")
                 body = args[args.index("-f") + 1].removeprefix("body=")
+                if self.die_on_accepted and "cancel-accepted" in body:
+                    raise RuntimeError("the heal runner went away after the cancel")
                 self.markers.append(("github-actions[bot]", body))
                 return "{}"
             if url.endswith("/cancel"):
+                if self.die_on_cancel:
+                    raise RuntimeError("the heal runner went away before the cancel")
                 if self.cancel_refusal:
                     raise subprocess.CalledProcessError(1, ["gh"], stderr=self.cancel_refusal)
                 self.cancelled_at = self.stamp(0)
@@ -448,7 +455,7 @@ class StallMainTests(unittest.TestCase):
         rc, out, posts = self._main(step_minutes_ago=45)
         self.assertEqual(rc, 0, out)
         self.assertEqual([p.rsplit("/", 1)[-1] for p in posts],
-                         ["comments", "cancel", "rerun-failed-jobs", "comments"])
+                         ["comments", "cancel", "comments", "rerun-failed-jobs", "comments"])
         self.assertEqual(posts[0], "repos/o/r/commits/tagsha/comments")
         self.assertIn("issues/42/comments", posts[-1])
         self.assertIn("attempt 2/3", out)
@@ -462,7 +469,7 @@ class StallMainTests(unittest.TestCase):
         fake = FakeGitHub(step_minutes_ago=45, rerun_fails_fast=True, issue=False)
         rc, out = heal_main(fake)
         self.assertEqual(rc, 0, out)
-        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "rerun-failed-jobs"])
+        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "comments", "rerun-failed-jobs"])
         self.assertEqual(fake.state["run_attempt"], 2)
 
     def test_unreadable_confirmation_never_sends_the_fallback(self) -> None:
@@ -472,7 +479,7 @@ class StallMainTests(unittest.TestCase):
                           fail_reads_after_rerun=True, issue=False)
         rc, out = heal_main(fake)
         self.assertEqual(rc, 1, out)
-        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "rerun-failed-jobs"])
+        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "comments", "rerun-failed-jobs"])
         self.assertEqual(fake.state["run_attempt"], 3)
         self.assertIn("outcome is unknown", out)
 
@@ -485,7 +492,7 @@ class StallMainTests(unittest.TestCase):
                                   attempt_after_rerun=reported, issue=False)
                 rc, out = heal_main(fake)
                 self.assertEqual(rc, 1, out)
-                self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "rerun-failed-jobs"])
+                self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "comments", "rerun-failed-jobs"])
                 self.assertIn("outcome is unknown", out)
         fake = FakeGitHub(step_minutes_ago=45, attempt=2, failed_rerun_restarts=False,
                           attempt_after_rerun=2, issue=False)
@@ -504,7 +511,7 @@ class StallMainTests(unittest.TestCase):
     def test_a_cancel_that_does_not_settle_is_rerun_by_the_next_pass(self) -> None:
         fake = FakeGitHub(step_minutes_ago=45, settles=False, issue=False)
         rc, out = heal_main(fake)
-        self.assertEqual((rc, len(fake.posts)), (1, 2))
+        self.assertEqual((rc, len(fake.posts)), (1, 3))
         self.assertIn("next heal pass re-runs it", out)
         # The run stops later; the next pass finishes the job.
         fake.state.update(status="completed", conclusion="cancelled")
@@ -517,13 +524,14 @@ class StallMainTests(unittest.TestCase):
         fake = FakeGitHub(step_minutes_ago=45, die_on_poll=1, issue=False)
         with self.assertRaises(RuntimeError):
             heal_main(fake)
-        self.assertEqual(fake.posts, ["repos/o/r/commits/tagsha/comments", "repos/o/r/actions/runs/7/cancel"])
+        self.assertEqual(fake.posts, ["repos/o/r/commits/tagsha/comments", "repos/o/r/actions/runs/7/cancel",
+                                      "repos/o/r/commits/tagsha/comments"])
         self.assertEqual(fake.state["conclusion"], "cancelled")
         fake.die_on_poll = 0
         rc, out = heal_main(fake)
         self.assertEqual(rc, 0, out)
         self.assertIn("resume-rerun", out)
-        self.assertEqual(fake.posts[2:], ["repos/o/r/actions/runs/7/rerun-failed-jobs"])
+        self.assertEqual(fake.posts[3:], ["repos/o/r/actions/runs/7/rerun-failed-jobs"])
         self.assertEqual(fake.state["run_attempt"], 2)
 
     def _cancelled_long(self, **kw) -> FakeGitHub:
@@ -537,30 +545,75 @@ class StallMainTests(unittest.TestCase):
         self.assertEqual((rc, fake.posts), (1, []), out)
         self.assertIn("no release-heal cancel marker", out)
 
-    def test_a_heal_cancelled_run_with_its_marker_is_resumed(self) -> None:
-        marker = "<!-- release-heal-cancel run=7 attempt=1 nonce=0123456789abcdef -->"
-        fake = self._cancelled_long(markers=[("github-actions[bot]", marker)])
+    INTENT = "<!-- release-heal-cancel run=7 attempt=1 nonce=0123456789abcdef -->"
+    ACCEPTED = "<!-- release-heal-cancel-accepted run=7 attempt=1 nonce=0123456789abcdef -->"
+
+    def test_a_heal_cancelled_run_with_its_accepted_marker_is_resumed(self) -> None:
+        fake = self._cancelled_long(markers=[("github-actions[bot]", self.INTENT),
+                                             ("github-actions[bot]", self.ACCEPTED)])
         rc, out = heal_main(fake)
         self.assertEqual(rc, 0, out)
         self.assertEqual(fake.posts, ["repos/o/r/actions/runs/7/rerun-failed-jobs"])
 
+    def test_an_intent_marker_alone_is_not_resumed(self) -> None:
+        fake = self._cancelled_long(markers=[("github-actions[bot]", self.INTENT)])
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (1, []), out)
+
+    def test_a_mismatched_nonce_is_not_resumed(self) -> None:
+        other = self.ACCEPTED.replace("0123456789abcdef", "fedcba9876543210")
+        fake = self._cancelled_long(markers=[("github-actions[bot]", self.INTENT), ("github-actions[bot]", other)])
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (1, []), out)
+
     def test_a_marker_must_name_this_run_and_attempt_and_come_from_the_workflow(self) -> None:
-        for author, marker in (
-            ("github-actions[bot]", "<!-- release-heal-cancel run=7 attempt=2 nonce=0123456789abcdef -->"),
-            ("github-actions[bot]", "<!-- release-heal-cancel run=8 attempt=1 nonce=0123456789abcdef -->"),
-            ("someone", "<!-- release-heal-cancel run=7 attempt=1 nonce=0123456789abcdef -->"),
+        for author, change in (
+            ("github-actions[bot]", ("attempt=1", "attempt=2")),
+            ("github-actions[bot]", ("run=7", "run=8")),
+            ("someone", ("", "")),
         ):
-            with self.subTest(author=author, marker=marker):
-                fake = self._cancelled_long(markers=[(author, marker)])
+            with self.subTest(author=author, change=change):
+                markers = [(author, m.replace(*change) if change[0] else m) for m in (self.INTENT, self.ACCEPTED)]
+                fake = self._cancelled_long(markers=markers)
                 rc, out = heal_main(fake)
                 self.assertEqual((rc, fake.posts), (1, []), out)
 
     def test_an_unreadable_marker_is_not_resumed(self) -> None:
-        marker = "<!-- release-heal-cancel run=7 attempt=1 nonce=0123456789abcdef -->"
-        fake = self._cancelled_long(markers=[("github-actions[bot]", marker)], marker_read_fails=True)
+        fake = self._cancelled_long(markers=[("github-actions[bot]", self.INTENT),
+                                             ("github-actions[bot]", self.ACCEPTED)], marker_read_fails=True)
         rc, out = heal_main(fake)
         self.assertEqual((rc, fake.posts), (1, []), out)
         self.assertIn("unreadable; not resuming", out)
+
+    def test_a_refused_cancel_then_a_maintainer_cancel_is_not_resumed(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=45, issue=False,
+                          cancel_refusal="Resource not accessible by integration (HTTP 403)")
+        self.assertEqual(heal_main(fake)[0], 1)
+        fake.cancel_refusal = None
+        fake.state.update(status="completed", conclusion="cancelled")  # a maintainer cancels
+        rc, out = heal_main(fake)
+        self.assertEqual(rc, 1, out)
+        self.assertNotIn("rerun", " ".join(fake.posts))
+        self.assertIn("no release-heal cancel marker", out)
+
+    def test_an_already_stopping_cancel_is_not_rerun(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=45, issue=False, cancel_refusal="Cannot cancel (HTTP 409)")
+        rc, out = heal_main(fake, settle_secs=5)
+        self.assertEqual((rc, fake.posts), (1, ["repos/o/r/commits/tagsha/comments",
+                                                "repos/o/r/actions/runs/7/cancel"]), out)
+
+    def test_a_pass_that_dies_after_its_intent_is_not_resumed(self) -> None:
+        for die in ("die_on_cancel", "die_on_accepted"):
+            with self.subTest(die=die):
+                fake = FakeGitHub(step_minutes_ago=45, issue=False, **{die: True})
+                with self.assertRaises(RuntimeError):
+                    heal_main(fake)
+                setattr(fake, die, False)
+                fake.state.update(status="completed", conclusion="cancelled")
+                writes = len(fake.posts)
+                rc, out = heal_main(fake)
+                self.assertEqual(rc, 1, out)
+                self.assertEqual(len(fake.posts), writes)
 
     def test_no_cancel_without_a_recorded_marker(self) -> None:
         fake = FakeGitHub(step_minutes_ago=45, marker_write_fails=True, issue=False)
