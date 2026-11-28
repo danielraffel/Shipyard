@@ -314,3 +314,83 @@ fn a_pass_spawns_a_cacheable_read_once_and_a_live_read_every_time() {
     let report = pass.report();
     assert_eq!((report.rest, report.graphql, report.cache_hits), (4, 0, 2));
 }
+
+/// One applying pass over a failing pull request whose recovery is already
+/// signalled, with recovery publication on. `worker_ran` writes the worker's
+/// last-run marker into the state directory first. Returns the failing row's
+/// recovery outcome.
+fn recovery_outcome(worker_ran: bool) -> Option<String> {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fixture_gh(&temp, &log);
+    let mut observation = observation_for(fixture_pr(ADMISSIBLE, false), true);
+    observation.prs.push(fixture_pr(100, true));
+    let control = mutation_control(&temp, "studio", "studio");
+    if worker_ran {
+        crate::recovery_worker::RecoveryStore::new(
+            control.state_dir.join("merge-steward").join("recovery"),
+        )
+        .expect("store")
+        .record_worker_run(Utc::now())
+        .expect("marker");
+    }
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let report = with_recovery_publication(true, || {
+        apply_repo_plan(
+            &actions,
+            &apply_args(),
+            &observation,
+            &ledger_path,
+            &mut ledger,
+            0,
+            Some(&control),
+            None,
+        )
+        .0
+    });
+    report
+        .prs
+        .iter()
+        .find(|pr| pr.number == 100)
+        .and_then(|pr| pr.mutation.clone())
+}
+
+#[test]
+fn the_steward_stops_accepting_requests_while_no_worker_has_run() {
+    assert_eq!(
+        recovery_outcome(false).as_deref(),
+        Some("recovery_request_deferred:no_consumer")
+    );
+    // The control: with a fresh worker run the gate is open, so the request
+    // goes on to the store (and fails there for the test's non-canonical
+    // paths), never reporting a missing consumer.
+    assert_ne!(
+        recovery_outcome(true).as_deref(),
+        Some("recovery_request_deferred:no_consumer")
+    );
+}
+
+#[test]
+fn consumer_facts_read_the_store_without_creating_it() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let root = control.state_dir.join("merge-steward").join("recovery");
+    let facts = |enabled| {
+        with_recovery_publication(enabled, || {
+            crate::app::merge_steward_cmd::recovery_worker::recovery_consumer_facts(
+                Some(&control),
+                "owner/repo",
+            )
+        })
+    };
+    assert!(facts(false).is_none());
+    let empty = facts(true).expect("facts when enabled");
+    assert!(empty.oldest_unattempted.is_none() && empty.last_worker_run.is_none());
+    assert!(!root.exists());
+
+    let store = crate::recovery_worker::RecoveryStore::new(&root).expect("store");
+    let ran = Utc::now();
+    store.record_worker_run(ran).expect("marker");
+    assert_eq!(facts(true).expect("facts").last_worker_run, Some(ran));
+}

@@ -379,6 +379,14 @@ fn enqueue_recovery(
             );
         }
     };
+    // A queue nothing drains only fills: stop accepting requests until a
+    // worker has run recently. The `recovery_consumer` invariant reports it.
+    if super::recovery_worker::recovery_consumer_is_stale(&context.mutation_control.state_dir) {
+        return (
+            Some("recovery_request_deferred:no_consumer".to_owned()),
+            None,
+        );
+    }
     match enqueue_recovery_request(
         &context.mutation_control.global_dir,
         &context.mutation_control.state_dir,

@@ -329,6 +329,63 @@ pub(super) fn recovery_publication_is_enabled(
     Ok(true)
 }
 
+/// Proof of a consumer for the steward: an applying run writes the marker
+/// whether or not it finds work; a dry run writes nothing.
+fn note_worker_run(store: &RecoveryStore, apply: bool) -> Result<(), CliFailure> {
+    if !apply {
+        return Ok(());
+    }
+    store
+        .record_worker_run(chrono::Utc::now())
+        .map_err(|error| CliFailure::new(1, format!("failed to record worker run: {error}")))
+}
+
+#[cfg(test)]
+mod consumer_marker_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_applying_run_writes_the_marker() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RecoveryStore::new(temp.path()).expect("store");
+        note_worker_run(&store, false).expect("dry run");
+        assert!(store.last_worker_run().is_none());
+        note_worker_run(&store, true).expect("applying run");
+        assert!(store.last_worker_run().is_some());
+    }
+}
+
+/// Whether no worker has run recently enough to consume a new request. The
+/// steward stops accepting requests while this holds.
+pub(super) fn recovery_consumer_is_stale(state_dir: &Path) -> bool {
+    RecoveryStore::new(recovery_store_root(state_dir)).map_or(true, |store| {
+        crate::recovery_worker::worker_is_stale(store.last_worker_run(), chrono::Utc::now())
+    })
+}
+
+/// What the `recovery_consumer` invariant reads, or `None` when recovery
+/// publication is off or the store cannot be read (the invariant is then
+/// not evaluated). Read-only: it never creates the store.
+pub(super) fn recovery_consumer_facts(
+    control: Option<&super::MutationControl>,
+    repo: &str,
+) -> Option<super::invariants::RecoveryConsumerFacts> {
+    let control = control?;
+    let (global_dir, state_dir) = (&control.global_dir, &control.state_dir);
+    if !recovery_publication_is_enabled(global_dir, state_dir, repo).ok()? {
+        return None;
+    }
+    let root = recovery_store_root(state_dir);
+    if !root.exists() {
+        return Some(super::invariants::RecoveryConsumerFacts::default());
+    }
+    let store = RecoveryStore::new(root).ok()?;
+    Some(super::invariants::RecoveryConsumerFacts {
+        oldest_unattempted: store.oldest_unattempted_pending().ok()?,
+        last_worker_run: store.last_worker_run(),
+    })
+}
+
 /// Persist one deterministic exact-head recovery request after the steward has
 /// already written and revalidated its needs-agent signal.
 ///
@@ -593,6 +650,7 @@ fn process_durable_requests<W: Write>(
     }
     let store = RecoveryStore::new(&store_root)
         .map_err(|error| CliFailure::new(1, format!("failed to open recovery store: {error}")))?;
+    note_worker_run(&store, apply)?;
     // Reconciliation is a terminal state transition. It must share the same
     // global lease as model execution so an active worker cannot be expired
     // while it is finishing bounded post-model validation or persistence.

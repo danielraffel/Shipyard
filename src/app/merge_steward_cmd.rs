@@ -1871,6 +1871,7 @@ fn steward_repo_observed(
                     &args.approval_context,
                     &invariants::state_path(ledger_path),
                     args.apply,
+                    recovery_worker::recovery_consumer_facts(mutation_control, repo),
                     Utc::now(),
                 );
             }
