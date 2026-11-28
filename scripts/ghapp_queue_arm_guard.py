@@ -1403,6 +1403,289 @@ def _rest_check_runs(repo: str, head: str, check: str) -> list[dict[str, Any]]:
     return runs
 
 
+# ---------------------------------------------------------------------------
+# Review items: exceptions a base's own guard leaves for the reviewer.
+# ---------------------------------------------------------------------------
+
+# `[auto_merge]` keys. Both unset is off: nothing below is read. A base that
+# sets one sets both, or every head is refused.
+REVIEW_ITEMS_CHECK_KEY = "review_items_check"
+REVIEW_ITEMS_WORKFLOW_KEY = "review_items_workflow"
+# The only event whose run is trusted: ``pull_request_target`` always runs the
+# default branch's definition of the workflow, never the pull request's.
+REVIEW_ITEMS_EVENT = "pull_request_target"
+# The one annotation on the items job's own check run that lists the items.
+REVIEW_ITEMS_TITLE = "review-items"
+_REVIEW_ITEM_LINE = re.compile(r"review-item: ([a-z][a-z0-9-]*:\S{1,240})")
+_REVIEW_ITEMS_COUNT = re.compile(r"review-items-count: (0|[1-9][0-9]{0,3})")
+# One line of the accept trailer: exactly this, from column 0, nothing else on the line.
+_ACCEPT_TRAILER_LINE = re.compile(r"accept-review-item: (\S+)")
+_WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
+_CHECK_RUN_URL = re.compile(r"https://api\.github\.com/repos/([^/]+/[^/]+)/check-runs/([0-9]+)")
+# Set by _review_gate once the policy and the verdicts are read, for
+# _review_items_checked; cleared by review_gate.
+REVIEW_CONTEXT: dict[str, Any] = {}
+# One read per head and policy in a process: the status judges every open
+# pull request sharing a head, and their items are the same.
+_REVIEW_ITEMS_CACHE: dict[tuple[str, str, str, str], tuple[str, Any]] = {}
+
+
+def review_items_policy(section: dict[str, Any]) -> dict[str, str] | None:
+    """``{"check", "workflow"}`` from ``[auto_merge]``, ``None`` when off, or
+    ``{"error"}`` for a half or malformed setting, which refuses every head
+    (``_review_items_checked``): a base that asks for review items is never
+    judged without them. Only the gate refuses; posting a verdict does not."""
+    try:
+        return _review_items_policy(section)
+    except GuardError as error:
+        return {"error": str(error)}
+
+
+def _review_items_policy(section: dict[str, Any]) -> dict[str, str] | None:
+    check = section.get(REVIEW_ITEMS_CHECK_KEY)
+    workflow = section.get(REVIEW_ITEMS_WORKFLOW_KEY)
+    if check is None and workflow is None:
+        return None
+    if not (isinstance(check, str) and check.strip() and check == check.strip()
+            and len(check) <= 255):
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] {REVIEW_ITEMS_CHECK_KEY} "
+                         f"must be the items job's check-run name, not {check!r}")
+    if not (isinstance(workflow, str) and _WORKFLOW_PATH.fullmatch(workflow)):
+        raise GuardError(f"the base's .shipyard/config.toml [auto_merge] "
+                         f"{REVIEW_ITEMS_WORKFLOW_KEY} must name the workflow file that posts "
+                         f"`{check}` (for example \".github/workflows/review-items.yml\"), not "
+                         f"{workflow!r}: any workflow can post a check run of that name")
+    return {"check": check, "workflow": workflow}
+
+
+def parse_review_items(message: Any) -> list[str] | str:
+    """The ids an items annotation lists, or why it is malformed.
+
+    Every non-blank line is ``review-item: <id>`` or the one
+    ``review-items-count: <n>`` line, and ``n`` is the number of ids, so a
+    truncated or appended list never reads as a shorter one."""
+    if not isinstance(message, str):
+        return "its message is not text"
+    items: list[str] = []
+    counts: list[int] = []
+    for line in message.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        item = _REVIEW_ITEM_LINE.fullmatch(line)
+        count = _REVIEW_ITEMS_COUNT.fullmatch(line)
+        if item is not None:
+            if item.group(1) in items:
+                return f"it lists {item.group(1)} twice"
+            items.append(item.group(1))
+        elif count is not None:
+            counts.append(int(count.group(1)))
+        else:
+            return f"line {line[:80]!r} is neither `review-item: <id>` nor `review-items-count: <n>`"
+    if len(counts) != 1:
+        return f"it has {len(counts)} `review-items-count:` lines, not exactly one"
+    if counts[0] != len(items):
+        return f"it counts {counts[0]} items but lists {len(items)}"
+    return items
+
+
+def _listing(path: str, key: str, what: str) -> list[dict[str, Any]]:
+    """Every row of a paginated ``{total_count, <key>: [...]}`` listing, or
+    ``GuardError`` when a page, a row or the count is unreadable or the rows
+    fall short of the count (a missing row could be the one that decides)."""
+    value = run_real_gh(["api", "--paginate", "--slurp", path])
+    pages = value if isinstance(value, list) else [value]
+    rows: list[dict[str, Any]] = []
+    total = 0
+    for page in pages:
+        listed = page.get(key) if isinstance(page, dict) else None
+        count = page.get("total_count") if isinstance(page, dict) else None
+        if (not isinstance(listed, list) or type(count) is not int or count < 0
+                or not all(isinstance(row, dict) for row in listed)):
+            raise GuardError(f"{what} are unreadable")
+        rows.extend(listed)
+        total = max(total, count)
+    if len(rows) < total:
+        raise GuardError(f"{what} are incomplete: {len(rows)} of {total} read")
+    return rows
+
+
+def read_review_items(repo: str, head: str, items: dict[str, str]) -> tuple[str, Any]:
+    """``("ok", [ids])``, ``("waiting", why)`` or ``("refused", why)`` for
+    ``head``; ``GuardError`` when GitHub's answer cannot be read.
+
+    The items come only from the newest ``pull_request_target`` run of the
+    configured workflow file on the exact head, which runs the default
+    branch's definition. Its job named ``check`` (from that run's own job
+    listing, never a check run found by name: a check run another workflow
+    creates through the API can carry any name and details URL) must have
+    succeeded and carry exactly one ``review-items`` annotation. Annotations
+    can only be added to a check run, never removed, so another workflow
+    writing to it can only add items or a second list, which refuses."""
+    key = (repo.lower(), head.lower(), items["check"], items["workflow"])
+    if key in _REVIEW_ITEMS_CACHE:
+        return _REVIEW_ITEMS_CACHE[key]
+    check, workflow = items["check"], items["workflow"]
+    runs = _listing(f"repos/{repo}/actions/runs?head_sha={head}&event={REVIEW_ITEMS_EVENT}"
+                    "&per_page=100", "workflow_runs", f"the workflow runs on {head[:12]}")
+    counting = []
+    for run in runs:
+        if (not is_number_id(run.get("id")) or not isinstance(run.get("path"), str)
+                or not isinstance(run.get("event"), str) or not isinstance(run.get("head_sha"), str)):
+            raise GuardError(f"the workflow runs on {head[:12]} contain a malformed run")
+        # A run of another file, event or head says nothing about this head's
+        # items, whatever it is named.
+        if (run["path"] == workflow and run["event"] == REVIEW_ITEMS_EVENT
+                and run["head_sha"].lower() == head.lower()):
+            counting.append(run)
+    if not counting:
+        result: tuple[str, Any] = ("waiting", f"no {REVIEW_ITEMS_EVENT} run of {workflow} on "
+                                              f"head {head[:12]} yet")
+        # Cached too: the judgement is for one moment, and every pull request sharing the head
+        # is judged in it.
+        _REVIEW_ITEMS_CACHE[key] = result
+        return result
+    run = max(counting, key=lambda row: row["id"])
+    run_id = run["id"]
+    if run.get("status") != "completed":
+        result = ("waiting", f"{workflow} run {run_id} has not completed")
+        _REVIEW_ITEMS_CACHE[key] = result
+        return result
+    if run.get("conclusion") != "success":
+        result = ("refused", f"{workflow} run {run_id} concluded {run.get('conclusion')}")
+        _REVIEW_ITEMS_CACHE[key] = result
+        return result
+    jobs = _listing(f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100", "jobs",
+                    f"the jobs of run {run_id}")
+    named = [job for job in jobs if job.get("name") == check]
+    if len(named) != 1:
+        result = ("refused", f"{workflow} run {run_id} has {len(named)} jobs named `{check}`, "
+                             "not exactly one")
+        _REVIEW_ITEMS_CACHE[key] = result
+        return result
+    job = named[0]
+    url = _CHECK_RUN_URL.fullmatch(str(job.get("check_run_url") or ""))
+    if (job.get("run_id") != run_id or str(job.get("head_sha") or "").lower() != head.lower()
+            or url is None or url.group(1).lower() != repo.lower()):
+        raise GuardError(f"job `{check}` of run {run_id} is malformed")
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        result = ("refused", f"job `{check}` of run {run_id} is {job.get('status')} "
+                             f"{job.get('conclusion')}, not completed success")
+        _REVIEW_ITEMS_CACHE[key] = result
+        return result
+    annotations = _rest_pages(f"repos/{repo}/check-runs/{url.group(2)}/annotations?per_page=100")
+    lists = [row for row in annotations if row.get("title") == REVIEW_ITEMS_TITLE]
+    if len(lists) != 1:
+        result = ("refused", f"job `{check}` of run {run_id} carries {len(lists)} "
+                             f"`{REVIEW_ITEMS_TITLE}` annotations, not exactly one")
+        _REVIEW_ITEMS_CACHE[key] = result
+        return result
+    parsed = parse_review_items(lists[0].get("message"))
+    result = (("refused", f"the `{REVIEW_ITEMS_TITLE}` annotation of job `{check}` (run "
+                          f"{run_id}) is malformed: {parsed}")
+              if isinstance(parsed, str) else ("ok", parsed))
+    _REVIEW_ITEMS_CACHE[key] = result
+    return result
+
+
+def is_number_id(value: Any) -> bool:
+    return type(value) is int and 0 < value < 2 ** 63
+
+
+def accepted_review_items(body: str) -> set[str]:
+    """Ids a verdict body accepts: only its machine-written trailer, the contiguous run of lines
+    that are exactly ``accept-review-item: <id>`` ending on the line right before the body's last
+    ``reviewer:`` line (which sits above the ``session:`` lines, the stamp and the final
+    ``verdict: APPROVE head:<sha>``). An accept line anywhere else counts for nothing, whatever
+    Markdown surrounds it, so no fence, quote, list or indentation can make text the reviewer
+    quoted read as an acceptance. A body with no ``reviewer:`` line accepts nothing."""
+    lines = body.splitlines()
+    signer = [i for i, line in enumerate(lines) if _SIGNER_LINE.fullmatch(line)]
+    found: set[str] = set()
+    if not signer:
+        return found
+    for line in reversed(lines[:signer[-1]]):
+        match = _ACCEPT_TRAILER_LINE.fullmatch(line)
+        if match is None:
+            break
+        found.add(match.group(1))
+    return found
+
+
+def _accepting_body(classification: dict[str, Any], head: str) -> str | None:
+    """The body of the counting exact-head APPROVE comment that allowed
+    ``head``, or ``None``: a carried approval, a rollup, an admission, an
+    APPROVED review and a ``reviewed:`` marker accept no item."""
+    approval = classification.get("approval")
+    if (not isinstance(approval, dict) or approval.get("verdict_comment_id") is None
+            or str(approval.get("approved_head") or "").lower() != head.lower()):
+        return None
+    for comment in REVIEW_CONTEXT.get("comments") or []:
+        body = comment.get("body")
+        if comment.get("id") != approval["verdict_comment_id"] or not isinstance(body, str):
+            continue
+        lines = [line for line in body.splitlines() if line.strip()]
+        match = _MARKER.match(lines[-1]) if lines else None
+        if (match is None or match.group(2) != "APPROVE" or match.group(3) != head.lower()
+                or comment_edited(comment)):
+            return None
+        return body
+    return None
+
+
+def _review_items_checked(classification: dict[str, Any], repo: str | None,
+                          result: tuple[bool, str, dict[str, Any] | None]
+                          ) -> tuple[bool, str, dict[str, Any] | None]:
+    """``result``, refused unless every review item of the head is accepted
+    by the exact-head APPROVE that allowed it. Off (``result`` unchanged, and
+    nothing read) when the base sets no ``review_items_check``."""
+    items_policy = REVIEW_CONTEXT.get("review_items")
+    if not items_policy:
+        return result
+    repo = classification.get("repo") or repo
+    number = classification.get("pr")
+    head = str(classification.get("head") or "").lower()
+    label = f"PR #{number}"
+    number_int = int(number) if isinstance(number, int) else 0
+    if "error" in items_policy:
+        return False, f"{label} ({repo}): {items_policy['error']}", review_fix(
+            "review_items_refused", items_policy["error"], str(repo), number_int, head,
+            f"fix [auto_merge] in the default branch's .shipyard/config.toml of {repo}", False)
+    read = (f"ghapp api 'repos/{repo}/actions/runs?head_sha={head}&event={REVIEW_ITEMS_EVENT}' "
+            f"(the {items_policy['workflow']} run's `{items_policy['check']}` job)")
+    try:
+        state, found = read_review_items(str(repo), head, items_policy)
+    except GuardError as error:
+        why = f"its review items cannot be read ({error})"
+        return False, f"{label} ({repo}): {why}", review_fix(
+            "review_items_unreadable", why, str(repo), number_int, head, read, True)
+    if state == "waiting":
+        return False, f"{label} ({repo}): awaiting review items: {found}", review_fix(
+            "review_items_pending", found, str(repo), number_int, head, read, True)
+    if state == "refused":
+        return False, f"{label} ({repo}): review items refused: {found}", review_fix(
+            "review_items_refused", found, str(repo), number_int, head, read, False)
+    classification["review_items"] = list(found)
+    if not found:
+        return result
+    body = _accepting_body(classification, head)
+    accepted = accepted_review_items(body) if body is not None else set()
+    missing = [item for item in found if item not in accepted]
+    if not missing:
+        return result[0], f"{result[1]}; it accepts all {len(found)} review items", result[2]
+    why = (f"unaccepted review items: {', '.join(missing)}; the exact-head APPROVE must carry "
+           "`accept-review-item: <id>` for each"
+           + ("" if body is not None else
+              " (an approval carried from another head, a rollup, an admission or an APPROVED "
+              "review accepts none)"))
+    return False, f"{label} ({repo}): {why}", review_fix(
+        "review_items_unaccepted", why, str(repo), number_int, head,
+        f"a reviewer reviews each item and posts a new comment on "
+        f"https://github.com/{repo}/pull/{number} whose trailer, the lines right above its "
+        f"`reviewer:` line, is one `accept-review-item: <id>` line per item, then the "
+        f"`reviewer:` and `verdict: APPROVE head:{head}` lines", False)
+
+
 def review_policy(config_text: str | None, repo: str, host_default: bool) -> dict[str, Any]:
     """``{required, reviewers, any_but_author}`` from the base's config text.
 
@@ -1540,6 +1823,8 @@ def review_policy(config_text: str | None, repo: str, host_default: bool) -> dic
         # authority until both protected-base fields are present.
         "claim_receipt": claim_receipt.strip() if isinstance(claim_receipt, str) else None,
         "claim_app": claim_app.strip() if isinstance(claim_app, str) else claim_app,
+        # The base's review-items check (see read_review_items); None is off.
+        "review_items": review_items_policy(section),
     }
 
 
@@ -3682,9 +3967,14 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
     a landing ever logs a carry. Same as src/head_approval.rs ``dry_run``."""
     EXCLUDED_APPROVALS.clear()
     HELD_EXCLUSIONS.clear()
+    REVIEW_CONTEXT.clear()
     result = _review_gate(classification, repo, dry_run)
     if result[0]:
         result = _edit_checked(classification, repo, result)
+    if result[0]:
+        # Last, so the APPROVE whose acceptances count is the one that
+        # survived every other rule, the edit check included.
+        result = _review_items_checked(classification, repo, result)
     if HELD_EXCLUSIONS:
         classification["held_exclusions"] = sorted(set(HELD_EXCLUSIONS))
         print(f"queue-arm-guard: note: PR #{classification.get('pr')}: "
@@ -3802,6 +4092,7 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
                 f"retarget https://github.com/{repo}/pull/{number} to {default}", False)
         config_text = base_config_text(repo, default)
         policy = review_policy(config_text, repo, True)
+        REVIEW_CONTEXT["review_items"] = policy.get("review_items")
         if not policy["required"] and not host_requires_guard():
             # A host that requires guard admission never takes this early
             # return: a base cannot opt out of review to dodge the host rule
@@ -3819,6 +4110,7 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         if not is_login(author):
             raise GuardError("the pull request names no canonical author login")
         comments, reviews = verdict_listing(repo, number)
+        REVIEW_CONTEXT["comments"] = comments
     except GuardError as error:
         return False, (
             f"{label}: cannot read what its review requires ({error}); refusing to land it unreviewed"

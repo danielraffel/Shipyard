@@ -30,7 +30,8 @@ disagree:
   unlisted_stamp_session`; codes include `unattributed`, `uncounted_signer`,
   `not_exact_head`). Branch protection treats `pending` as unsatisfied exactly
   like `failure`, so nothing merges without an approval; `failure` is kept for a
-  counted HOLD or an unreadable review. The job (the required check run) still
+  counted HOLD, an unreadable review, or a review-items run that failed or
+  cannot be read (see Review items). The job (the required check run) still
   fails while awaiting, so that check cannot read as satisfied; it carries a
   notice saying there is nothing for the author to do;
 - whose verdict counts is the guard's rule: the base's `reviewer_identities`,
@@ -46,7 +47,9 @@ rebase only when the diff keeps its `git patch-id --stable`, the files and
 their statuses are the same, the base touched none of them and each keeps its
 approved blob and mode, and no required check on the new head was skipped,
 neutral or reused a receipt. `shipyard review-verdict --pr N --json` gives the
-same answer from the command line (Rust, `crate::review_verdict`).
+same answer from the command line (Rust, `crate::review_verdict`), except
+for review items, which only this status and the queue-arm guard read (see
+Review items).
 
 Signers come only from the base: the status reads no host's
 `reviewer-signers.json`. An App APPROVE counts only with a `reviewer: <name>`
@@ -329,6 +332,176 @@ The `check_run` trigger re-judges a head when its admission run completes,
 so the status follows admission without a new push. Only runs named
 `fleet-guard/admission` start the job; a base that renames the check also
 edits that `if:`.
+
+## Review items
+
+A base's own guards can leave exceptions for the reviewer instead of the
+author: a regenerated serialized hotspot, a header whose compile fan-out grew
+past its ceiling. Each is a review item with a stable id, such as
+`hotspot:docs/status/consumption-profiles.json` or
+`fanout:core/audio/include/pulp/audio/buffer.hpp:+12`. With two keys on the
+default branch's `.shipyard/config.toml`, this status, and the `ghapp`
+queue-arm guard, require the reviewer to accept every item:
+
+```toml
+[auto_merge]
+review_items_check = "review-items"                       # the items job's name
+review_items_workflow = ".github/workflows/review-items.yml"
+```
+
+Both unset is off, and nothing below is read. Setting one without the other,
+an empty name, or a workflow path outside `.github/workflows/` refuses every
+head.
+
+**Where the items come from.** Only the newest `pull_request_target` run of
+exactly `review_items_workflow` on the exact head counts. Its job named
+`review_items_check`, taken from that run's own job listing, must have
+completed `success`. Its job check run must carry exactly one annotation
+titled `review-items`, whose message is one `review-item: <id>` line per item
+and one `review-items-count: <n>` line:
+
+```
+review-item: hotspot:docs/status/consumption-profiles.json
+review-item: fanout:core/audio/include/pulp/audio/buffer.hpp:+12
+review-items-count: 2
+```
+
+A job prints it with one workflow command, newlines encoded as `%0A`:
+`::notice title=review-items::review-item: hotspot:docs/x.json%0Areview-items-count: 1`.
+An id is a lowercase kind, a colon, and up to 240 non-space characters.
+
+**The producer's contract.** The reader takes the newest run of the file on
+the head sha, from whichever pull request's event started it, and does not
+bind that run to the pull request it judges. That is sound only when the
+items job keeps three rules:
+
+1. It analyses exactly `github.event.pull_request.head.sha`, never a branch
+   or `refs/pull/N/head`. Otherwise another pull request can push the same
+   sha, then a clean commit before the job fetches, and leave a newer run on
+   that sha that lists no items.
+2. The list depends only on that sha and the default branch. It never reads
+   the event's base ref or sha, labels, title, body or number. Otherwise a
+   second pull request on the same head, into a base its author chose, yields
+   a newer run with a shorter list.
+3. No step writes head-derived text to its log, stdout or stderr. The list is
+   a log line, so a head-controlled line starting
+   `::notice title=review-items::` is a second list (refused), and a
+   `::stop-commands::` line or the per-job annotation cap could suppress the
+   real one. Redirect the step that computes the items, for example
+   `review_items.py items ... > "$RUNNER_TEMP/items.log" 2>&1`, and print only
+   the list.
+
+Why this chain and not a check run found by name:
+
+- `pull_request_target` always runs the default branch's definition of the
+  workflow (on github.com since GitHub's December 2025 change; before it, the
+  pull request's base branch copy ran). A `pull_request` run runs the head's
+  copy, which the pull request can rewrite to list no items.
+- Every Actions check run has the app `github-actions`, so the app alone
+  distinguishes nothing. A check run created through the API with a
+  workflow's token can carry any name, output and details URL, and GitHub
+  may file it in any Actions check suite on the head. Only the run's job
+  listing says which check run is that run's job.
+- An Actions job's own check run has no `output.title`, `summary` or `text`,
+  so the list rides on an annotation. Annotations can only be added to a
+  check run, never removed, so another workflow writing to it can add an
+  item or a second list, both of which refuse, but cannot shorten the list.
+
+| Items run on the head | Result |
+|---|---|
+| none from that file and event, or the newest is queued or in progress | `pending` (`awaiting the review items check for head <sha>`) |
+| newest completed with any conclusion but `success` | `failure` |
+| not exactly one job of that name, or the job did not succeed | `failure` |
+| not exactly one `review-items` annotation, or a malformed one (a stray line, a duplicate id, no count or a wrong count) | `failure` |
+| any listing unreadable or short of its `total_count` | `failure` |
+| a well-formed list | judged against the verdict, below: `success` when every item is accepted, else `pending` naming the unaccepted ids |
+
+**Accepting an item.** The exact-head APPROVE comment that allows the head
+under every other rule here (signers, stamp sessions, never edited, newest
+wins, no HOLD) must carry a machine-written trailer: one line per id, ending on
+the line right before its last `reviewer:` line:
+
+```
+accept-review-item: hotspot:docs/status/consumption-profiles.json
+accept-review-item: fanout:core/audio/include/pulp/audio/buffer.hpp:+12
+reviewer: pulp-review
+<!-- session: ... -->   (written by ghapp)
+verdict: APPROVE head:<sha>
+```
+
+Only that trailer counts: the contiguous run of lines that are exactly
+`accept-review-item: <id>` (column 0, one space, nothing else on the line)
+directly above the `reviewer:` line. An accept line anywhere else in the body
+counts for nothing, whatever Markdown surrounds it: in prose, a quote, a code
+block, a list, after a blank line, or indented. So a reviewer quoting a pull
+request's text can never accept an item by accident, and no Markdown is
+parsed. The fleet's verdict sender writes the trailer from a structured field
+of the reviewer's verdict, never from its prose. Extra accepts
+are ignored. A missing one keeps the head `pending`, since only the reviewer
+can fix it with a new verdict, and the description names what is unaccepted
+(`awaiting reviewer acceptance of review items: <id>, ...`). Nothing else accepts an
+item: an approval carried from an earlier head (merge-only or rebase), a
+rollup, a guard-mode admission, an `APPROVED` review and a `reviewed: <sha>`
+marker all accept none, so a head with items needs its own new verdict. A
+head with no items needs no accept lines.
+
+The items are read once per head and judged for every open pull request
+whose head it is, against that pull request's own deciding APPROVE, on every
+path that posts this status, including a backfill that runs the script once
+per pull request. A status that is `success` therefore already includes the
+items; no later step has to correct it.
+
+**Re-judging.** The items run finishes after the head is pushed, so the
+repository's `review-verdict.yml` lists the items workflow under
+`workflow_run` (the job's `if:` lets that event through):
+
+```yaml
+  workflow_run:
+    workflows: [Review verdict trigger, Review items]
+    types: [completed]
+```
+
+`workflows:` takes the workflow's `name:`, not its file.
+
+**Limits.** The items are computed when the items run ran (the head's push,
+or a re-run), against the default branch at that moment. A base change after
+that, such as a newly registered hotspot, is not seen until the items run is
+re-run. `shipyard review-verdict` (Rust, `crate::review_verdict`) and the
+steward's own gate do not read review items yet, so on such a base they can
+report a head allowed that this status refuses. The status is the required
+check and decides the landing. The fleet's reviewer dispatcher is
+fleet-handbook's `scripts/pass-runner/must-review.py` on m3 (`shipyard
+reviewer-dispatch observe` has no installed caller). It skips every head with
+a counted exact-head APPROVE, so an APPROVE that forgets an accept line would
+never go back to a reviewer, and the head would wait with no owner. A
+reviewer brief is not a recovery path (docs/autonomy-contract.md, A3 and A12),
+so this is a prerequisite: no base sets the keys until the `must-review.py`
+change that lists such a head again is deployed on m3. It lists a head whose
+newest `review-verdict` status is `pending` reading `awaiting reviewer
+acceptance of review items` or `awaiting the review items check for head`, at
+most twice per head, and keeps skipping it when the status cannot be read.
+
+**Permissions.** The reader lists Actions runs and jobs and reads check-run
+annotations, so the `review-verdict` job needs `actions: read` (or `write`)
+and `checks: read`, and the fleet App the same scopes for the host
+queue-arm guard. Without them every head on such a base fails closed.
+
+**Rollout order.** A Shipyard script from before review items ignores the two
+keys, so setting them first leaves the status unenforced with no error.
+
+1. Land this change, and deploy the `must-review.py` prerequisite above on m3.
+2. Bump the repository's pinned Shipyard commit in `review-verdict.yml`, and in
+   the same change add `checks: read` and the items workflow's name under
+   `workflow_run`.
+3. Land the items workflow.
+4. Set `review_items_check` and `review_items_workflow` on the default branch.
+5. Run the status backfill once: a `success` posted before the keys were set
+   stands until its head is judged again.
+
+Only a `pull_request_target` run counts, so a head opened before the items
+workflow existed has no run and stays `pending` until it is pushed or the
+pull request is reopened. A manually dispatched run of the items job does
+not count.
 
 ## Rollout
 
