@@ -1198,6 +1198,8 @@ so the keychain restore runs) and re-run, inside the same 3 attempts, when its
 current step has run longer than the largest of 20 minutes, 3x that step's
 median over the last 10 green release runs, and the step's own
 `timeout-minutes` plus 5; it comments on an open `release-blocked` issue.
+Cancelling needs the repository variable `RELEASE_HEAL_CANCEL_STALLED=true`;
+without it a stall only fails the heal run with the reason.
 The macOS release build runs in its own step, "Build release binaries under a
 hard time limit" (`scripts/release_build_guard.py`): cargo stops after
 `SHIPYARD_RELEASE_BUILD_TIMEOUT_MINUTES` (20), with network retries and closed

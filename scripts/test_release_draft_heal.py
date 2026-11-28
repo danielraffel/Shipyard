@@ -288,7 +288,8 @@ class StallMainTests(unittest.TestCase):
     """main() end to end against a fake GitHub that models cancel and re-run."""
 
     def _main(self, *, step_minutes_ago: float, attempt: int = 1, dry_run: bool = False,
-              settles: bool = True, failed_rerun_restarts: bool = True, issue: bool = True):
+              settles: bool = True, failed_rerun_restarts: bool = True, issue: bool = True,
+              enabled: bool = True):
         now = datetime.now(timezone.utc)
         stamp = lambda m: (now - timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
         state = {"status": "in_progress", "conclusion": None, "run_attempt": attempt}
@@ -338,7 +339,8 @@ class StallMainTests(unittest.TestCase):
                     mock.patch.object(heal.time, "sleep", lambda s: None), \
                     mock.patch.object(heal, "CANCEL_SETTLE_SECS", 0), \
                     mock.patch.object(heal, "RERUN_CONFIRM_SECS", 0), \
-                    mock.patch.dict("os.environ", {"CI_MACOS_SIGNING_ENABLED": "true"}), \
+                    mock.patch.dict("os.environ", {"CI_MACOS_SIGNING_ENABLED": "true",
+                                                   heal.CANCEL_STALLED_ENV: "true" if enabled else ""}), \
                     mock.patch.object(sys, "argv", argv), \
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
                 rc = heal.main()
@@ -371,6 +373,12 @@ class StallMainTests(unittest.TestCase):
         rc, out, posts = self._main(step_minutes_ago=45, attempt=3)
         self.assertEqual((rc, posts), (1, []))
         self.assertIn("not cancelling", out)
+
+    def test_cancel_is_off_unless_the_variable_is_true(self) -> None:
+        rc, out, posts = self._main(step_minutes_ago=45, enabled=False)
+        self.assertEqual((rc, posts), (1, []))
+        self.assertIn("RELEASE_HEAL_CANCEL_STALLED", out)
+        self.assertIn("stalled", out)
 
     def test_dry_run_never_cancels(self) -> None:
         rc, out, posts = self._main(step_minutes_ago=45, dry_run=True)

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -35,6 +37,15 @@ def _stub_runner(calls: list[list[str]]):
 
 
 class BoundedBuildTests(unittest.TestCase):
+    def test_module_imports_without_pwd_as_on_windows(self) -> None:
+        try:
+            with mock.patch.dict(sys.modules, {"pwd": None}):
+                reloaded = importlib.reload(guard)
+                self.assertEqual(reloaded._real_home(), os.environ.get("HOME", "/"))
+        finally:
+            importlib.reload(guard)
+
+    @unittest.skipIf(shutil.which("ps") is None, "needs ps")
     def test_stalled_build_is_killed_after_writing_diagnostics(self) -> None:
         calls: list[list[str]] = []
         with tempfile.TemporaryDirectory() as temp:

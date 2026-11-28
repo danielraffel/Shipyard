@@ -43,6 +43,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CI_MACOS_SIGNING_ENABLED: ${{ vars.CI_MACOS_SIGNING_ENABLED }}
+          # Cancelling a stalled run is off unless this is 'true'; a stall is
+          # reported either way.
+          RELEASE_HEAL_CANCEL_STALLED: ${{ vars.RELEASE_HEAL_CANCEL_STALLED }}
           # Same focus release.yml builds for, so the expected asset set matches.
           CI_PLATFORM_FOCUS: ${{ vars.CI_PLATFORM_FOCUS || 'macos' }}
         run: python3 scripts/release_draft_heal.py

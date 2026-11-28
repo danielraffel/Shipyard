@@ -26,7 +26,6 @@ from __future__ import annotations
 import collections
 import contextlib
 import os
-import pwd
 import signal
 import subprocess
 import sys
@@ -35,7 +34,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Dict, Iterable, List, Optional
 
 DEFAULT_TIMEOUT_MINUTES = 20.0
 TIMEOUT_ENV = "SHIPYARD_RELEASE_BUILD_TIMEOUT_MINUTES"
@@ -52,6 +51,7 @@ MAX_SAMPLED = 4
 SECURITY_TIMEOUT_SECS = 15
 KILL_GRACE_SECS = 5.0
 KILL_WAIT_SECS = 30.0
+READER_JOIN_SECS = 10.0
 DIAGNOSTICS_BUDGET_SECS = (
     PS_TIMEOUT_SECS
     + LSOF_TIMEOUT_SECS
@@ -59,6 +59,7 @@ DIAGNOSTICS_BUDGET_SECS = (
     + 3 * SECURITY_TIMEOUT_SECS
     + KILL_GRACE_SECS
     + KILL_WAIT_SECS
+    + READER_JOIN_SECS
 )
 
 # Defaults only: a value the operator set in the environment wins.
@@ -172,13 +173,18 @@ def _stamp(started: float) -> str:
 
 
 def _real_home() -> str:
+    # `pwd` exists only on POSIX; package_release.py imports this module on
+    # Windows packaging jobs too.
     try:
+        import pwd
+
         return pwd.getpwuid(os.getuid()).pw_dir
-    except KeyError:
+    except (ImportError, KeyError, AttributeError):
         return os.environ.get("HOME", "/")
 
 
-Runner = Callable[[list[str], float, dict[str, str] | None], str]
+# typing aliases, not PEP 604 syntax: this line is evaluated at import time.
+Runner = Callable[[List[str], float, Optional[Dict[str, str]]], str]
 
 
 def _run_diagnostic(args: list[str], timeout: float, env: dict[str, str] | None = None) -> str:
@@ -341,7 +347,7 @@ def run_bounded(
             _stop_group(proc)
             raise
     finally:
-        reader.join(timeout=10)
+        reader.join(timeout=READER_JOIN_SECS)
         # A reader still blocked holds the pipe's lock; leave that pipe to it.
         if not reader.is_alive() and proc.stdout is not None:
             proc.stdout.close()

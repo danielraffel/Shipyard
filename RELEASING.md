@@ -399,7 +399,9 @@ is never cancelled, and a job with no step reported in progress is left alone.
 Heal uses a normal cancel (force-cancel would skip the keychain restore), waits
 up to 8 minutes for the run to stop, re-runs it, confirms a new attempt
 started, and comments on an open `release-blocked` issue. At attempt 3 it does
-not cancel; it fails with the reason.
+not cancel; it fails with the reason. Cancelling is off until the repository
+variable `RELEASE_HEAL_CANCEL_STALLED` is `true`; until then a stall fails the
+heal run with the same reason and nothing is cancelled.
 It only acts when `CI_MACOS_SIGNING_ENABLED=true` and never publishes or edits
 a release itself. Run `python3 scripts/release_draft_heal.py --dry-run` locally
 (with `GH_TOKEN`) to see the decision. An exhausted draft keeps Release Heal

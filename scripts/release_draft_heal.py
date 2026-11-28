@@ -52,6 +52,8 @@ CANCEL_SETTLE_SECS = 8 * 60
 CANCEL_POLL_SECS = 20
 RERUN_CONFIRM_SECS = 90
 BLOCKED_LABEL = "release-blocked"
+# Repository variable (passed as env) that lets heal cancel a stalled run.
+CANCEL_STALLED_ENV = "RELEASE_HEAL_CANCEL_STALLED"
 RELEASE_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml"
 
 
@@ -474,6 +476,12 @@ def main() -> int:
     print(f"{tag}: {decision.action}: {decision.reason}")
     if decision.action == "cancel-rerun" and not args.dry_run:
         assert stall is not None and run is not None
+        if os.environ.get(CANCEL_STALLED_ENV, "") != "true":
+            # Default off until the cancel path has run against the real
+            # repository (docs/autonomy-contract.md); the stall is still loud.
+            print(f"::error title=Release {tag} run stalled::{decision.reason}. "
+                  f"Not cancelling: repository variable {CANCEL_STALLED_ENV} is not 'true'")
+            return 1
         return cancel_and_rerun(repo, tag, run, stall)
     if decision.action == "rerun" and not args.dry_run:
         try:

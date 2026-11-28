@@ -485,6 +485,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         minutes = sorted(int(m) for m in triggers["schedule"][0]["cron"].split()[0].split(","))
         gaps = [b - a for a, b in zip(minutes, minutes[1:])] + [60 - minutes[-1] + minutes[0]]
         self.assertLessEqual(max(gaps), 10)
+        heal_env = workflow["jobs"]["heal"]["steps"][-1]["env"]
+        self.assertEqual(heal_env["RELEASE_HEAL_CANCEL_STALLED"], "${{ vars.RELEASE_HEAL_CANCEL_STALLED }}")
 
     def test_heal_step_timeout_parser_matches_yaml_for_release_workflow(self) -> None:
         import yaml
