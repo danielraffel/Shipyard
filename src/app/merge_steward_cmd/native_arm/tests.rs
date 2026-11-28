@@ -1120,42 +1120,9 @@ fn carrying_a_commit_of_11361_live_at(
     q_comments: &str,
     live_head: &str,
 ) -> String {
-    carrying_a_commit_of_11361_approved_at(
-        log,
-        q_reviews,
-        q_comments,
-        live_head,
-        "2026-10-04T01:00:00Z",
-        false,
-    )
-}
-
-/// [`carrying_a_commit_of_11361_live_at`], with this head's own approving
-/// review posted at `approved_at`.
-#[cfg(unix)]
-fn carrying_a_commit_of_11361_approved_at(
-    log: &str,
-    q_reviews: &str,
-    q_comments: &str,
-    live_head: &str,
-    approved_at: &str,
-    q_comments_fail_on_second_read: bool,
-) -> String {
     const HELD_HEAD: &str = "883bb3f600000000000000000000000000000000";
     const CARRIED: &str = "c26a23be00000000000000000000000000000000";
-    // The gate reads #11361's comments first; the HOLD-recency rule reads
-    // them again. Failing the second read leaves the gate's judgement intact.
-    let comments_arm = if q_comments_fail_on_second_read {
-        format!(
-            "n=$(cat '{log}.qc' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{log}.qc'; \
-             if [ $n -ge 2 ]; then echo 'HTTP 502' >&2; exit 1; fi; printf '%s\\n' '{q_comments}'; exit 0"
-        )
-    } else {
-        format!("printf '%s\\n' '{q_comments}'; exit 0")
-    };
-    let review = format!(
-        r#"{{"login":"someone","type":"User","at":"{approved_at}","state":"APPROVED","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#
-    );
+    let review = r#"{"login":"someone","type":"User","at":"2026-10-04T01:00:00Z","state":"APPROVED","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
     let listing = format!(
         r#"{{"data":{{"repository":{{"pullRequests":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{{"number":11361,"headRefName":"feat/real-world-inputs-t2","baseRefName":"main","headRefOid":"{HELD_HEAD}","isCrossRepository":false,"author":{{"login":"author"}},"carriedCommits":{{"totalCount":2,"nodes":[{{"commit":{{"oid":"{CARRIED}"}}}},{{"commit":{{"oid":"{HELD_HEAD}"}}}}]}}}}]}}}}}}}}"#
     );
@@ -1166,12 +1133,12 @@ case "$*" in
   *"/compare/main..."*"total_commits"*) printf '%s' '{{"total":2,"shas":["{CARRIED}","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}'; exit 0 ;;
   *carriedCommits*) printf '%s' '{listing}'; exit 0 ;;
   *pulls/11361/reviews*) printf '%s' '{q_reviews}'; exit 0 ;;
-  *issues/11361/comments*) {comments_arm} ;;
+  *issues/11361/comments*) printf '%s\n' '{q_comments}'; exit 0 ;;
   *commits/{HELD_HEAD}*) printf '%s' '2026-10-03T00:00:00Z'; exit 0 ;;
   *isInMergeQueue*number=11361*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":11361,"state":"OPEN","headRefOid":"{live_head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
 esac
 {}"#,
-        approval_required(log, &review)
+        approval_required(log, review)
     )
 }
 
@@ -1231,143 +1198,6 @@ fn the_backstop_never_arms_a_head_carrying_another_prs_held_commit() {
         assert_eq!(
             reports[0].blocked.blocked_on,
             "carries_unapproved_commits:#11361"
-        );
-    }
-}
-
-/// The same held #11361, but this head was approved after the HOLD: its
-/// review covered the carried commit, so the backstop arms it. Read from the
-/// live verdict records, not from labels or numbers.
-#[cfg(unix)]
-#[test]
-fn the_backstop_arms_a_head_approved_after_the_carried_prs_hold() {
-    let held_head = "883bb3f600000000000000000000000000000000";
-    let hold = format!(
-        r#"{{"id":777,"login":"someone","type":"User","at":"2026-10-04T02:00:00Z","body":"verdict: HOLD head:{held_head}"}}"#
-    );
-    for (approved_at, armed) in [
-        ("2026-10-04T03:00:00Z", true),
-        ("2026-10-04T02:00:00Z", false),
-    ] {
-        let temp = tempfile::tempdir().expect("temp");
-        let log = temp.path().join("calls.log");
-        let actions = fake_gh(
-            &temp,
-            &carrying_a_commit_of_11361_approved_at(
-                &log.display().to_string(),
-                "",
-                &hold,
-                held_head,
-                approved_at,
-                false,
-            ),
-        );
-        let observation = observation(pr_row(&serde_json::json!({})), true);
-        let reports = report(StewardDecision::Unmanaged);
-        let (status, _) = apply_native_arm_backstop(
-            &actions,
-            &observation,
-            &reports,
-            "shipyard:no-auto-merge",
-            true,
-            no_authority_needed,
-        );
-        let expected = if armed { "armed" } else { "skipped" };
-        assert_eq!(
-            status.results[0].outcome, expected,
-            "approved at {approved_at}: {status:?}"
-        );
-    }
-}
-
-/// The HOLD-recency rule's second read of #11361's comments fails: the head
-/// is not armed and fails closed with `carried_commits_unreadable:#11361`.
-#[cfg(unix)]
-#[test]
-fn the_backstop_fails_closed_when_the_hold_history_is_unreadable() {
-    let held_head = "883bb3f600000000000000000000000000000000";
-    let hold = format!(
-        r#"{{"id":777,"login":"someone","type":"User","at":"2026-10-04T02:00:00Z","body":"verdict: HOLD head:{held_head}"}}"#
-    );
-    for (fail, expected) in [
-        (true, "carried_commits_unreadable:#11361"),
-        (false, "carries_unapproved_commits:#11361"),
-    ] {
-        let temp = tempfile::tempdir().expect("temp");
-        let log = temp.path().join("calls.log");
-        let actions = fake_gh(
-            &temp,
-            &carrying_a_commit_of_11361_approved_at(
-                &log.display().to_string(),
-                "",
-                &hold,
-                held_head,
-                "2026-10-04T01:00:00Z",
-                fail,
-            ),
-        );
-        let observation = observation(pr_row(&serde_json::json!({})), true);
-        let reports = report(StewardDecision::Unmanaged);
-        let (status, _) = apply_native_arm_backstop(
-            &actions,
-            &observation,
-            &reports,
-            "shipyard:no-auto-merge",
-            true,
-            no_authority_needed,
-        );
-        assert_eq!(status.results[0].outcome, "skipped", "{status:?}");
-        let Some(crate::auto_arm::ArmSkip::CarriedCommits { blocked_on, .. }) =
-            &status.results[0].skip
-        else {
-            panic!("{status:?}");
-        };
-        assert_eq!(blocked_on, expected, "second read fails: {fail}");
-    }
-}
-
-/// #11361 was held at an older head after this head's approval and has since
-/// moved to a head with no verdict: the older HOLD still refuses. Held
-/// before the approval, it does not.
-#[cfg(unix)]
-#[test]
-fn the_backstop_counts_a_hold_on_an_older_head_of_the_carried_pr() {
-    let held_head = "883bb3f600000000000000000000000000000000";
-    let older = "9999999900000000000000000000000000000000";
-    for (hold_at, armed) in [
-        ("2026-10-04T02:00:00Z", false),
-        ("2026-10-04T00:30:00Z", true),
-    ] {
-        let hold = format!(
-            r#"{{"id":777,"login":"someone","type":"User","at":"{hold_at}","body":"verdict: HOLD head:{older}"}}"#
-        );
-        let temp = tempfile::tempdir().expect("temp");
-        let log = temp.path().join("calls.log");
-        let actions = fake_gh(
-            &temp,
-            &carrying_a_commit_of_11361_approved_at(
-                &log.display().to_string(),
-                "",
-                &hold,
-                held_head,
-                "2026-10-04T01:00:00Z",
-                false,
-            ),
-        );
-        let observation = observation(pr_row(&serde_json::json!({})), true);
-        let reports = report(StewardDecision::Unmanaged);
-        let (status, _) = apply_native_arm_backstop(
-            &actions,
-            &observation,
-            &reports,
-            "shipyard:no-auto-merge",
-            true,
-            no_authority_needed,
-        );
-        let expected = if armed { "armed" } else { "skipped" };
-        assert_eq!(
-            status.results[0].outcome, expected,
-            "HOLD at {hold_at}: {status:?}"
         );
     }
 }

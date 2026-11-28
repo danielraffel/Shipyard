@@ -1,21 +1,17 @@
-//! The HOLD-recency rule end to end: P is refused for a commit it shares
-//! with another open pull request Q only while some counting HOLD, on any
-//! head of Q's or of P's own, is at least as new as P's exact-head APPROVE.
-//! Labels, opening order and ancestry never clear a HOLD. The fixtures are
-//! the live shapes from Generous-Corp/pulp (#12982, #12930, #12884) and
-//! Generous-Corp/vellum (#798, #800, #801, #811 under #803 and #805), a child
-//! that merges two parents, and the two shapes the review of #1754 named.
-//! Each admitted shape has a control that adds or retimes one HOLD and is
-//! refused, so a pass cannot come from a read failing closed or open.
+//! Ownership by first arrival, end to end. P is refused for a commit it
+//! shares with an open pull request Q that Q introduced, unless P's branch
+//! held that commit strictly before Q's branch did, by the repository
+//! activity log. A stacked child that targets the base therefore never blocks
+//! its parent, held or not, while a commit that came to P from Q always
+//! refuses P until Q is approved, however recent P's approval or however old
+//! Q's HOLD. The fixtures are the live shapes from Generous-Corp/pulp (#12982,
+//! #12930, #12884) and Generous-Corp/vellum (#798, #800, #801, #811 under
+//! #803 and #805), a child that merges two parents, and the shapes the
+//! reviews of #1754 named (1754-r1-f1, 1754-r1-f2).
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-
-use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use super::{Judgement, OpenPr, PassCache, Refusal, recency_judgement, refusal_with};
-use crate::head_approval::{HoldRecord, VerdictHistory};
+use super::{Judgement, OpenPr, PassCache, Refusal, refusal_with};
 
 const BASE_TIP: &str = "b000000000000000000000000000000000000000";
 
@@ -78,53 +74,43 @@ fn compare(range: &[Node], parents: bool) -> String {
     .to_string()
 }
 
-/// `2026-11-27T<hour>:00:00Z`.
-fn at(hour: u32) -> DateTime<Utc> {
-    format!("2026-11-27T{hour:02}:00:00Z")
-        .parse()
-        .expect("time")
+/// Each row's branch created once, at its head, in the order `numbers` gives.
+fn created_in_order(rows: &[Row], numbers: &[u64]) -> Vec<(u64, Vec<(u32, &'static str)>)> {
+    numbers
+        .iter()
+        .enumerate()
+        .map(|(index, number)| {
+            let row = rows.iter().find(|row| row.number == *number).expect("row");
+            (
+                *number,
+                vec![(u32::try_from(index).expect("small") + 1, row.head)],
+            )
+        })
+        .collect()
 }
 
-/// Every pull request's verdicts, by number; a missing one has none.
-#[derive(Clone, Default)]
-struct Verdicts(BTreeMap<u64, VerdictHistory>);
-
-impl Verdicts {
-    /// `number` approved at `head` at `hour`.
-    fn approve(mut self, number: u64, head: &str, hour: u32) -> Self {
-        self.0.entry(number).or_default().approvals.push(
-            crate::head_approval::history::ApproveRecord {
-                head: head.to_owned(),
-                at: at(hour),
-                comment: None,
-            },
-        );
-        self
-    }
-
-    /// `number` held at `head` at `hour`.
-    fn hold(mut self, number: u64, head: &str, hour: u32) -> Self {
-        self.0.entry(number).or_default().holds.push(HoldRecord {
-            head: head.to_owned(),
-            at: at(hour),
-            record: "comment",
-            id: Some(u64::from(hour)),
-        });
-        self
-    }
-
-    fn of(&self, number: u64) -> VerdictHistory {
-        self.0.get(&number).cloned().unwrap_or_default()
-    }
-}
-
-/// Run the guard for the row numbered `p` among `rows` (all listed open).
-/// Every other row's gate refuses its head (`gate`, default unreviewed), and
-/// the HOLD-recency rule then judges it from `verdicts`.
-fn run_gated(
+/// Run the guard for the row numbered `p` among `rows` (all listed open),
+/// each other row judged `gate(number)`, branches logged as `logs` (`(hour,
+/// sha the branch moved to)`, the first entry its creation), and `extra`
+/// (`main...sha`) ranges for logged shas that are no row's head.
+fn run_full(
     rows: &[Row],
     p: u64,
-    verdicts: &Verdicts,
+    logs: &[(u64, Vec<(u32, &'static str)>)],
+    extra: &[(&str, &[Node])],
+    gate: &dyn Fn(u64) -> Judgement,
+) -> Option<Refusal> {
+    run_logged(rows, p, logs, extra, &[], gate)
+}
+
+/// [`run_full`], where the logs of the rows in `mid_life` start after their
+/// branch's creation (the log was truncated).
+fn run_logged(
+    rows: &[Row],
+    p: u64,
+    logs: &[(u64, Vec<(u32, &'static str)>)],
+    extra: &[(&str, &[Node])],
+    mid_life: &[u64],
     gate: &dyn Fn(u64) -> Judgement,
 ) -> Option<Refusal> {
     let listed = listing(rows);
@@ -132,6 +118,32 @@ fn run_gated(
         let joined = argv.join(" ");
         if joined.contains("OPEN") {
             return Ok(listed.clone());
+        }
+        if joined.contains("/activity?") {
+            for (number, entries) in logs {
+                if joined.contains(&format!("ref=refs/heads/{}&", branch(*number))) {
+                    return Ok(entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (hour, after))| {
+                            // A `+` before the sha marks a later re-creation.
+                            let (recreated, after) = after
+                                .strip_prefix('+')
+                                .map_or((false, *after), |sha| (true, sha));
+                            let kind = if recreated || (index == 0 && !mid_life.contains(number)) {
+                                "branch_creation"
+                            } else {
+                                "push"
+                            };
+                            json!({"at": format!("2026-11-27T{hour:02}:00:00Z"),
+                                "kind": kind, "after": after})
+                            .to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"));
+                }
+            }
+            return Err("activity not served".to_owned());
         }
         if argv.iter().any(|arg| arg.ends_with("?per_page=1")) {
             return Ok("behind".to_owned());
@@ -141,23 +153,18 @@ fn run_gated(
                 return Ok(compare(row.range, joined.contains("parents")));
             }
         }
+        for (sha, range) in extra {
+            if joined.contains(&format!("compare/main...{sha}?")) {
+                return Ok(compare(range, joined.contains("parents")));
+            }
+        }
         // The landed-content proof: an unreadable base ref keeps the overlap.
         Err(format!("not served: {joined}"))
     };
     let parent = rows.iter().find(|row| row.number == p).expect("P is a row");
-    let judged = RefCell::new(Vec::new());
-    let p_history = verdicts.of(p);
     let mut judge = |q: &OpenPr| {
         assert_ne!(q.number, p, "P is never judged as its own carrier");
-        judged.borrow_mut().push(q.number);
-        recency_judgement(
-            gate(q.number),
-            p,
-            parent.head,
-            &p_history,
-            q.number,
-            &verdicts.of(q.number),
-        )
+        gate(q.number)
     };
     refusal_with(
         &run_gh,
@@ -171,10 +178,17 @@ fn run_gated(
     )
 }
 
-fn run(rows: &[Row], p: u64, verdicts: &Verdicts) -> Option<Refusal> {
-    run_gated(rows, p, verdicts, &|_| {
-        Judgement::Unapproved("head carries no approval".to_owned())
-    })
+fn unreviewed(_: u64) -> Judgement {
+    Judgement::Unapproved("head carries no approval".to_owned())
+}
+
+fn held(_: u64) -> Judgement {
+    Judgement::Held("HOLD".to_owned())
+}
+
+/// Rows created in `order`, every other row judged `gate`.
+fn run(rows: &[Row], p: u64, order: &[u64], gate: &dyn Fn(u64) -> Judgement) -> Option<Refusal> {
+    run_full(rows, p, &created_in_order(rows, order), &[], gate)
 }
 
 fn refusal(refusal: Option<Refusal>) -> Refusal {
@@ -333,286 +347,247 @@ const TWO_PARENTS: [Row; 3] = [
 ];
 
 #[test]
-fn a_parent_with_unreviewed_children_on_its_head_is_admitted() {
-    let approved = Verdicts::default().approve(12982, A, 10);
-    assert_eq!(run(&PULP_12982, 12982, &approved), None);
+fn a_parent_with_unreviewed_or_held_children_on_its_head_is_admitted() {
+    for gate in [unreviewed as fn(u64) -> Judgement, held] {
+        assert_eq!(run(&PULP_12982, 12982, &[12982, 12984, 12987], &gate), None);
+    }
 
-    // Control: a HOLD on one child after P's approval refuses P, and names it.
-    let held = approved.clone().hold(12987, A_CHILD_2, 11);
-    let refused = refusal(run(&PULP_12982, 12982, &held));
-    assert_eq!(refused.token, "carries_unapproved_commits:#12987");
-    assert!(refused.detail.contains(A), "names A: {}", refused.detail);
+    // Control: had the children's branches held A first, A is theirs.
+    let refused = refusal(run(&PULP_12982, 12982, &[12984, 12982, 12987], &unreviewed));
+    assert_eq!(refused.token, "carries_unapproved_commits:#12984");
     assert!(
         refused
             .detail
-            .contains(&format!("a HOLD on #12987's head {A_CHILD_2}")),
-        "names the HOLD: {}",
-        refused.detail
-    );
-    assert!(
-        !refused.detail.contains("of #12984"),
-        "the unheld child does not hold P: {}",
-        refused.detail
-    );
-    assert!(
-        refused
-            .detail
-            .contains("Push a new head of this branch (for example, merge origin/main once)"),
-        "names the author's move: {}",
+            .contains("#12984's branch held 1 of them before #12982's did"),
+        "{}",
         refused.detail
     );
 }
 
 #[test]
-fn an_approval_after_the_hold_admits_the_parent() {
-    let hold_then_approve = Verdicts::default()
-        .hold(12987, A_CHILD_2, 9)
-        .approve(12982, A, 10);
-    assert_eq!(run(&PULP_12982, 12982, &hold_then_approve), None);
+fn a_child_carrying_its_unapproved_parents_commits_is_refused() {
+    // The parent's branch held A first, so A is the parent's: the child,
+    // whose diff carries A, waits for the parent's approval.
+    let refused = refusal(run(&PULP_12982, 12984, &[12982, 12984, 12987], &unreviewed));
+    assert_eq!(refused.token, "carries_unapproved_commits:#12982");
 
-    // Control: the same HOLD and approval, the other way round, refuses.
-    let approve_then_hold = Verdicts::default()
-        .approve(12982, A, 9)
-        .hold(12987, A_CHILD_2, 10);
-    assert_eq!(
-        refusal(run(&PULP_12982, 12982, &approve_then_hold)).token,
-        "carries_unapproved_commits:#12987"
-    );
-
-    // A HOLD at the very instant of the approval is not older: refused.
-    let same_instant = Verdicts::default()
-        .approve(12982, A, 10)
-        .hold(12987, A_CHILD_2, 10);
-    assert!(run(&PULP_12982, 12982, &same_instant).is_some());
-}
-
-#[test]
-fn a_child_is_held_back_by_its_parent_only_through_a_newer_hold() {
-    // #12984 carries #12982's commit. #12984's approval reviewed it, so with
-    // no HOLD it is admitted; a HOLD on #12982 after that approval refuses.
-    let approved = Verdicts::default().approve(12984, A_CHILD_1, 10);
-    assert_eq!(run(&PULP_12982, 12984, &approved), None);
-    let held = approved.hold(12982, A, 11);
-    assert_eq!(
-        refusal(run(&PULP_12982, 12984, &held)).token,
-        "carries_unapproved_commits:#12982"
-    );
-}
-
-#[test]
-fn an_unreadable_child_still_refuses() {
-    let approved = Verdicts::default().approve(12982, A, 10);
-    let unreadable = |q: u64| {
-        if q == 12984 {
-            Judgement::Unreadable("#12984 moved after the listing".to_owned())
+    // Control: the parent approved admits the child.
+    let parent_approved = |q: u64| {
+        if q == 12982 {
+            Judgement::Approved
         } else {
-            Judgement::Unapproved("no approval".to_owned())
+            unreviewed(q)
         }
     };
-    let refused = refusal(run_gated(&PULP_12982, 12982, &approved, &unreadable));
-    assert_eq!(refused.token, "carried_commits_unreadable:#12984");
-
-    // Control: the same child read as unreviewed admits P.
-    assert_eq!(run(&PULP_12982, 12982, &approved), None);
-}
-
-#[test]
-fn review_f1_a_stacked_label_never_clears_a_newer_hold() {
-    // #12962 is labelled stacked:12930 and built on an older head of it.
-    let approved = Verdicts::default().approve(12930, B4, 10);
-    assert_eq!(run(&PULP_12930, 12930, &approved), None);
-    let held = approved.hold(12962, B_CHILD, 11);
-    let refused = refusal(run(&PULP_12930, 12930, &held));
-    assert_eq!(refused.token, "carries_unapproved_commits:#12962");
-
-    // Control: the label removed changes nothing either way.
-    let unlabelled = [
-        PULP_12930[0],
-        Row {
-            stacked_on: None,
-            ..PULP_12930[1]
-        },
-    ];
     assert_eq!(
-        refusal(run(&unlabelled, 12930, &held)).token,
-        "carries_unapproved_commits:#12962"
-    );
-    assert_eq!(
-        run(
-            &unlabelled,
-            12930,
-            &Verdicts::default().approve(12930, B4, 10)
-        ),
+        run(&PULP_12982, 12984, &[12982, 12984, 12987], &parent_approved),
         None
     );
 }
 
 #[test]
-fn review_f2_a_parent_reset_onto_a_newer_childs_held_commit_is_refused() {
-    // P (#500, opened first) was reset onto C, a commit of the newer Q
-    // (#501). Q was held at an old head after P's approval, then pushed, so
-    // its current head carries no verdict at all. The lower number does not
-    // help P.
-    const C: &str = "aa00000000000000000000000000000000000000";
-    const Q_OLD: &str = "ab00000000000000000000000000000000000000";
-    const Q_NEW: &str = "ac00000000000000000000000000000000000000";
-    let rows = [
-        Row {
-            number: 500,
-            head: C,
-            range: &[(C, &[BASE_TIP])],
-            stacked_on: None,
-        },
-        Row {
-            number: 501,
-            head: Q_NEW,
-            range: &[(C, &[BASE_TIP]), (Q_NEW, &[C])],
-            stacked_on: Some(500),
-        },
+fn a_parent_with_a_held_child_on_an_older_head_is_admitted() {
+    // #12962 branched off #12930's older head B3; #12930 moved on to B4.
+    let logs = vec![(12930, vec![(1, B3), (3, B4)]), (12962, vec![(2, B_CHILD)])];
+    let extra: [(&str, &[Node]); 1] = [(B3, &[(B1, &[BASE_TIP]), (B2, &[B1]), (B3, &[B2])])];
+    assert_eq!(run_full(&PULP_12930, 12930, &logs, &extra, &held), None);
+
+    // Control: the child's branch first.
+    let child_first = vec![(12962, vec![(1, B_CHILD)]), (12930, vec![(2, B4)])];
+    assert_eq!(
+        refusal(run_full(&PULP_12930, 12930, &child_first, &extra, &held)).token,
+        "carries_unapproved_commits:#12962"
+    );
+}
+
+#[test]
+fn a_parent_with_two_children_on_an_older_head_is_admitted() {
+    let logs = vec![
+        (12884, vec![(1, C1), (4, C2)]),
+        (12889, vec![(2, C_CHILD_1)]),
+        (12891, vec![(3, C_CHILD_2)]),
     ];
-    let held = Verdicts::default().approve(500, C, 10).hold(501, Q_OLD, 11);
-    let refused = refusal(run(&rows, 500, &held));
-    assert_eq!(refused.token, "carries_unapproved_commits:#501");
-    assert!(refused.detail.contains(Q_OLD), "{}", refused.detail);
+    let extra: [(&str, &[Node]); 1] = [(C1, &[(C1, &[BASE_TIP])])];
+    assert_eq!(run_full(&PULP_12884, 12884, &logs, &extra, &held), None);
 
-    // The reviewer's other shape: Q labelled stacked:500, containing P's
-    // exact head, held at its current head after P's approval. The label and
-    // the containment used to clear it; now it is refused.
-    let held_now = Verdicts::default().approve(500, C, 10).hold(501, Q_NEW, 11);
-    assert_eq!(
-        refusal(run(&rows, 500, &held_now)).token,
-        "carries_unapproved_commits:#501"
-    );
-
-    // Control: a review of P after that HOLD admits it.
-    assert_eq!(run(&rows, 500, &held.approve(500, C, 12)), None);
+    // Control: P's log never shows C1 before C2 arrived, after both
+    // children's branches.
+    let late = vec![
+        (12884, vec![(4, C2)]),
+        (12889, vec![(2, C_CHILD_1)]),
+        (12891, vec![(3, C_CHILD_2)]),
+    ];
+    assert!(run_full(&PULP_12884, 12884, &late, &extra, &held).is_some());
 }
 
 #[test]
-fn a_hold_on_the_parents_own_older_head_after_its_approval_refuses() {
-    let held = Verdicts::default()
-        .approve(12982, A, 10)
-        .hold(12982, BASE_TIP, 11);
-    assert_eq!(
-        refusal(run(&PULP_12982, 12982, &held)).token,
-        "carries_unapproved_commits:#12984"
-    );
-    // Control: that HOLD before the approval does not.
-    let earlier = Verdicts::default()
-        .hold(12982, BASE_TIP, 9)
-        .approve(12982, A, 10);
-    assert_eq!(run(&PULP_12982, 12982, &earlier), None);
-}
-
-#[test]
-fn a_parent_without_an_exact_head_approve_is_refused_by_any_hold() {
-    // P's admission rests on an approval carried from another head: there is
-    // nothing to date, so any HOLD holds it.
-    let held = Verdicts::default()
-        .approve(12982, BASE_TIP, 10)
-        .hold(12987, A_CHILD_2, 1);
-    assert_eq!(
-        refusal(run(&PULP_12982, 12982, &held)).token,
-        "carries_unapproved_commits:#12987"
-    );
-    // Control: with no HOLD anywhere it is admitted.
-    assert_eq!(run(&PULP_12982, 12982, &Verdicts::default()), None);
-}
-
-#[test]
-fn a_parent_with_two_unreviewed_children_on_an_older_head_is_admitted() {
-    let approved = Verdicts::default().approve(12884, C2, 10);
-    assert_eq!(run(&PULP_12884, 12884, &approved), None);
-
-    // Control: one child held after the approval refuses.
-    let held = approved.hold(12891, C_CHILD_2, 11);
-    assert_eq!(
-        refusal(run(&PULP_12884, 12884, &held)).token,
-        "carries_unapproved_commits:#12891"
-    );
-}
-
-#[test]
-fn each_parent_on_a_line_of_unreviewed_children_is_admitted() {
-    let approved = Verdicts::default()
-        .approve(798, V1, 10)
-        .approve(800, V2, 10)
-        .approve(801, V3, 10)
-        .approve(811, V4, 10);
-    for parent in [798, 800, 801, 811] {
+fn each_parent_on_a_line_is_admitted_and_a_later_split_is_not() {
+    // #798, #800, #801 were each pushed before the children; #811's branch
+    // was made later from a point #803 already held.
+    let logs = vec![
+        (798, vec![(1, V1)]),
+        (800, vec![(2, V2)]),
+        (801, vec![(3, V3)]),
+        (803, vec![(4, V_803)]),
+        (805, vec![(5, V_805)]),
+        (811, vec![(6, V4)]),
+    ];
+    let children_unapproved = |q: u64| {
+        if matches!(q, 803 | 805 | 811) {
+            held(q)
+        } else {
+            Judgement::Approved
+        }
+    };
+    for parent in [798, 800, 801] {
         assert_eq!(
-            run(&VELLUM, parent, &approved),
+            run_full(&VELLUM, parent, &logs, &[], &children_unapproved),
             None,
-            "#{parent} is admitted on its own approval"
+            "#{parent} is admitted"
         );
     }
-
-    // Control: #803 held after #800's approval refuses #800, and a review of
-    // #801 after the HOLD keeps #801 admitted.
-    let held = approved.hold(803, V_803, 11).approve(801, V3, 12);
     assert_eq!(
-        refusal(run(&VELLUM, 800, &held)).token,
+        refusal(run_full(&VELLUM, 811, &logs, &[], &children_unapproved)).token,
         "carries_unapproved_commits:#803"
     );
-    assert_eq!(run(&VELLUM, 801, &held), None);
 }
 
 #[test]
-fn each_parent_of_an_unreviewed_merge_child_is_admitted() {
-    let approved = Verdicts::default()
-        .approve(100, E1, 10)
-        .approve(101, F1, 10);
+fn each_parent_of_a_merge_child_is_admitted() {
     for parent in [100, 101] {
         assert_eq!(
-            run(&TWO_PARENTS, parent, &approved),
+            run(&TWO_PARENTS, parent, &[100, 101, 110], &held),
             None,
-            "#{parent} is admitted on its own approval"
+            "#{parent} is admitted"
         );
     }
-
-    // Control: the child held after both approvals refuses both parents.
-    let held = approved.hold(110, M, 11);
+    // Control: the merge child's branch first holds both parents' commits.
     for parent in [100, 101] {
         assert_eq!(
-            refusal(run(&TWO_PARENTS, parent, &held)).token,
+            refusal(run(&TWO_PARENTS, parent, &[110, 100, 101], &held)).token,
             "carries_unapproved_commits:#110"
         );
     }
 }
 
+/// Q (#21, newer) introduced C and has no verdict at all; the older P (#20)
+/// was then reset onto C and approved.
+const C: &str = "aa00000000000000000000000000000000000000";
+const P0: &str = "ab00000000000000000000000000000000000000";
+const Q_TIP: &str = "ac00000000000000000000000000000000000000";
+const RESET: [Row; 2] = [
+    Row {
+        number: 20,
+        head: C,
+        range: &[(C, &[BASE_TIP])],
+        stacked_on: None,
+    },
+    Row {
+        number: 21,
+        head: Q_TIP,
+        range: &[(C, &[BASE_TIP]), (Q_TIP, &[C])],
+        stacked_on: Some(20),
+    },
+];
+
 #[test]
-fn a_parent_carrying_a_held_childs_exact_head_is_refused_whatever_the_hold_age() {
-    // P (#599) is built on Q's (#600) exact head, which a HOLD names. The
-    // HOLD predates P's approval, but P carries the whole held state.
-    const QH: &str = "ad00000000000000000000000000000000000000";
-    const PH: &str = "ae00000000000000000000000000000000000000";
-    let rows = [
+fn review_r1_f2_a_parent_reset_onto_an_unheld_childs_commit_is_refused() {
+    // The finding as written: no HOLD anywhere, Q merely unapproved.
+    let logs = vec![(20, vec![(1, P0), (3, C)]), (21, vec![(2, Q_TIP)])];
+    let extra: [(&str, &[Node]); 1] = [(P0, &[(P0, &[BASE_TIP])])];
+    let refused = refusal(run_full(&RESET, 20, &logs, &extra, &unreviewed));
+    assert_eq!(refused.token, "carries_unapproved_commits:#21");
+    assert!(refused.detail.contains(C), "{}", refused.detail);
+
+    // The fast-forward variant (no force-push): P's branch moved to Q's tip.
+    let ff_rows = [
         Row {
-            number: 599,
-            head: PH,
-            range: &[(QH, &[BASE_TIP]), (PH, &[QH])],
-            stacked_on: None,
+            head: Q_TIP,
+            range: &[(C, &[BASE_TIP]), (Q_TIP, &[C])],
+            ..RESET[0]
         },
-        Row {
-            number: 600,
-            head: QH,
-            range: &[(QH, &[BASE_TIP])],
-            stacked_on: None,
-        },
+        RESET[1],
     ];
-    let verdicts = Verdicts::default().hold(600, QH, 9).approve(599, PH, 10);
-    let held_at_head = |_: u64| Judgement::Held("HOLD names this head".to_owned());
-    let refused = refusal(run_gated(&rows, 599, &verdicts, &held_at_head));
-    assert_eq!(refused.token, "carries_unapproved_commits:#600");
+    let ff = vec![(20, vec![(1, P0), (3, Q_TIP)]), (21, vec![(2, Q_TIP)])];
+    assert!(run_full(&ff_rows, 20, &ff, &extra, &unreviewed).is_some());
+
+    // Control: Q approved admits P.
+    assert_eq!(
+        run_full(&RESET, 20, &logs, &extra, &|_| Judgement::Approved),
+        None
+    );
+}
+
+#[test]
+fn review_r1_f1_an_ancestor_of_a_held_tip_never_lands_through_p() {
+    // Q introduced C and is held at its tip, which P does not carry; P
+    // carries only C, and P's approval may be as new as you like: no verdict
+    // time is read, and C is Q's.
+    let logs = vec![(21, vec![(1, Q_TIP)]), (20, vec![(2, C)])];
+    let refused = refusal(run_full(&RESET, 20, &logs, &[], &held));
+    assert_eq!(refused.token, "carries_unapproved_commits:#21");
+
+    // Control: Q approved admits P.
+    assert_eq!(
+        run_full(&RESET, 20, &logs, &[], &|_| Judgement::Approved),
+        None
+    );
+}
+
+#[test]
+fn an_unreadable_or_truncated_log_keeps_the_commit_the_childs() {
+    // No activity served for the child's branch: fail closed.
+    let p_only = vec![(12982, vec![(1, A)])];
+    let refused = refusal(run_full(&PULP_12982, 12982, &p_only, &[], &unreviewed));
     assert!(
-        refused
-            .detail
-            .contains("is held and this head carries that exact head"),
+        refused.detail.contains("could not be settled"),
         "{}",
         refused.detail
     );
 
-    // Control: Q's current head not held (the HOLD named an older state), the
-    // same older HOLD clears P.
-    assert_eq!(run(&rows, 599, &verdicts), None);
+    // A child's log that does not start at its branch's creation: where it
+    // first held A may be lost, so A stays the child's.
+    let logs = created_in_order(&PULP_12982, &[12982, 12984, 12987]);
+    let refused = refusal(run_logged(
+        &PULP_12982,
+        12982,
+        &logs,
+        &[],
+        &[12984],
+        &unreviewed,
+    ));
+    assert_eq!(refused.token, "carries_unapproved_commits:#12984");
+
+    // The parent's and a child's branches holding A at the same instant: not
+    // strictly first, so A is the child's.
+    let same_time = vec![
+        (12982, vec![(1, A)]),
+        (12984, vec![(1, A_CHILD_1)]),
+        (12987, vec![(3, A_CHILD_2)]),
+    ];
+    assert!(run_full(&PULP_12982, 12982, &same_time, &[], &unreviewed).is_some());
+
+    // Control: the same logs, complete and in order, admit P.
+    assert_eq!(run_full(&PULP_12982, 12982, &logs, &[], &unreviewed), None);
+}
+
+#[test]
+fn a_parent_branch_reused_after_a_deletion_cannot_claim_its_earlier_life() {
+    // P's branch name held C in an earlier life (hour 1), was deleted, and
+    // was created again at C after Q's branch held C (hour 3).
+    let logs = vec![
+        (
+            20,
+            vec![(1, C), (3, "+aa00000000000000000000000000000000000000")],
+        ),
+        (21, vec![(2, Q_TIP)]),
+    ];
+    assert_eq!(
+        refusal(run_full(&RESET, 20, &logs, &[], &unreviewed)).token,
+        "carries_unapproved_commits:#21"
+    );
+
+    // Control: one life from hour 1, C is P's.
+    let one_life = vec![(20, vec![(1, C)]), (21, vec![(2, Q_TIP)])];
+    assert_eq!(run_full(&RESET, 20, &one_life, &[], &unreviewed), None);
 }

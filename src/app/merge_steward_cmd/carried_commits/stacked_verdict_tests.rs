@@ -10,9 +10,10 @@
 //! history), so a guard that excused Q on ancestry would admit P in the held
 //! and unapproved cases.
 //!
-//! Here a held or unapproved Q stands for a Q with a HOLD at least as new as
-//! P's exact-head approval; how HOLD recency is read and compared is tested
-//! in `parent_child_tests`. No label, opening order or ancestry excuses Q.
+//! No label, opening order or ancestry excuses Q: which pull request owns a
+//! shared commit is read from the repository activity log (see
+//! `parent_child_tests`). These fixtures serve no log, so every shared
+//! commit here counts as Q's.
 
 use std::cell::{Cell, RefCell};
 

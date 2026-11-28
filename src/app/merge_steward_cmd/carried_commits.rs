@@ -1,57 +1,54 @@
-//! Refuse to admit a head that carries commits a newer HOLD covers.
+//! Refuse to admit a head that carries another open pull request's
+//! unapproved commits.
 //!
-//! A HOLD stops one pull request's head. Without this guard it would not stop
-//! the same commits reaching the base through a second pull request approved
-//! before the HOLD was posted, or through one that carries the held head
-//! itself. Before admitting candidate P, the steward therefore
+//! A HOLD stops one pull request's head. It does not stop the same commits
+//! reaching the base through a second pull request: a branch that merged the
+//! held branch (or a branch that did) carries the held commits, a reviewer can
+//! approve the second pull request on its own diff, and the steward would then
+//! admit the held code. Before admitting candidate P, the steward therefore
 //! compares P's commits that are not on the base with the commits of every
-//! other open pull request Q in the repository. When P carries a commit of a
-//! Q whose current head the exact-head approval gate does not admit, P is
-//! refused with `carries_unapproved_commits:#Q`, naming the shared commits,
-//! unless the HOLD-recency rule clears Q ([`recency_judgement`]).
+//! other open pull request Q in the repository. When P carries any commit of a
+//! Q whose current head the exact-head approval gate does not admit (a counted
+//! HOLD, or no counted APPROVE), P is refused with
+//! `carries_unapproved_commits:#Q`, and the shared commits are named.
 //!
-//! The rule: P's exact-head APPROVE reviewed P's whole diff, the shared
-//! commits included, so a shared commit holds P back only while some counting
-//! HOLD on any head of Q's, or of P's own, is at least as new as that APPROVE.
-//! Times are the server's (a review's `submitted_at`, a comment's
-//! `created_at`, and its `updated_at` when later), read from the same verdict
-//! records the gate reads. Every HOLD on Q counts, not only those on heads
-//! holding the shared commits: a superset that refuses more, never less. A
-//! child waiting for review therefore never blocks its approved parent, a
-//! parent with several children or a child built on several parents is
-//! settled pair by pair, and a HOLD posted after P's approval stops P until P
-//! is reviewed again. A P with no exact-head APPROVE of its own (an approval
-//! carried from an earlier head, or a rollup) is held by any HOLD. A verdict
-//! that cannot be read refuses (`carried_commits_unreadable:#Q`), and under
-//! fleet-guard admission, which keeps no verdict timeline here, a refused Q
-//! always refuses. Labels (`stacked:<n>`), opening order, `Supersedes #n`, the
-//! clean-replacement marker and head ancestry never clear a HOLD: none of
-//! them says whether anyone reviewed the shared commits after the HOLD. One
-//! narrowing does not depend on age: a P that contains the exact head a HOLD
-//! at Q's current head names is refused however old that HOLD is.
-//!
-//! Named residuals:
-//! * A HOLD older than P's exact-head APPROVE does not stop P, even when P
-//!   merged or was reset onto Q's held commits afterwards: P's reviewer, who
-//!   approved a diff containing the held commits, is the control.
-//! * A HOLD erased (its verdict line edited away, or deleted) no longer
-//!   counts, as on a single pull request.
-//! * A reviewer who started on P before Q's HOLD and approves after it clears
-//!   P without having seen the HOLD: the window is one review's duration.
-//!
-//! Not blocked, before any verdict is read:
+//! Not blocked:
 //!
 //! * Q is P's own base-branch pull request (same repository, Q's head branch
 //!   is P's base); a properly stacked P never targets the steward's base.
 //! * Q is stacked on P, directly or transitively (following Q's base branch
 //!   through other open pull requests' head branches reaches P's head
-//!   branch): Q builds on P and cannot land before it.
+//!   branch): Q builds on P.
 //! * Q only inherits the commit: Q "introduced" a commit only if it is in Q's
 //!   own diff against Q's own base branch (`Q.base...Q.head`), not merely
 //!   reachable from Q. A pull request stacked on another branch therefore
-//!   never matches the commits its base branch already carries. A pull
+//!   never matches the commits its base branch already carries, which is what
+//!   keeps P admissible when P's own commit reached Q through a chain. A pull
 //!   request that merges another pull request's branch still has those
 //!   commits in its own diff and is still caught.
+//! * Q introduced the commit, but P's branch held it first: P owns it (see
+//!   [`ownership`]). Head ancestry, labels (`stacked:<n>`), opening order,
+//!   `Supersedes #n`, the clean-replacement marker and verdict times never
+//!   decide whose a shared commit is: the commit graph is the same whether Q
+//!   branched off P or P took Q's commits. GitHub's repository activity log
+//!   records, with the server's timestamp, every sha each branch moved to,
+//!   so a shared commit is P's exactly when P's branch (in its current life)
+//!   held it strictly before Q's branch did. A child stacked on P that
+//!   targets the base, held or unreviewed, therefore never blocks P, a
+//!   parent with several children or a child built on several parents is
+//!   settled pair by pair, and a commit that came to P from Q (P merged Q,
+//!   was reset or fast-forwarded onto Q, or cherry-picked the same sha)
+//!   stays Q's: while Q's current head is not approved it refuses P, however
+//!   recent P's approval or however old Q's HOLD. An unreadable log, a log of
+//!   Q's branch that does not reach back to a creation, a compare over the
+//!   cap, more logged entries than the read limit, a cross-repository
+//!   branch, or equal times leave the commit Q's, and the refusal says so.
+//!   Ownership is read only for an overlap whose shared commits are listed:
+//!   an over-cap Q, and every overlap of an over-cap P, clear only by Q's
+//!   approval. Named residuals: the log's retention bounds what can be
+//!   proved (an expired entry can only make a commit Q's); and a commit that
+//!   reached P's branch first through some third branch is P's, though P's
+//!   reviewer approved a diff containing it.
 //! * A carried commit whose change is already on the base under other shas
 //!   (a merge that only re-applies landed content, a cherry-pick with the
 //!   base's patch-id and matching changed entries): see [`landed`]. The
@@ -131,9 +128,6 @@ const LISTING_PAGE: usize = 50;
 /// Listing pages read per pass before failing closed.
 const MAX_LISTING_PAGES: usize = 20;
 
-/// How a recency refusal names the HOLD that keeps it: `a HOLD on #<n>`.
-const HOLD_NAMED: &str = "a HOLD on #";
-
 /// Shared shas named in one detail line.
 const SHAS_NAMED: usize = 10;
 
@@ -204,32 +198,17 @@ impl Carried {
     }
 }
 
-/// Whether Q's commits may land through P: the exact-head approval gate's
-/// verdict on Q's current head, then the HOLD-recency rule
-/// ([`recency_judgement`]).
+/// The exact-head approval gate's verdict on Q's current head.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Judgement {
     /// The gate admits Q's head.
     Approved,
-    /// The gate does not admit Q's head, but no counting HOLD on any head of
-    /// Q's or P's is as new as P's exact-head approval, which reviewed every
-    /// commit P carries: Q holds nothing back from P. `head_held` says the
-    /// gate refused Q for a HOLD at Q's current head (then P carrying that
-    /// exact head still refuses, see [`refusal_with`]).
-    Cleared { detail: String, head_held: bool },
     /// The gate refuses Q's head, for this reason.
     Unapproved(String),
     /// A counting HOLD names Q's head: refused, and never excused as a stack.
     Held(String),
     /// Q's approval could not be read.
     Unreadable(String),
-}
-
-impl Judgement {
-    /// Whether Q's commits may land through P.
-    pub(super) const fn clears(&self) -> bool {
-        matches!(self, Self::Approved | Self::Cleared { .. })
-    }
 }
 
 /// Why P is refused: the `blocked_on` token and its detail.
@@ -268,8 +247,9 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
 /// The open pull requests whose commits P must not carry unapproved: every
 /// one but P itself, P's own base-branch pull request, and those stacked on
 /// P. Pure. A labelled stack is still checked here when it is unrelated to P;
-/// the label is a repair-lane marker and never excuses Q. A Q stacked on P is
-/// excluded by the base-branch relation itself, regardless of labels.
+/// the label is a repair-lane marker and never excuses Q on its own (it only
+/// unlocks the older-parent graph proof, see [`older_parent_of`]). A Q stacked
+/// on P is excluded by the base-branch relation itself, regardless of labels.
 fn unrelated<'a>(
     number: u64,
     base_ref: &'a str,
@@ -486,7 +466,7 @@ fn resolve_overlap(
                 number: q.number,
                 total,
             };
-            if judgement.clears() {
+            if judgement == Judgement::Approved {
                 return Some((unbounded, judgement));
             }
             match probe_introduced(run_gh, repo, base, q, &probe, reachable) {
@@ -571,7 +551,7 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
     let mut unreadable = Vec::new();
     for (carried, judgement) in judged {
         match (carried, judgement) {
-            (_, Judgement::Approved | Judgement::Cleared { .. }) => {}
+            (_, Judgement::Approved) => {}
             (Carried::Shares { .. }, Judgement::Unapproved(reason) | Judgement::Held(reason)) => {
                 carries.push((carried, reason));
             }
@@ -602,22 +582,11 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
             })
             .collect::<Vec<_>>()
             .join("; ");
-        // Only a refusal the recency rule decided names a HOLD; under
-        // fleet-guard admission none was read, so none is named.
-        let fresh_review = carries
-            .iter()
-            .any(|(_, reason)| reason.contains(HOLD_NAMED));
-        let fix = if fresh_review {
-            "Push a new head of this branch (for example, merge origin/main once) so it is \
-             reviewed after that HOLD, land or approve that pull request first, or drop its \
-             commits from this branch"
-        } else {
-            "Land or approve that pull request first, or drop its commits from this branch"
-        };
         return Some(Refusal {
             token: format!("carries_unapproved_commits:#{}", first.number()),
             detail: format!(
-                "{detail}. {fix}; a branch built on another pull request should target that pull \
+                "{detail}. Land or approve that pull request first, or drop its commits from \
+                 this branch; a branch built on another pull request should target that pull \
                  request's branch"
             ),
         });
@@ -663,8 +632,10 @@ pub(super) struct PassCache {
     /// every over-cap candidate and admission path in the pass.
     roots: BTreeMap<(u64, String), Result<Roots, String>>,
     /// Commit graphs (`base...head` with parents), by `(base, head)`, read
-    /// once per pass.
+    /// once per pass: own diffs, and each logged head for [`ownership`].
     graphs: GraphCache,
+    /// Branch activity logs, by branch, for [`ownership`].
+    activity: ownership::ActivityCache,
 }
 
 impl PassCache {
@@ -758,7 +729,6 @@ pub(super) fn refusal_for(
     );
     let mut report_policy = policy.clone();
     report_policy.dry_run = true;
-    let reads = std::cell::RefCell::new(RecencyReads::default());
     let mut judge = |q: &OpenPr| -> Judgement {
         let queue = match super::native_arm::read_queue_state(actions, repo, q.number) {
             Ok(queue) => queue,
@@ -783,7 +753,7 @@ pub(super) fn refusal_for(
             }
             None => queue,
         };
-        let gate = match crate::head_approval::evaluate_with_policy_for_author_with_diagnosis(
+        match crate::head_approval::evaluate_with_policy_for_author_with_diagnosis(
             &run_gh,
             repo,
             q.number,
@@ -793,18 +763,8 @@ pub(super) fn refusal_for(
             q.author.as_deref(),
         ) {
             Ok((gate, _, blocker)) => judgement_of(&gate, blocker.as_ref(), comment_source),
-            Err(error) => return Judgement::Unreadable(error),
-        };
-        judge_after_gate(
-            &run_gh,
-            repo,
-            &report_policy,
-            comment_source,
-            pr,
-            q,
-            gate,
-            &mut reads.borrow_mut(),
-        )
+            Err(error) => Judgement::Unreadable(error),
+        }
     };
     refusal_with(
         &run_gh,
@@ -816,124 +776,6 @@ pub(super) fn refusal_for(
         cache,
         &mut judge,
     )
-}
-
-/// The verdict histories one candidate's recency judgements share.
-#[derive(Debug, Default)]
-pub(super) struct RecencyReads {
-    /// Every pull request's counting verdicts, by number.
-    histories: BTreeMap<u64, Result<crate::head_approval::VerdictHistory, String>>,
-    /// P's, with edited approvals dropped by GraphQL's edit history.
-    p_dated: Option<Result<crate::head_approval::VerdictHistory, String>>,
-}
-
-/// Judge Q after the approval gate's `gate` judgement, as the production
-/// guard does: an approved Q, and every refused Q under fleet-guard admission
-/// (`comment_source` false: no verdict timeline to date P's approval by), keep
-/// the gate's judgement; otherwise P's and Q's verdict histories are read
-/// (once per candidate, in `reads`) and [`recency_judgement`] decides. P is
-/// dated only by an approval the gate would count: GraphQL's edit history
-/// drops edited ones. Any failed read is [`Judgement::Unreadable`].
-#[allow(clippy::too_many_arguments)]
-pub(super) fn judge_after_gate(
-    run_gh: RunGh<'_>,
-    repo: &str,
-    policy: &crate::head_approval::ApprovalPolicy,
-    comment_source: bool,
-    pr: &crate::merge_steward::StewardPullRequest,
-    q: &OpenPr,
-    gate: Judgement,
-    reads: &mut RecencyReads,
-) -> Judgement {
-    if !comment_source || gate.clears() {
-        return gate;
-    }
-    let mut history = |number: u64, author: Option<&str>| {
-        reads
-            .histories
-            .entry(number)
-            .or_insert_with(|| {
-                crate::head_approval::verdict_history(run_gh, repo, number, policy, author)
-            })
-            .clone()
-    };
-    let p_history = if let Some(read) = &reads.p_dated {
-        read.clone()
-    } else {
-        let read = history(pr.number, pr.author.as_deref())
-            .and_then(|history| history.without_edited_approvals(run_gh, &pr.head_sha));
-        reads.p_dated = Some(read.clone());
-        read
-    };
-    let q_history = history(q.number, q.author.as_deref());
-    match (p_history, q_history) {
-        (Ok(p_history), Ok(q_history)) => recency_judgement(
-            gate,
-            pr.number,
-            &pr.head_sha,
-            &p_history,
-            q.number,
-            &q_history,
-        ),
-        (Err(error), _) | (_, Err(error)) => Judgement::Unreadable(error),
-    }
-}
-
-/// Whether a Q the gate refuses still holds P back, by HOLD recency. P's
-/// exact-head approval reviewed every commit P carries, Q's included, so a
-/// shared commit stops P only while some counting HOLD is at least as new as
-/// that approval: a HOLD on any head of Q's, or of P's own. Every HOLD on Q
-/// counts, not only those on heads that contain the shared commits: a
-/// deliberate superset that refuses more, never less, and needs no reads of
-/// heads Q has since dropped. With no such HOLD Q is
-/// [`Judgement::Cleared`]; with one Q is [`Judgement::Held`], naming the
-/// HOLD and the remedy (a review of P's head after it). A P with no counting,
-/// unedited exact-head APPROVE of its own (one carried from an earlier head,
-/// or a rollup) has nothing to date, so any HOLD holds it. Only server-set
-/// times are compared, never labels, numbers or commit dates. An approved,
-/// cleared or unreadable `gate` is returned as it is. Pure.
-pub(super) fn recency_judgement(
-    gate: Judgement,
-    p_number: u64,
-    p_head: &str,
-    p_history: &crate::head_approval::VerdictHistory,
-    q_number: u64,
-    q_history: &crate::head_approval::VerdictHistory,
-) -> Judgement {
-    let reason = match &gate {
-        Judgement::Unapproved(reason) | Judgement::Held(reason) => reason.clone(),
-        Judgement::Approved | Judgement::Cleared { .. } | Judgement::Unreadable(_) => return gate,
-    };
-    let head_held = matches!(gate, Judgement::Held(_));
-    let approved_at = p_history.approved_at(p_head);
-    let newest = q_history
-        .holds
-        .iter()
-        .map(|hold| (q_number, hold))
-        .chain(p_history.holds.iter().map(|hold| (p_number, hold)))
-        .filter(|(_, hold)| approved_at.is_none_or(|approved| hold.at >= approved))
-        .max_by_key(|(_, hold)| hold.at);
-    let approval = approved_at.map_or_else(
-        || format!("#{p_number} has no exact-head APPROVE of its own at {p_head}"),
-        |at| format!("#{p_number}'s exact-head APPROVE at {}", at.to_rfc3339()),
-    );
-    match newest {
-        None => Judgement::Cleared {
-            detail: format!(
-                "{reason}; no HOLD on #{q_number} or #{p_number} is as new as {approval}"
-            ),
-            head_held,
-        },
-        Some((number, hold)) => Judgement::Held(format!(
-            "{reason}; {HOLD_NAMED}{number}'s head {} ({} {}, {}) is not older than {approval}: \
-             a review of #{p_number}'s head posted after that HOLD clears it",
-            hold.head,
-            hold.record,
-            hold.id
-                .map_or_else(|| "unrecorded".to_owned(), |id| id.to_string()),
-            hold.at.to_rfc3339()
-        )),
-    }
 }
 
 /// The judgement of Q's head from the approval gate and its blocker. A HOLD
@@ -961,7 +803,7 @@ fn judgement_of(
 
 /// [`admission_refusal`] over any `gh` runner and approval judge, after the
 /// policy says approval is required.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn refusal_with(
     run_gh: RunGh<'_>,
     repo: &str,
@@ -996,7 +838,13 @@ pub(super) fn refusal_with(
         commits: &own,
     };
     let overlaps = carried(&candidate, others);
+    // P's own row: whether its branch is in this repository's activity log.
+    let p_cross_repository = others
+        .iter()
+        .find(|row| row.number == number)
+        .is_none_or(|row| row.cross_repository);
     let mut judged = Vec::with_capacity(overlaps.len());
+    let mut notes = Vec::new();
     for overlap in overlaps {
         let q = others
             .iter()
@@ -1015,34 +863,116 @@ pub(super) fn refusal_with(
         ) else {
             continue;
         };
-        // Hardening: P that carries the exact head a HOLD at Q's current head
-        // names carries the whole held state, not an ancestor of it, so the
-        // HOLD's age does not clear it.
-        let settled = match settled {
-            (
-                carried,
-                Judgement::Cleared {
-                    detail,
-                    head_held: true,
-                },
-            ) if own.contains(&q.head_sha) => (
-                carried,
-                Judgement::Held(format!(
-                    "{detail}; but #{}'s current head {} is held and this head carries \
-                         that exact head",
-                    q.number, q.head_sha
-                )),
-            ),
-            settled => settled,
-        };
-        if settled.1.clears() {
+        let Some(settled) = without_p_owned(
+            settled,
+            run_gh,
+            repo,
+            base,
+            (number, head_ref, p_cross_repository),
+            q,
+            (&mut cache.activity, &mut cache.graphs),
+            &mut notes,
+        ) else {
             continue;
-        }
+        };
         if let Some(settled) = landed::without_landed_commits(run_gh, repo, base, settled) {
             judged.push(settled);
         }
     }
-    decide(base, &judged)
+    decide(base, &judged).map(|mut refusal| {
+        // Only notes for a pull request the refusal still names.
+        for (q, note) in notes {
+            if judged.iter().any(|(carried, _)| carried.number() == q) {
+                refusal.detail.push_str(&note);
+            }
+        }
+        refusal
+    })
+}
+
+/// Drop from a refusing overlap with `q` the shared commits P owns: those
+/// P's branch held strictly before `q`'s did ([`ownership`]). `None` when
+/// every shared commit is P's. An approved `q` and an unbounded overlap are
+/// returned as they are. When ownership cannot be settled the overlap is kept
+/// whole, and `notes` says why; when commits stay `q`'s, `notes` says that.
+#[allow(clippy::too_many_arguments)]
+fn without_p_owned(
+    settled: (Carried, Judgement),
+    run_gh: RunGh<'_>,
+    repo: &str,
+    base: &str,
+    (number, head_ref, p_cross_repository): (u64, &str, bool),
+    q: &OpenPr,
+    (activity, graphs): (&mut ownership::ActivityCache, &mut GraphCache),
+    notes: &mut Vec<(u64, String)>,
+) -> Option<(Carried, Judgement)> {
+    Some(match settled {
+        (
+            Carried::Shares {
+                number: q_number,
+                head_sha: q_head,
+                shared,
+            },
+            judgement,
+        ) if judgement != Judgement::Approved => {
+            match ownership::p_owned(
+                run_gh,
+                repo,
+                base,
+                head_ref,
+                p_cross_repository,
+                q,
+                &shared,
+                activity,
+                graphs,
+            ) {
+                Ok(owned) => {
+                    let kept: Vec<String> = shared
+                        .iter()
+                        .filter(|sha| !owned.contains(*sha))
+                        .cloned()
+                        .collect();
+                    if kept.is_empty() {
+                        return None;
+                    }
+                    notes.push((
+                        q_number,
+                        format!(
+                            "; #{q_number}'s branch held {} of them before #{number}'s did \
+                             (repository activity log), so they are #{q_number}'s",
+                            kept.len()
+                        ),
+                    ));
+                    (
+                        Carried::Shares {
+                            number: q_number,
+                            head_sha: q_head,
+                            shared: kept,
+                        },
+                        judgement,
+                    )
+                }
+                Err(error) => {
+                    notes.push((
+                        q_number,
+                        format!(
+                            "; which branch held #{q_number}'s shared commits first could not \
+                             be settled ({error}), so they count as #{q_number}'s"
+                        ),
+                    ));
+                    (
+                        Carried::Shares {
+                            number: q_number,
+                            head_sha: q_head,
+                            shared,
+                        },
+                        judgement,
+                    )
+                }
+            }
+        }
+        settled => settled,
+    })
 }
 
 /// Q's approval is judged only at the head the listing saw, so the live
@@ -1194,7 +1124,7 @@ fn over_cap_refusal(
             continue;
         }
         let judgement = judge(q);
-        if !judgement.clears() {
+        if judgement != Judgement::Approved {
             judged.push((
                 Carried::Shares {
                     number: q.number,
@@ -1216,7 +1146,7 @@ fn judge_unbounded(
     judged: &mut Vec<(Carried, Judgement)>,
 ) {
     let judgement = judge(q);
-    if !judgement.clears() {
+    if judgement != Judgement::Approved {
         judged.push((
             Carried::Unbounded {
                 number: q.number,
@@ -1545,14 +1475,13 @@ fn rest_commits(run_gh: RunGh<'_>, repo: &str, number: u64) -> Result<BTreeSet<S
 
 mod landed;
 
+mod ownership;
+
 #[cfg(test)]
 mod stacked_verdict_tests;
 
 #[cfg(test)]
 mod parent_child_tests;
-
-#[cfg(test)]
-mod recency_glue_tests;
 
 #[cfg(test)]
 mod tests;
