@@ -370,11 +370,33 @@ A job prints it with one workflow command, newlines encoded as `%0A`:
 `::notice title=review-items::review-item: hotspot:docs/x.json%0Areview-items-count: 1`.
 An id is a lowercase kind, a colon, and up to 240 non-space characters.
 
+**The producer's contract.** The reader takes the newest run of the file on
+the head sha, from whichever pull request's event started it, and does not
+bind that run to the pull request it judges. That is sound only when the
+items job keeps three rules:
+
+1. It analyses exactly `github.event.pull_request.head.sha`, never a branch
+   or `refs/pull/N/head`. Otherwise another pull request can push the same
+   sha, then a clean commit before the job fetches, and leave a newer run on
+   that sha that lists no items.
+2. The list depends only on that sha and the default branch. It never reads
+   the event's base ref or sha, labels, title, body or number. Otherwise a
+   second pull request on the same head, into a base its author chose, yields
+   a newer run with a shorter list.
+3. No step writes head-derived text to its log, stdout or stderr. The list is
+   a log line, so a head-controlled line starting
+   `::notice title=review-items::` is a second list (refused), and a
+   `::stop-commands::` line or the per-job annotation cap could suppress the
+   real one. Redirect the step that computes the items, for example
+   `review_items.py items ... > "$RUNNER_TEMP/items.log" 2>&1`, and print only
+   the list.
+
 Why this chain and not a check run found by name:
 
 - `pull_request_target` always runs the default branch's definition of the
-  workflow. A `pull_request` run runs the head's copy, which the pull request
-  can rewrite to list no items.
+  workflow (on github.com since GitHub's December 2025 change; before it, the
+  pull request's base branch copy ran). A `pull_request` run runs the head's
+  copy, which the pull request can rewrite to list no items.
 - Every Actions check run has the app `github-actions`, so the app alone
   distinguishes nothing. A check run created through the API with a
   workflow's token can carry any name, output and details URL, and GitHub
@@ -406,7 +428,11 @@ reviewer: pulp-review
 verdict: APPROVE head:<sha>
 ```
 
-Lines inside a fenced code block, and `>` quotes, do not count. Extra accepts
+Lines inside a fenced code block, `>` quotes, and lines indented four spaces
+or a tab do not count. A fence closes only on a line holding nothing but its
+opening character, at least as many times, from the first column, so a
+`~~~` block holding a backtick line, or a longer backtick fence holding a
+shorter one, stays fenced. Extra accepts
 are ignored. A missing one keeps the head `pending`, since only the reviewer
 can fix it with a new verdict, and the description names what is unaccepted
 (`awaiting reviewer acceptance of review items: <id>, ...`). Nothing else accepts an
@@ -442,13 +468,33 @@ report a head allowed that this status refuses. The status is the required
 check and decides the landing, but reviewer dispatch observes a trusted
 exact-head APPROVE through `crate::review_verdict` and counts the review as
 done: an APPROVE that forgets an accept line is not re-dispatched, and the
-head waits with no owner. Until the Rust gate reads items too, a base turns
-this on only where its reviewer brief always lists the items first.
+head waits with no owner. A reviewer brief is not a recovery path
+(docs/autonomy-contract.md, A3 and A12), so this is a prerequisite: no base
+sets the keys until reviewer dispatch treats an exact-head APPROVE that lacks
+an accept (a `pending` status reading `awaiting reviewer acceptance of review
+items`) as a review not done, and dispatches again.
 
 **Permissions.** The reader lists Actions runs and jobs and reads check-run
 annotations, so the `review-verdict` job needs `actions: read` (or `write`)
 and `checks: read`, and the fleet App the same scopes for the host
 queue-arm guard. Without them every head on such a base fails closed.
+
+**Rollout order.** A Shipyard script from before review items ignores the two
+keys, so setting them first leaves the status unenforced with no error.
+
+1. Land this change, and the reviewer-dispatch prerequisite above.
+2. Bump the repository's pinned Shipyard commit in `review-verdict.yml`, and in
+   the same change add `checks: read` and the items workflow's name under
+   `workflow_run`.
+3. Land the items workflow.
+4. Set `review_items_check` and `review_items_workflow` on the default branch.
+5. Run the status backfill once: a `success` posted before the keys were set
+   stands until its head is judged again.
+
+Only a `pull_request_target` run counts, so a head opened before the items
+workflow existed has no run and stays `pending` until it is pushed or the
+pull request is reopened. A manually dispatched run of the items job does
+not count.
 
 ## Rollout
 

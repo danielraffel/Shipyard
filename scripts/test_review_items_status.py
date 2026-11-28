@@ -177,6 +177,20 @@ class ReviewItemsStatus(unittest.TestCase):
                 self.assertEqual(self.judged(self.trail(body)), "pending")
                 self.assertIn(HOTSPOT, self.posted()["description"])
 
+    def test_an_accept_github_renders_as_code_keeps_the_head_pending(self) -> None:
+        # The Fable review of #1767's bodies, each inside a counting APPROVE.
+        accept = f"accept-review-item: {HOTSPOT}"
+        for fenced in (f"~~~\n```\n{accept}\n~~~", f"````\n```\n{accept}\n````",
+                       f"```diff\n ```\n {accept}\n```"):
+            body = f"Reviewed.\n{fenced}\nreviewer: pulp-review\n{STAMP}\nverdict: APPROVE head:{HEAD}"
+            with self.subTest(fenced=fenced):
+                self.assertEqual(self.judged(self.trail(body)), "pending")
+                self.assertIn(HOTSPOT, self.posted()["description"])
+        # Mixed fences closed properly: the accept after them counts.
+        body = (f"Reviewed.\n~~~\n```\n~~~\n{accept}\nreviewer: pulp-review\n{STAMP}\n"
+                f"verdict: APPROVE head:{HEAD}")
+        self.assertEqual(self.judged(self.trail(body)), "success")
+
     def test_an_accept_from_an_approve_that_does_not_count_is_not_success(self) -> None:
         # The same counting rules as the approval: an unsigned App APPROVE
         # carrying every accept is no approval at all.
@@ -459,6 +473,26 @@ class AcceptingBody(unittest.TestCase):
         self.assertIsNone(self.body({"verdict_comment_id": 1, "approved_head": HEAD}))
         self.comment(approve(HOTSPOT), updated_at="2026-10-12T15:00:09Z")
         self.assertIsNone(self.body({"verdict_comment_id": 1, "approved_head": HEAD}))
+
+    def test_text_github_renders_inside_a_fence_accepts_nothing(self) -> None:
+        # The three bodies of the Fable review of #1767: each line toggled
+        # a naive fence state and read as an acceptance.
+        accept = "accept-review-item: hotspot:x"
+        for body in (f"~~~\n```\n{accept}\n~~~",
+                     f"````\n```\n{accept}\n````",
+                     f"```diff\n ```\n {accept}\n```",
+                     f"```\n{accept}",
+                     f"    {accept}",
+                     f"\t{accept}"):
+            with self.subTest(body=body):
+                self.assertEqual(self.guard.accepted_review_items(body), set())
+        # Mixed fences: each closes only on its own character and length,
+        # and an accept after the real close counts.
+        self.assertEqual(self.guard.accepted_review_items(
+            f"~~~\n```\n{accept}\n```\n~~~\naccept-review-item: hotspot:after-tilde\n"
+            f"````\n```\n{accept}\n`````\n   accept-review-item: hotspot:after-ticks\n"
+            f"```py\n{accept}\n``` \naccept-review-item: hotspot:after-trailing-space"),
+            {"hotspot:after-tilde", "hotspot:after-ticks", "hotspot:after-trailing-space"})
 
     def test_the_parsers_match_pulps_grammar(self) -> None:
         self.assertEqual(self.guard.accepted_review_items(

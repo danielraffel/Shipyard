@@ -1420,8 +1420,11 @@ _REVIEW_ITEM_LINE = re.compile(r"review-item: ([a-z][a-z0-9-]*:\S{1,240})")
 _REVIEW_ITEMS_COUNT = re.compile(r"review-items-count: (0|[1-9][0-9]{0,3})")
 # The acceptance line in an exact-head APPROVE (same grammar as Pulp's
 # tools/scripts/review_items.py ACCEPT_LINE).
-_ACCEPT_LINE = re.compile(r"^[ \t]*accept-review-item:[ \t]*(\S+)[ \t]*$")
-_FENCE = re.compile(r"^[ \t]*(```|~~~)")
+# At most three leading spaces: four, or a tab, is an indented code block.
+_ACCEPT_LINE = re.compile(r"^ {0,3}accept-review-item:[ \t]*(\S+)[ \t]*$")
+# A fence opens with up to three spaces and three or more of one character
+# (a backtick fence's info string has no backtick, as CommonMark reads it).
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
 _WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
 _CHECK_RUN_URL = re.compile(r"https://api\.github\.com/repos/([^/]+/[^/]+)/check-runs/([0-9]+)")
 # Set by _review_gate once the policy and the verdicts are read, for
@@ -1591,17 +1594,29 @@ def is_number_id(value: Any) -> bool:
 
 def accepted_review_items(body: str) -> set[str]:
     """Ids a verdict body accepts: ``accept-review-item: <id>`` lines outside
-    fenced code. A ``>`` quote never matches: the line must start with the key."""
+    fenced code. A ``>`` quote never matches: the line must start with the key.
+
+    A fence closes only on a line holding nothing but the opening character,
+    at least as many times, from the first column (stricter than CommonMark,
+    which allows three spaces: a fence read as still open only makes a head
+    wait). So a ``~~~`` block holding a backtick line, a longer backtick
+    fence holding a shorter one, and a diff's `` ```'' context line all stay
+    fenced; an unclosed fence keeps the rest of the body fenced."""
     found: set[str] = set()
-    fenced = False
+    fence: str | None = None
     for line in body.splitlines():
-        if _FENCE.match(line):
-            fenced = not fenced
+        if fence is not None:
+            closing = line.rstrip(" \t")
+            if closing and set(closing) == {fence[0]} and len(closing) >= len(fence):
+                fence = None
             continue
-        if not fenced:
-            match = _ACCEPT_LINE.match(line)
-            if match is not None:
-                found.add(match.group(1))
+        opening = _FENCE_OPEN.match(line)
+        if opening is not None:
+            fence = opening.group(1)
+            continue
+        match = _ACCEPT_LINE.match(line)
+        if match is not None:
+            found.add(match.group(1))
     return found
 
 
