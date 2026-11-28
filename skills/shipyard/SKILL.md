@@ -4678,22 +4678,25 @@ one issue per signature (marker on the last line, updated by comment, closed
 issues left alone, test names sanitised). Do not push a no-op head for such a
 row; fix or list the flaky test. See `docs/automated-draining.md` "Flakes".
 
-**A job GitHub never gives a runner is cancelled once, then proved.**
-On a merge-queue base the steward reports the queue head's merge-group job, or
-a required job on an approved pull request head (the approval context is
-green), that sits `queued` with no runner for `[auto_merge] mq_stall_minutes`
-(20) while a newer job with the same or more labels started on a runner. The
-summary line reads `mq_stall=#<pr>:run:<id>:job:<id>:<age>m` or `pr_stall=...`.
-Under `mq_stall_recover = "apply"` (queue head) or `pr_stall_recover = "apply"`
-(pull requests), both default `off`, the steward cancels that run once per run
-id after re-reading the entry and the job, at most one per repository per pass
-and `mq_stall_max_cancels_per_hour` (3) per hour; `shadow` reports
-`would_cancel` only. A later pass proves it: the queue entry re-enqueued or a
-fresh merge-group run, or for a pull request a re-run (the steward requests one
-once) showing a new attempt, within an hour. Otherwise it reports `mq_stall_unrecovered` or
-`pr_stall_unrecovered` and leaves that run alone. Do not cancel such a run by
-hand while the mode is `apply`. See `docs/automated-draining.md` "Jobs GitHub
-never gives a runner".
+**A queue-head job GitHub never gives a runner is cancelled once, then proved.**
+On a merge-queue base the steward reports the queue head's merge-group job
+that sits `queued` with no runner for `[auto_merge] mq_stall_minutes` (20)
+while a job created at least 5 minutes after it, with the same or more labels,
+started on a runner (`mq_stall=#<pr>:run:<id>:job:<id>:<age>m`). A batch
+sibling taking the one free runner is a short label, not a stall. With
+`pr_stall_recover = "shadow"` it also reports approved pull request heads'
+required jobs (`pr_stall=`); those are report only, and `apply` there is read
+as `shadow`. Under `mq_stall_recover = "apply"` (default `off`) the steward
+cancels the head run once per run id after re-reading the entry and the job,
+at most one per repository per pass, one per pull request in six hours and
+`mq_stall_max_cancels_per_hour` (3) per hour; `shadow` reports `would_cancel`
+only. A cancel ejects the head and rebuilds every group behind it. A later
+pass proves it within an hour (the run cancelled and the entry re-enqueued or
+on a fresh merge-group run); otherwise it reports `mq_stall_unrecovered` and
+leaves that run alone. Run `shadow` for at least 48 hours and check each
+`would_cancel` against what happened before turning `apply` on. Do not cancel
+such a run by hand while the mode is `apply`. See `docs/automated-draining.md`
+"Jobs GitHub never gives a runner".
 
 **A row marked `red_everywhere` is a base-level failure only when the base is red on that check.**
 When one required check fails the same test on three or more open pull requests,

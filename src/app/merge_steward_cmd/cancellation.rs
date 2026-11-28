@@ -697,7 +697,8 @@ pub(super) fn apply_repo_plan(
         let detection = super::mq_stall::detect(
             &|argv: &[String]| actions.run_gh(argv).map_err(|error| error.to_string()),
             observation,
-            &policy.approval_context,
+            (mq_policy.pr_mode != crate::merge_steward::mq_stall::MqStallMode::Off)
+                .then_some(policy.approval_context.as_str()),
             mq_policy.minutes,
             now,
         );

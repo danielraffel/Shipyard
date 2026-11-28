@@ -1,11 +1,16 @@
-//! Jobs GitHub never gave a runner, on two recorded Generous-Corp/vellum
+//! Jobs GitHub never gave a runner, on three recorded Generous-Corp/vellum
 //! shapes (read back with `ghread`, trimmed to the fields the stall reads):
 //!
 //! * `mq_stall_vellum_825.json`, 2026-11-28T04:55Z: the queue head #825's
 //!   run 46104476461 had job 140854026289 queued with runner id 0 since
-//!   03:46:57 while job 140854029336 of #769's run 46104477453 (created the
-//!   same second) started on `studio-vellum-gate-slot2-02-59395-93` at
-//!   03:51:50;
+//!   03:46:57 while job 140859201898 of #791's run 46106139411 (created
+//!   04:08:34) started on `m5studio-vellum-gate-01-19987-181` at 04:11:24.
+//!   The same-second sibling 140854029336 (#769, started 03:51:50) is a batch
+//!   sibling and never a witness;
+//! * `mq_stall_vellum_825_batch_sibling.json`, 08:00Z, a negative: head job
+//!   140908713155 (created 07:38:19) waited while only its batch sibling
+//!   140908717862 (created 07:38:21) had started; the head got a runner at
+//!   08:10:19 and #825 merged at 09:03:46 unaided;
 //! * `mq_stall_vellum_pr_jobs.json`, 09:29Z: seven approved pull requests'
 //!   `gpu-macos-arm64` jobs queued from 05:12Z while job 140898811001 (run
 //!   46118904930, created 06:56:33) started at 09:05:16 and completed.
@@ -29,6 +34,8 @@ const RUN_825: u64 = 46_104_476_461;
 const JOB_825: u64 = 140_854_026_289;
 const RUN_769: u64 = 46_104_477_453;
 const JOB_769: u64 = 140_854_029_336;
+const RUN_791: u64 = 46_106_139_411;
+const JOB_791: u64 = 140_859_201_898;
 const WITNESS_PR_RUN: u64 = 46_118_904_930;
 const WITNESS_PR_JOB: u64 = 140_898_811_001;
 
@@ -211,14 +218,14 @@ fn detect(shape: &Shape, observation: &RepoObservation, now: DateTime<Utc>) -> D
     mq_stall::detect(
         &|argv: &[String]| shape.gh(argv),
         observation,
-        crate::merge_steward::DEFAULT_APPROVAL_CONTEXT,
+        Some(crate::merge_steward::DEFAULT_APPROVAL_CONTEXT),
         20,
         now,
     )
 }
 
 #[test]
-fn the_825_shape_is_a_queue_head_stall_with_the_769_witness() {
+fn the_825_shape_is_a_queue_head_stall_with_the_791_witness() {
     let shape = Shape::load("mq_stall_vellum_825.json");
     let detection = detect(&shape, &queue_825(&shape), shape.now);
     assert!(detection.unread.is_none(), "{detection:?}");
@@ -229,17 +236,45 @@ fn the_825_shape_is_a_queue_head_stall_with_the_769_witness() {
         (stall.pr, stall.run_id, stall.job_id),
         (825, RUN_825, JOB_825)
     );
+    // Not #769's same-second batch sibling: #791's job, 11.6 minutes later.
     assert_eq!(
         (stall.witness_run_id, stall.witness_job_id),
-        (RUN_769, JOB_769)
+        (RUN_791, JOB_791)
     );
     assert_eq!(
         stall.witness_runner.as_deref(),
-        Some("studio-vellum-gate-slot2-02-59395-93")
+        Some("m5studio-vellum-gate-01-19987-181")
     );
     assert_eq!(stall.token(), "#825:run:46104476461:job:140854026289:68m");
-    // Jobs are read once per pass: the stalled run, the listing, the witness.
-    assert_eq!(detection.reads, 3, "{:?}", shape.reads.borrow());
+    // Jobs are read once per pass: the stalled run, the listing, #769's run,
+    // the witness run.
+    assert_eq!(detection.reads, 4, "{:?}", shape.reads.borrow());
+}
+
+/// The 07:38Z shape: only a batch sibling had a runner, and the head was
+/// served 32 minutes in and merged by itself.
+#[test]
+fn a_batch_sibling_taking_the_free_runner_is_not_a_witness() {
+    let shape = Shape::load("mq_stall_vellum_825_batch_sibling.json");
+    let mut observation = observation(
+        vec![
+            pr(825, &"8".repeat(40), Some(1), true, None),
+            pr(837, &"3".repeat(40), Some(2), true, None),
+            pr(816, &"6".repeat(40), Some(3), true, None),
+        ],
+        shape.census.clone(),
+    );
+    observation.merge_group_heads = BTreeMap::from([
+        (825, "a563a7a70457181faf57d0b170a9e80344a7e257".to_owned()),
+        (816, "3d4f2d17399052076984888ee8c959d9f2a1c1ed".to_owned()),
+    ]);
+    let detection = detect(&shape, &observation, shape.now);
+    assert!(detection.unread.is_none(), "{detection:?}");
+    assert!(detection.stalls.is_empty(), "{detection:?}");
+    // The same shape with a later witness would count: the margin is the guard.
+    let mut later = Shape::load("mq_stall_vellum_825_batch_sibling.json");
+    later.job_mut(140_908_717_862)["created_at"] = "2026-11-28T07:43:30Z".into();
+    assert_eq!(detect(&later, &observation, later.now).stalls.len(), 1);
 }
 
 #[test]
@@ -261,6 +296,46 @@ fn a_full_fleet_with_no_newer_started_job_is_not_a_stall() {
             .iter()
             .any(|note| note.contains("no newer job with its labels")),
         "{detection:?}"
+    );
+}
+
+#[test]
+fn a_stalled_job_with_no_labels_is_never_a_stall() {
+    let mut shape = Shape::load("mq_stall_vellum_825.json");
+    shape.job_mut(JOB_825)["labels"] = serde_json::json!([]);
+    assert!(
+        detect(&shape, &queue_825(&shape), shape.now)
+            .stalls
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_run_off_the_heads_current_group_is_never_judged() {
+    let shape = Shape::load("mq_stall_vellum_825.json");
+    let mut observation = queue_825(&shape);
+    // #825's queue entry moved to a new group; the old group's run lingers.
+    observation.merge_group_heads.insert(825, "c".repeat(40));
+    let detection = detect(&shape, &observation, shape.now);
+    assert!(detection.stalls.is_empty(), "{detection:?}");
+    assert!(!shape.read_jobs_of(RUN_825), "{:?}", shape.reads.borrow());
+}
+
+#[test]
+fn pull_request_targets_are_read_only_when_their_knob_is_on() {
+    let shape = Shape::load("mq_stall_vellum_pr_jobs.json");
+    let detection = mq_stall::detect(
+        &|argv: &[String]| shape.gh(argv),
+        &pr_jobs(&shape),
+        None,
+        20,
+        shape.now,
+    );
+    assert!(detection.stalls.is_empty(), "{detection:?}");
+    assert!(
+        shape.reads.borrow().is_empty(),
+        "{:?}",
+        shape.reads.borrow()
     );
 }
 
@@ -365,7 +440,7 @@ fn an_incomplete_read_decides_nothing() {
     let detection = mq_stall::detect(
         &partial,
         &queue_825(&shape),
-        "review-verdict",
+        Some("review-verdict"),
         20,
         shape.now,
     );
@@ -400,8 +475,9 @@ fn approved_pr_heads_with_old_queued_gpu_jobs_are_pr_stalls() {
         .iter()
         .map(|stall| stall.pr)
         .collect::<Vec<_>>();
-    // Created before the 06:56:33 witness and over 20 minutes old.
-    assert_eq!(stalled, vec![842, 843, 844, 833], "{detection:?}");
+    // Over 20 minutes old and created at least 5 minutes before the 06:56:33
+    // witness; #833's job (06:54:10) is too close to it.
+    assert_eq!(stalled, vec![842, 843, 844], "{detection:?}");
     assert!(
         detection
             .stalls
@@ -459,7 +535,6 @@ struct FakeActs {
     cancel: Result<(), String>,
     run: RefCell<Result<RunState, String>>,
     cancels: RefCell<Vec<u64>>,
-    reruns: RefCell<Vec<u64>>,
 }
 
 impl FakeActs {
@@ -470,7 +545,6 @@ impl FakeActs {
             cancel: Ok(()),
             run: RefCell::new(Ok(cancelled_run(1))),
             cancels: RefCell::default(),
-            reruns: RefCell::default(),
         }
     }
 
@@ -521,10 +595,6 @@ impl Acts for FakeActs {
     }
     fn read_run(&self, _run_id: u64) -> Result<RunState, String> {
         self.run.borrow().clone()
-    }
-    fn rerun(&self, run: &StewardRun) -> Result<(), String> {
-        self.reruns.borrow_mut().push(run.id);
-        Ok(())
     }
 }
 
@@ -734,113 +804,154 @@ fn an_unread_detection_never_acts() {
     assert!(acts.cancels.borrow().is_empty());
 }
 
+/// The 825 stall, as if on another pull request and run.
+fn other_stall(detection: &Detection, pr: u64, run_id: u64) -> mq_stall::Stall {
+    let mut stall = detection.stalls[0].clone();
+    stall.pr = pr;
+    stall.run_id = run_id;
+    stall
+}
+
+fn prior_receipt(ledger: &mut StewardLedger, pr: u64, run_id: u64, at: DateTime<Utc>) {
+    ledger.mq_stall_cancels.insert(
+        mq_stall::receipt_key(REPO, run_id),
+        Receipt {
+            repo: REPO.to_owned(),
+            kind: Kind::MergeQueue,
+            pr,
+            run_id,
+            job_id: 1,
+            head_sha: G825.to_owned(),
+            at: at.to_rfc3339(),
+            outcome: "cancelled".to_owned(),
+            progress: None,
+            proved_at: None,
+        },
+    );
+}
+
 #[test]
-fn the_hourly_cap_and_one_cancel_per_pass_hold() {
-    let shape = Shape::load("mq_stall_vellum_pr_jobs.json");
-    let observation = pr_jobs(&shape);
-    let detection = detect(&shape, &observation, shape.now);
-    assert_eq!(detection.stalls.len(), 4);
-    let acts = FakeActs::ok(Entry::default());
-    let apply = policy(MqStallMode::Off, MqStallMode::Apply);
+fn one_cancel_per_pass() {
+    let (shape, mut observation, mut detection) = stalled_825();
+    let mut second = observation.runs[0].clone();
+    second.id = RUN_825 + 1;
+    observation.runs.push(second);
+    let extra = other_stall(&detection, 825, RUN_825 + 1);
+    detection.stalls.push(extra);
+    let acts = FakeActs::head_825();
     let mut ledger = StewardLedger::default();
-    let first = mq_stall::act(
+    let actions = act(
         &detection,
-        &apply,
+        &policy(MqStallMode::Apply, MqStallMode::Off),
         true,
-        &BTreeSet::new(),
         &observation,
         &mut ledger,
-        &HeadActs(&acts, &observation),
+        &acts,
         shape.now,
     );
-    let outcomes = first.iter().map(|a| a.outcome.as_str()).collect::<Vec<_>>();
-    assert_eq!(
-        outcomes,
-        vec!["cancelled", "deferred", "deferred", "deferred"]
-    );
+    let outcomes = actions
+        .iter()
+        .map(|a| a.outcome.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes, vec!["cancelled", "deferred"]);
     assert_eq!(acts.cancels.borrow().len(), 1);
-    // Two more passes spend the hour's cap of three; the fourth is refused.
-    for minutes in [5, 10] {
-        let next = mq_stall::act(
-            &detection,
-            &apply,
-            true,
-            &BTreeSet::new(),
-            &observation,
+}
+
+#[test]
+fn the_hourly_cap_holds() {
+    let (shape, observation, detection) = stalled_825();
+    let acts = FakeActs::head_825();
+    let apply = policy(MqStallMode::Apply, MqStallMode::Off);
+    let mut ledger = StewardLedger::default();
+    for (index, pr) in [901, 902, 903].into_iter().enumerate() {
+        let minutes = 10 * (i64::try_from(index).expect("small") + 1);
+        prior_receipt(
             &mut ledger,
-            &HeadActs(&acts, &observation),
-            shape.now + chrono::Duration::minutes(minutes),
-        );
-        assert!(
-            next.iter().filter(|a| a.outcome == "cancelled").count() == 1,
-            "{next:?}"
+            pr,
+            1_000 + pr,
+            shape.now - chrono::Duration::minutes(minutes),
         );
     }
-    let capped = mq_stall::act(
+    let capped = act(
         &detection,
         &apply,
         true,
-        &BTreeSet::new(),
         &observation,
         &mut ledger,
-        &HeadActs(&acts, &observation),
-        shape.now + chrono::Duration::minutes(15),
+        &acts,
+        shape.now,
     );
-    let refused = capped
-        .iter()
-        .find(|a| a.outcome == "refused")
-        .expect("refused");
+    assert_eq!(capped[0].outcome, "refused", "{capped:?}");
     assert!(
-        refused
+        capped[0]
             .detail
             .as_deref()
             .unwrap_or_default()
             .contains("cap 3"),
         "{capped:?}"
     );
-    assert_eq!(acts.cancels.borrow().len(), 3);
-    // An hour after the first, the cap has room again.
-    let later = mq_stall::act(
+    assert!(acts.cancels.borrow().is_empty());
+    // Once the oldest is over an hour old there is room again.
+    let later = shape.now + chrono::Duration::minutes(31);
+    let next = act(
         &detection,
         &apply,
         true,
-        &BTreeSet::new(),
         &observation,
         &mut ledger,
-        &HeadActs(&acts, &observation),
-        shape.now + chrono::Duration::minutes(61),
+        &acts,
+        later,
     );
-    assert!(later.iter().any(|a| a.outcome == "cancelled"), "{later:?}");
+    assert_eq!(next[0].outcome, "cancelled", "{next:?}");
 }
 
-/// The fake acts, re-reading each pull request at its observed head.
-struct HeadActs<'a>(&'a FakeActs, &'a RepoObservation);
-
-impl Acts for HeadActs<'_> {
-    fn reread_entry(&self, pr: u64) -> Result<Entry, String> {
-        Ok(Entry {
-            head: self
-                .1
-                .prs
-                .iter()
-                .find(|row| row.fact.number == pr)
-                .map(|row| row.fact.head_sha.clone()),
-            position: None,
-            group: None,
-        })
-    }
-    fn reread_job(&self, job_id: u64) -> Result<Job, String> {
-        self.0.reread_job(job_id)
-    }
-    fn cancel(&self, run: &StewardRun) -> Result<(), String> {
-        self.0.cancel(run)
-    }
-    fn read_run(&self, run_id: u64) -> Result<RunState, String> {
-        self.0.read_run(run_id)
-    }
-    fn rerun(&self, run: &StewardRun) -> Result<(), String> {
-        self.0.rerun(run)
-    }
+/// A re-enqueued head gets a new group and a new run id: one cancel per
+/// pull request in six hours, not only per run.
+#[test]
+fn one_cancel_per_pull_request_in_six_hours() {
+    let (shape, observation, detection) = stalled_825();
+    let acts = FakeActs::head_825();
+    let apply = policy(MqStallMode::Apply, MqStallMode::Off);
+    let mut ledger = StewardLedger::default();
+    prior_receipt(
+        &mut ledger,
+        825,
+        RUN_825 - 5,
+        shape.now - chrono::Duration::hours(2),
+    );
+    let refused = act(
+        &detection,
+        &apply,
+        true,
+        &observation,
+        &mut ledger,
+        &acts,
+        shape.now,
+    );
+    assert_eq!(refused[0].outcome, "refused", "{refused:?}");
+    assert!(
+        refused[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("one per pull request"),
+        "{refused:?}"
+    );
+    assert!(acts.cancels.borrow().is_empty());
+    let later = shape.now + chrono::Duration::hours(5);
+    assert_eq!(
+        act(
+            &detection,
+            &apply,
+            true,
+            &observation,
+            &mut ledger,
+            &acts,
+            later
+        )[0]
+        .outcome,
+        "cancelled"
+    );
 }
 
 #[test]
@@ -1033,6 +1144,44 @@ fn a_run_that_was_not_cancelled_is_unrecovered() {
     assert_eq!(unrecovered.len(), 1);
 }
 
+/// The queue entry moved, but the run was never cancelled (it finished on
+/// its own): not a recovery by the cancel.
+#[test]
+fn a_moved_entry_without_a_cancelled_run_is_not_recovered() {
+    let (mut observation, mut ledger, cancelled) = cancelled_825();
+    observation.merge_group_heads.insert(825, "b".repeat(40));
+    let acts = FakeActs::head_825();
+    *acts.run.borrow_mut() = Ok(RunState {
+        status: "completed".to_owned(),
+        conclusion: Some("success".to_owned()),
+        run_attempt: 1,
+    });
+    let (none, _) = mq_stall::progress(
+        &acts,
+        &observation,
+        &[],
+        &mut ledger,
+        cancelled + chrono::Duration::minutes(5),
+    );
+    assert!(none.is_empty());
+    assert!(receipt(&ledger, RUN_825).progress.is_none());
+    let (unrecovered, _) = mq_stall::progress(
+        &acts,
+        &observation,
+        &[],
+        &mut ledger,
+        cancelled + chrono::Duration::minutes(61),
+    );
+    assert_eq!(unrecovered.len(), 1);
+    assert!(
+        receipt(&ledger, RUN_825)
+            .progress
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("unrecovered: run is completed/success")
+    );
+}
+
 #[test]
 fn an_unread_run_stays_pending_for_an_hour_then_is_unrecovered() {
     let (observation, mut ledger, cancelled) = cancelled_825();
@@ -1060,131 +1209,55 @@ fn an_unread_run_stays_pending_for_an_hour_then_is_unrecovered() {
     assert_eq!(unrecovered.len(), 1);
 }
 
-/// Cancel #842's PR run.
-fn cancelled_842() -> (RepoObservation, StewardLedger, DateTime<Utc>, FakeActs) {
+/// Pull request stalls are report only: even `apply` (read as shadow, but
+/// also if a policy said apply) never cancels one.
+#[test]
+fn a_pull_request_stall_is_never_cancelled() {
     let shape = Shape::load("mq_stall_vellum_pr_jobs.json");
     let observation = pr_jobs(&shape);
     let detection = detect(&shape, &observation, shape.now);
+    assert_eq!(detection.stalls.len(), 3);
     let acts = FakeActs::ok(Entry::default());
     let mut ledger = StewardLedger::default();
-    let actions = mq_stall::act(
+    let actions = act(
         &detection,
-        &policy(MqStallMode::Off, MqStallMode::Apply),
+        &policy(MqStallMode::Apply, MqStallMode::Apply),
         true,
-        &BTreeSet::new(),
         &observation,
         &mut ledger,
-        &HeadActs(&acts, &observation),
+        &acts,
         shape.now,
     );
-    assert_eq!(
-        (actions[0].pr, actions[0].outcome.as_str()),
-        (842, "cancelled")
+    assert!(
+        actions.iter().all(|a| a.outcome == "would_cancel"),
+        "{actions:?}"
     );
-    acts.cancels.borrow_mut().clear();
-    (observation, ledger, shape.now, acts)
+    assert!(acts.cancels.borrow().is_empty() && ledger.mq_stall_cancels.is_empty());
 }
 
 #[test]
-fn a_cancelled_pr_run_is_re_run_once_and_proved_by_its_new_attempt() {
-    let (observation, mut ledger, cancelled, acts) = cancelled_842();
-    let run = 46_111_057_074;
-    let next = cancelled + chrono::Duration::minutes(5);
-    let (unrecovered, lines) = mq_stall::progress(&acts, &observation, &[], &mut ledger, next);
-    assert!(unrecovered.is_empty(), "{lines:?}");
-    assert_eq!(*acts.reruns.borrow(), vec![run]);
-    assert_eq!(receipt(&ledger, run).rerun.as_deref(), Some("requested"));
-    assert!(receipt(&ledger, run).progress.is_none());
-    // The next pass sees attempt 2.
-    *acts.run.borrow_mut() = Ok(RunState {
-        status: "queued".to_owned(),
-        conclusion: None,
-        run_attempt: 2,
-    });
-    mq_stall::progress(
-        &acts,
-        &observation,
-        &[],
+fn a_pull_request_receipt_from_an_older_binary_is_closed() {
+    let acts = FakeActs::head_825();
+    let shape = Shape::load("mq_stall_vellum_pr_jobs.json");
+    let observation = pr_jobs(&shape);
+    let mut ledger = StewardLedger::default();
+    prior_receipt(
         &mut ledger,
-        next + chrono::Duration::minutes(5),
+        842,
+        46_111_057_074,
+        shape.now - chrono::Duration::minutes(5),
     );
-    assert_eq!(
-        receipt(&ledger, run).progress.as_deref(),
-        Some("recovered: re-run as attempt 2 (queued)")
-    );
-    assert_eq!(acts.reruns.borrow().len(), 1);
-}
-
-#[test]
-fn a_re_run_that_never_shows_is_unrecovered() {
-    let (observation, mut ledger, cancelled, acts) = cancelled_842();
-    let next = cancelled + chrono::Duration::minutes(5);
-    mq_stall::progress(&acts, &observation, &[], &mut ledger, next);
-    let (unrecovered, _) = mq_stall::progress(
-        &acts,
-        &observation,
-        &[],
-        &mut ledger,
-        next + chrono::Duration::minutes(61),
-    );
+    if let Some(receipt) = ledger
+        .mq_stall_cancels
+        .get_mut(&mq_stall::receipt_key(REPO, 46_111_057_074))
+    {
+        receipt.kind = Kind::PullRequest;
+    }
+    let (unrecovered, _) = mq_stall::progress(&acts, &observation, &[], &mut ledger, shape.now);
     assert_eq!(
         unrecovered,
         vec![(Kind::PullRequest, "#842:run:46111057074".to_owned())]
     );
-    assert_eq!(acts.reruns.borrow().len(), 1, "re-run once");
-}
-
-#[test]
-fn the_stewards_own_re_run_counts_without_a_second_one() {
-    let (observation, mut ledger, cancelled, acts) = cancelled_842();
-    *acts.run.borrow_mut() = Ok(RunState {
-        status: "in_progress".to_owned(),
-        conclusion: None,
-        run_attempt: 2,
-    });
-    mq_stall::progress(
-        &acts,
-        &observation,
-        &[],
-        &mut ledger,
-        cancelled + chrono::Duration::minutes(5),
-    );
-    assert!(acts.reruns.borrow().is_empty());
-    assert!(
-        receipt(&ledger, 46_111_057_074)
-            .progress
-            .as_deref()
-            .unwrap_or_default()
-            .starts_with("recovered")
-    );
-}
-
-#[test]
-fn a_moved_pr_head_refuses_the_cancel() {
-    let shape = Shape::load("mq_stall_vellum_pr_jobs.json");
-    let observation = pr_jobs(&shape);
-    let detection = detect(&shape, &observation, shape.now);
-    let acts = FakeActs::ok(Entry {
-        head: Some("f".repeat(40)),
-        position: None,
-        group: None,
-    });
-    let mut ledger = StewardLedger::default();
-    let actions = mq_stall::act(
-        &detection,
-        &policy(MqStallMode::Off, MqStallMode::Apply),
-        true,
-        &BTreeSet::new(),
-        &observation,
-        &mut ledger,
-        &acts,
-        shape.now,
-    );
-    assert!(
-        actions.iter().all(|a| a.outcome == "refused"),
-        "{actions:?}"
-    );
-    assert!(acts.cancels.borrow().is_empty());
 }
 
 #[test]
@@ -1214,7 +1287,7 @@ fn the_queue_and_pr_knobs_are_separate() {
         &ledger,
         REPO,
     );
-    assert_eq!(status.summary.pr_stall.len(), 4);
+    assert_eq!(status.summary.pr_stall.len(), 3);
     assert!(status.summary.mq_stall.is_empty());
 }
 

@@ -1,73 +1,71 @@
-//! Jobs GitHub never gives a runner: the queue head's merge-group jobs and
-//! the required-check jobs of approved pull request heads.
+//! Jobs GitHub never gives a runner: the queue head's merge-group jobs and,
+//! report only, the required-check jobs of approved pull request heads.
 //!
 //! Under an `ALLGREEN` merge queue every entry behind the head is built on
 //! the head's group, so a head job that stays `queued` with no runner holds
 //! the whole queue until the ruleset's check timeout. On 2026-11-28 Vellum
 //! run 46104476461 (#825) had job `gpu-macos-arm64` 140854026289 queued with
-//! runner id 0 for 69 minutes while job 140854029336 (run 46104477453, #769,
-//! same labels, created the same second) started on a runner at 03:51:50 and
-//! job 140859201898 (run 46106139411, #791) at 04:11:24. The lane had counted
-//! the job and minted runners; GitHub gave them the newer jobs. It was
-//! cancelled by hand. The same day seven approved Vellum pull requests had
-//! their `gpu-macos-arm64` job queued from 05:12-09:11Z (runs 46111057074 to
-//! 46129273537) while job 140898811001 (run 46118904930, created 06:56, same
-//! labels) started on a runner at 09:05.
+//! runner id 0 for 69 minutes while job 140859201898 (run 46106139411, #791,
+//! same labels, created 04:08:34) started on a runner at 04:11:24. It was
+//! cancelled by hand. A head cancel is not free: #825 was ejected, the groups
+//! behind it were rebuilt (discarding #769's finished 58-minute GPU job), and
+//! #825 was re-enqueued 37 minutes later.
 //!
-//! **Detect** (every merge-queue base, report only; [`detect`]). Targets:
+//! A runner going to a job created in the same batch proves only that there
+//! were fewer runners than jobs. At 07:38Z the same day the head job
+//! 140908713155 (created 07:38:19) waited while its batch sibling 140908717862
+//! (#816, created 07:38:21) started at 07:44:01; the head got a runner at
+//! 08:10:19 and #825 merged at 09:03:46 unaided. A witness must therefore be
+//! created at least [`WITNESS_MARGIN_SECS`] after the stalled job.
 //!
-//! * the queue head entry only: each unfinished `merge_group` run on its
-//!   group head;
-//! * each open, non-draft pull request whose head the approval context
-//!   (`review-verdict`) reports green: each `pull_request` run on its exact
-//!   head that is still `queued` as a whole.
+//! **Detect** (report only; [`detect`]). Targets:
+//!
+//! * every merge-queue base: the queue head entry only, each unfinished
+//!   `merge_group` run on its current group head;
+//! * only when `pr_stall_recover` is not `off`: each open, non-draft pull
+//!   request whose head the approval context (`review-verdict`) reports
+//!   green, each `pull_request` run on its exact head still `queued` as a
+//!   whole. Pull request stalls are never acted on: the seven Vellum PR jobs
+//!   queued from 05:12Z on 2026-11-28 were a backlog on their label served
+//!   out of order, and a cancel and re-run only resets a job's place.
 //!
 //! A target run is read only once it is older than the threshold, at most
 //! [`MAX_TARGET_READS`] per pass. A job is stalled when it is `queued`, has
 //! no runner (runner id absent or 0 and no runner name), names labels, has
 //! waited at least `[auto_merge] mq_stall_minutes` (default 20) since it was
 //! created and no other job of its run is `in_progress`. A pull request job
-//! must also produce a required check (its check run is required, or its
-//! name is a required context). A stalled job counts only with a witness: a
-//! newer job of the same repository (later `created_at`, or the same second
-//! and a larger id) whose labels include all of the stalled job's, that
-//! started on a runner after the stalled job was created. The witness scan
-//! lists the stalled workflow's runs created since the oldest stalled job
-//! (one read; completed runs count) and joins the pass's run census; it reads
-//! the stalled runs' own jobs first, then the same workflow, then other
-//! merge groups, then the rest, skipping runs still `queued` (no job of
-//! theirs started), at most [`MAX_WITNESS_READS`] job reads, and stops once
-//! every stall has a witness. Jobs are read once per pass. Any failed or
-//! partial read decides nothing and is reported as unread. The summary tokens
-//! are `mq_stall=#<pr>:run:<id>:job:<id>:<age>m` and `pr_stall=...`.
+//! must also produce a required check. A stalled job counts only with a
+//! witness: a job of the same repository created at least
+//! [`WITNESS_MARGIN_SECS`] after it, whose labels include all of the stalled
+//! job's, that started on a runner. The witness scan lists the stalled
+//! workflow's runs created since the oldest stalled job (one read; completed
+//! runs count) and joins the pass's run census; it reads the stalled runs'
+//! own jobs first, then the same workflow, then other merge groups, then the
+//! rest, skipping runs still `queued`, at most [`MAX_WITNESS_READS`] job
+//! reads, and stops once every stall has a witness. Jobs are read once per
+//! pass. Any failed or partial read decides nothing and is reported as
+//! unread. The summary tokens are `mq_stall=#<pr>:run:<id>:job:<id>:<age>m`
+//! and `pr_stall=...`.
 //!
-//! **Recover** (`[auto_merge] mq_stall_recover` for the queue head and
-//! `pr_stall_recover` for pull requests, each `off | shadow | apply`,
-//! default off). `shadow`, or `apply` on a pass that does not apply, reports
-//! `would_cancel` and writes nothing. Under `apply` the steward cancels the
+//! **Recover** (`[auto_merge] mq_stall_recover`, `off | shadow | apply`,
+//! default off; queue head only). `shadow`, or `apply` on a pass that does
+//! not apply, reports `would_cancel` and writes nothing; a pull request stall
+//! only ever reports `would_cancel`. Under `apply` the steward cancels the
 //! stalled run once per run id, under the run mutation guard, after a fresh
-//! read shows the entry is still the head on the same group (or the pull
-//! request head is unchanged) and the job is still queued with no runner.
-//! At most one cancel per repository per pass, the queue head first, and at
-//! most `mq_stall_max_cancels_per_hour` (default 3) per repository per hour,
-//! both kinds together. Every attempt is a receipt in the steward ledger.
+//! read shows the entry is still the head on the same group and the job is
+//! still queued with no runner. At most one cancel per repository per pass,
+//! at most one per pull request in [`PER_PR_WINDOW_SECS`] (a re-enqueued head
+//! gets a new run id), and at most `mq_stall_max_cancels_per_hour` (default
+//! 3) per repository per hour. Every attempt is a receipt in the steward
+//! ledger.
 //!
 //! **Prove** ([`progress`]), on a later pass, from a fresh run read:
-//!
-//! * queue head: recovered only when the run concluded `cancelled` and the
-//!   pull request moved: it left the open set, sits in the queue on a
-//!   different group, has a newer merge-group run, or this pass enqueued it
-//!   again;
-//! * pull request: once the run is `cancelled`, it is re-run
-//!   (`rerun-failed-jobs`, under the guard, once); recovered when the run
-//!   shows a newer attempt (the steward's own transient re-run counts) or the
-//!   pull request head moved.
-//!
-//! Until [`RECOVERY_WINDOW_SECS`] after the last act a receipt that has not
-//! moved stays pending (Vellum #825, cancelled by hand at 04:56Z, was
-//! re-enqueued at 05:33). After it the receipt becomes `unrecovered`
-//! (`mq_stall_unrecovered` or `pr_stall_unrecovered`) and that run is never
-//! cancelled again. A failed
+//! recovered only when the run concluded `cancelled` and the pull request
+//! moved: it left the open set, sits in the queue on a different group, has
+//! a newer merge-group run, or this pass enqueued it again. Until
+//! [`RECOVERY_WINDOW_SECS`] after the act a receipt that has not moved stays
+//! pending. After it the receipt becomes `unrecovered`
+//! (`mq_stall_unrecovered`) and that run is never cancelled again. A failed
 //! run read keeps the receipt pending for at most [`PROGRESS_UNREAD_SECS`].
 
 use std::collections::BTreeMap;
@@ -84,6 +82,11 @@ use crate::merge_steward::mq_stall::{MqStallMode, MqStallPolicy};
 pub(super) const MAX_TARGET_READS: usize = 15;
 /// The most job reads one pass spends looking for witnesses.
 pub(super) const MAX_WITNESS_READS: usize = 10;
+/// A witness must be created at least this long after the stalled job, so a
+/// batch sibling taking the one free runner never counts.
+pub(super) const WITNESS_MARGIN_SECS: i64 = 300;
+/// At most one stall cancel per pull request in this window.
+pub(super) const PER_PR_WINDOW_SECS: i64 = 6 * 3600;
 /// A receipt is proved no sooner than this after its last act.
 pub(super) const PROGRESS_MIN_SECS: i64 = 60;
 /// How long the entry may take to move after the act before the receipt is
@@ -154,16 +157,18 @@ impl Job {
     }
 
     /// Whether this job proves runners for `stalled`'s labels were handed
-    /// out after `stalled` was queued.
+    /// out after `stalled` was queued: created at least
+    /// [`WITNESS_MARGIN_SECS`] later (not a batch sibling), with every one of
+    /// its labels, and started on a runner.
     fn witnesses(&self, stalled: &Job) -> bool {
         let Some(created) = stalled.created_at else {
             return false;
         };
+        let margin = created + chrono::Duration::seconds(WITNESS_MARGIN_SECS);
         self.id != stalled.id
+            && !stalled.labels.is_empty()
             && self.has_runner()
-            && self
-                .created_at
-                .is_some_and(|at| (at, self.id) > (created, stalled.id))
+            && self.created_at.is_some_and(|at| at >= margin)
             && self.started_at.is_some_and(|at| at > created)
             && self.covers(&stalled.labels)
     }
@@ -333,7 +338,7 @@ struct Target<'a> {
 
 fn targets<'a>(
     observation: &'a RepoObservation,
-    approval_context: &str,
+    approval_context: Option<&str>,
     threshold: chrono::Duration,
     now: DateTime<Utc>,
 ) -> Vec<Target<'a>> {
@@ -363,6 +368,10 @@ fn targets<'a>(
             required_runs: Vec::new(),
         }));
     }
+    // Pull request targets cost reads; only a base that asks for them pays.
+    let Some(approval_context) = approval_context else {
+        return out;
+    };
     let required = observation
         .required_checks
         .iter()
@@ -437,12 +446,13 @@ impl Reader<'_> {
 }
 
 /// Read the targets' jobs and, when one waits, look for witnesses. Reads
-/// nothing unless a target run is older than the threshold.
+/// nothing unless a target run is older than the threshold. `approval_context`
+/// is `None` when pull request targets are off.
 #[allow(clippy::too_many_lines)] // Targets, candidates and the witness scan read in one order.
 pub(super) fn detect(
     run_gh: &dyn Fn(&[String]) -> Result<String, String>,
     observation: &RepoObservation,
-    approval_context: &str,
+    approval_context: Option<&str>,
     minutes: u32,
     now: DateTime<Utc>,
 ) -> Detection {
@@ -664,24 +674,10 @@ pub(super) struct Receipt {
     /// The group head (merge queue) or the pull request head.
     #[serde(alias = "group_sha")]
     pub(super) head_sha: String,
-    /// What the guard and the re-run need of the run.
-    #[serde(default)]
-    pub(super) run_head_branch: String,
-    #[serde(default)]
-    pub(super) run_head_sha: String,
-    #[serde(default)]
-    pub(super) workflow_id: u64,
-    #[serde(default)]
-    pub(super) run_attempt: u64,
     /// RFC 3339.
     pub(super) at: String,
     /// `cancelled` or `failed: ...`.
     pub(super) outcome: String,
-    /// Pull request only: `requested` or `failed: ...`, once.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) rerun: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) rerun_at: Option<String>,
     /// `recovered: ...` or `unrecovered: ...`; absent until proved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) progress: Option<String>,
@@ -710,23 +706,6 @@ impl Receipt {
     /// `#<pr>:run:<id>`.
     fn token(&self) -> String {
         format!("#{}:run:{}", self.pr, self.run_id)
-    }
-
-    /// The run as the guard needs it.
-    fn run(&self) -> StewardRun {
-        StewardRun {
-            id: self.run_id,
-            workflow_id: self.workflow_id,
-            run_attempt: self.run_attempt,
-            workflow: String::new(),
-            head_sha: self.run_head_sha.clone(),
-            head_branch: self.run_head_branch.clone(),
-            status: "completed".to_owned(),
-            event: "pull_request".to_owned(),
-            pull_request_number: Some(self.pr),
-            created_at: self.at.clone(),
-            jobs: Vec::new(),
-        }
     }
 }
 
@@ -764,8 +743,6 @@ pub(super) trait Acts {
     fn cancel(&self, run: &StewardRun) -> Result<(), String>;
     /// Read one run.
     fn read_run(&self, run_id: u64) -> Result<RunState, String>;
-    /// Re-run the run's failed and cancelled jobs under the guard.
-    fn rerun(&self, run: &StewardRun) -> Result<(), String>;
 }
 
 /// What the act did for one stall this pass.
@@ -888,7 +865,8 @@ pub(super) fn act(
             );
             continue;
         }
-        if mode == MqStallMode::Shadow || !applying {
+        // Pull request stalls are report only, whatever the mode says.
+        if mode == MqStallMode::Shadow || !applying || stall.kind == Kind::PullRequest {
             record("would_cancel", Some(stall.token()));
             continue;
         }
@@ -906,6 +884,24 @@ pub(super) fn act(
                 key.starts_with(&prefix) && receipt.at().is_some_and(|at| at > hour)
             })
             .count();
+        let per_pr = now - chrono::Duration::seconds(PER_PR_WINDOW_SECS);
+        if let Some(earlier) = ledger.mq_stall_cancels.iter().find(|(key, receipt)| {
+            key.starts_with(&prefix)
+                && receipt.pr == stall.pr
+                && receipt.at().is_some_and(|at| at > per_pr)
+        }) {
+            record(
+                "refused",
+                Some(format!(
+                    "#{} already had a stall cancel at {} (run {}); one per pull request in {} hours",
+                    stall.pr,
+                    earlier.1.at,
+                    earlier.1.run_id,
+                    PER_PR_WINDOW_SECS / 3600
+                )),
+            );
+            continue;
+        }
         if recent >= policy.max_cancels_per_hour as usize {
             record(
                 "refused",
@@ -938,14 +934,8 @@ pub(super) fn act(
                 run_id: stall.run_id,
                 job_id: stall.job_id,
                 head_sha: stall.head_sha.clone(),
-                run_head_branch: run.head_branch.clone(),
-                run_head_sha: run.head_sha.clone(),
-                workflow_id: run.workflow_id,
-                run_attempt: run.run_attempt,
                 at: now.to_rfc3339(),
                 outcome: outcome.clone(),
-                rerun: None,
-                rerun_at: None,
                 progress: None,
                 proved_at: None,
             },
@@ -998,83 +988,42 @@ fn queue_moved(
         .map(|_| "re-enqueued this pass".to_owned())
 }
 
-/// Whether an approved pull request's head moved on or left the open set.
-fn pr_moved(receipt: &Receipt, observation: &RepoObservation) -> Option<String> {
-    match observation
-        .prs
-        .iter()
-        .find(|pr| pr.fact.number == receipt.pr)
-    {
-        None => Some("pull request no longer open".to_owned()),
-        Some(pr) if !pr.fact.head_sha.eq_ignore_ascii_case(&receipt.head_sha) => {
-            Some("pull request head moved".to_owned())
-        }
-        Some(_) => None,
-    }
-}
-
-#[allow(clippy::too_many_arguments)] // One receipt, its fresh read, the pass and its one actor.
 /// One receipt's next step from a fresh run read: `Some(verdict)` once
-/// proved, `None` while it waits (or after a re-run this pass).
+/// proved, `None` while it waits.
 fn prove(
-    receipt: &mut Receipt,
+    receipt: &Receipt,
     state: &RunState,
     observation: &RepoObservation,
     reports: &[PrReport],
-    acts: &dyn Acts,
     at: DateTime<Utc>,
     now: DateTime<Utc>,
     lines: &mut Vec<String>,
 ) -> Option<String> {
     let cancelled = state.status.eq_ignore_ascii_case("completed")
         && state.conclusion.as_deref() == Some("cancelled");
-    let run = format!(
-        "run is {}/{} (attempt {}) after `{}`",
-        state.status,
-        state.conclusion.as_deref().unwrap_or("none"),
-        state.run_attempt,
-        receipt.outcome
-    );
     // Ok: recovered. Err: not yet, with why.
     let step: Result<String, String> = match receipt.kind {
-        Kind::MergeQueue if !cancelled => Err(run),
+        Kind::MergeQueue if !cancelled => Err(format!(
+            "run is {}/{} after `{}`",
+            state.status,
+            state.conclusion.as_deref().unwrap_or("none"),
+            receipt.outcome
+        )),
         Kind::MergeQueue => queue_moved(receipt, observation, reports, at).ok_or_else(|| {
             format!(
                 "run cancelled, but #{} is neither re-enqueued nor on a fresh merge_group run",
                 receipt.pr
             )
         }),
-        Kind::PullRequest if state.run_attempt > receipt.run_attempt => Ok(format!(
-            "re-run as attempt {} ({})",
-            state.run_attempt, state.status
-        )),
-        Kind::PullRequest => match pr_moved(receipt, observation) {
-            Some(how) => Ok(how),
-            None if receipt.rerun.is_some() => Err(format!(
-                "re-run `{}`, but the {run}",
-                receipt.rerun.as_deref().unwrap_or_default()
-            )),
-            None if !cancelled => Err(run),
-            None => {
-                let outcome = match acts.rerun(&receipt.run()) {
-                    Ok(()) => "requested".to_owned(),
-                    Err(error) => format!("failed: {error}"),
-                };
-                lines.push(format!("{}: re-run {outcome}", receipt.token()));
-                receipt.rerun = Some(outcome);
-                receipt.rerun_at = Some(now.to_rfc3339());
-                return None;
-            }
-        },
+        // No pull request stall is ever cancelled; a receipt of one is from
+        // an older binary and is closed.
+        Kind::PullRequest => {
+            return Some("unrecovered: pull request stalls are report only".to_owned());
+        }
     };
-    let last = receipt
-        .rerun_at
-        .as_deref()
-        .and_then(parse_at)
-        .map_or(at, |rerun| rerun.max(at));
     match step {
         Ok(how) => Some(format!("recovered: {how}")),
-        Err(why) if (now - last).num_seconds() >= RECOVERY_WINDOW_SECS => {
+        Err(why) if (now - at).num_seconds() >= RECOVERY_WINDOW_SECS => {
             Some(format!("unrecovered: {why}"))
         }
         Err(why) => {
@@ -1084,8 +1033,8 @@ fn prove(
     }
 }
 
-/// Prove each pending receipt of `observation.repo` from a fresh run read,
-/// and re-run a cancelled pull request run. Only an applying pass calls it.
+/// Prove each pending receipt of `observation.repo` from a fresh run read.
+/// Only an applying pass calls it.
 /// Returns (kind, token) of receipts that became unrecovered, and one line
 /// per receipt touched.
 pub(super) fn progress(
@@ -1108,11 +1057,7 @@ pub(super) fn progress(
             unrecovered.push((receipt.kind, receipt.token()));
             continue;
         };
-        let last = receipt
-            .rerun_at
-            .as_deref()
-            .and_then(parse_at)
-            .map_or(at, |rerun| rerun.max(at));
+        let last = at;
         if (now - last).num_seconds() < PROGRESS_MIN_SECS {
             continue;
         }
@@ -1127,16 +1072,7 @@ pub(super) fn progress(
                 ));
                 None
             }
-            Ok(state) => prove(
-                receipt,
-                &state,
-                observation,
-                reports,
-                acts,
-                at,
-                now,
-                &mut lines,
-            ),
+            Ok(state) => prove(receipt, &state, observation, reports, at, now, &mut lines),
         };
         if let Some(verdict) = verdict {
             lines.push(format!("{}: {verdict}", receipt.token()));
@@ -1254,9 +1190,6 @@ impl Acts for NoActs {
         Err("no mutation control".to_owned())
     }
     fn read_run(&self, _run_id: u64) -> Result<RunState, String> {
-        Err("no mutation control".to_owned())
-    }
-    fn rerun(&self, _run: &StewardRun) -> Result<(), String> {
         Err("no mutation control".to_owned())
     }
 }
@@ -1387,19 +1320,5 @@ impl Acts for GitHubActs<'_> {
                 .and_then(Value::as_u64)
                 .ok_or_else(|| format!("run {run_id} answer had no run_attempt"))?,
         })
-    }
-
-    fn rerun(&self, run: &StewardRun) -> Result<(), String> {
-        self.guarded(
-            run,
-            "runner steward re-run a pull request run cancelled for a runner stall",
-            ("pr_stall_rerun", "pr_stall_rerun_failed"),
-            "re-run after a runner-stall cancel",
-            || {
-                self.actions
-                    .rerun_failed_jobs(&self.observation.repo, run.id)
-                    .map_err(|error| error.to_string())
-            },
-        )
     }
 }

@@ -13,24 +13,25 @@
 //! ```toml
 //! [auto_merge]
 //! mq_stall_recover = "off"          # off (default) | shadow | apply: the queue head
-//! pr_stall_recover = "off"          # off (default) | shadow | apply: approved PR heads
+//! pr_stall_recover = "off"          # off (default) | shadow: approved PR heads, report only
 //! mq_stall_minutes = 20             # 5..=360: how long the job waits before it counts
 //! mq_stall_max_cancels_per_hour = 3 # 1..=20 per repository
 //! ```
 //!
-//! The same stall hits pull-request jobs: on 2026-11-28 seven Vellum
-//! `gpu-macos-arm64` PR jobs (runs 46111057074, 46111430653, 46114407938,
-//! 46118730933, 46122069534, 46128116094 and 46129273537) sat queued from
-//! 05:12-09:11Z while a newer job with the same labels (run 46118904930,
-//! created 06:56) got a runner at 09:05. `pr_stall_recover` covers the
-//! required-check jobs of open pull requests whose head the approval context
-//! reports green; its recovery is cancel, then re-run of the run.
+//! `pr_stall_recover` reports the same shape on the required-check jobs of
+//! open pull requests whose head the approval context reports green. It is
+//! report only: the seven Vellum `gpu-macos-arm64` PR jobs queued from 05:12Z
+//! on 2026-11-28 (runs 46111057074 to 46129273537) were a backlog on their
+//! runner label served out of order, not jobs GitHub refused a runner, and a
+//! cancel and re-run only resets a job's place. `apply` is read as `shadow`
+//! and reported in [`MqStallPolicy::error`].
 //!
-//! Detection is report only and runs on every merge-queue base. `shadow`
-//! adds `would_cancel`; `apply` cancels the stalled run, once per run id, and
-//! proves on a later pass that the entry moved. Both modes share the
-//! threshold and the caps. A value that does not parse keeps `off` and is
-//! reported in [`MqStallPolicy::error`].
+//! The queue-head detection runs on every merge-queue base; the pull request
+//! targets are read only when `pr_stall_recover` is not `off`. `shadow` adds
+//! `would_cancel`; `mq_stall_recover = "apply"` cancels the stalled run, once
+//! per run id and at most once per pull request in six hours, and proves on a
+//! later pass that the entry moved. A value that does not parse keeps `off`
+//! and is reported in [`MqStallPolicy::error`].
 
 use serde::Serialize;
 
@@ -132,6 +133,13 @@ impl MqStallPolicy {
         ] {
             if let Some(value) = section.get(key) {
                 match value.as_str().and_then(MqStallMode::parse) {
+                    // Pull request stalls are report only.
+                    Some(MqStallMode::Apply) if key == PR_MODE_KEY => {
+                        *slot = MqStallMode::Shadow;
+                        errors.push(format!(
+                            "auto_merge.{key} = \"apply\" is not supported: pull request stalls are report only; read as shadow"
+                        ));
+                    }
                     Some(mode) => *slot = mode,
                     None => errors.push(format!(
                         "auto_merge.{key} must be \"off\", \"shadow\" or \"apply\"; kept off"
@@ -187,7 +195,15 @@ mod tests {
             "[auto_merge]\nmq_stall_recover = \"shadow\"\npr_stall_recover = \"apply\"\n",
         ));
         assert_eq!(policy.mode, MqStallMode::Shadow);
-        assert_eq!(policy.pr_mode, MqStallMode::Apply);
+        // Pull request stalls never act: apply reads as shadow and says so.
+        assert_eq!(policy.pr_mode, MqStallMode::Shadow);
+        assert!(
+            policy
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains(PR_MODE_KEY)
+        );
         let typo = MqStallPolicy::from_table(&table("[auto_merge]\npr_stall_recover = \"yes\"\n"));
         assert_eq!(typo.pr_mode, MqStallMode::Off);
         assert!(typo.error.expect("error").contains(PR_MODE_KEY));
