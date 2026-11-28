@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
@@ -294,7 +295,8 @@ class FakeGitHub:
                  settles: bool = True, failed_rerun_restarts: bool = True, rerun_fails_fast: bool = False,
                  issue: bool = True, workflow: str | None = None, history: bool = True,
                  status: str = "in_progress", conclusion: str | None = None, die_on_poll: int = 0,
-                 poll_errors: int = 0) -> None:
+                 poll_errors: int = 0, workflow_unreadable: bool = False,
+                 cancel_refusal: str | None = None) -> None:
         self.now = datetime.now(timezone.utc)
         self.step_minutes_ago = step_minutes_ago
         self.step = step
@@ -307,6 +309,8 @@ class FakeGitHub:
         self.history = history
         self.die_on_poll = die_on_poll
         self.poll_errors = poll_errors
+        self.workflow_unreadable = workflow_unreadable
+        self.cancel_refusal = cancel_refusal
         self.posts: list[str] = []
         self.reads: list[str] = []
         self.cancelled_at: str | None = None
@@ -325,6 +329,8 @@ class FakeGitHub:
             url = args[3]
             self.posts.append(url)
             if url.endswith("/cancel"):
+                if self.cancel_refusal:
+                    raise subprocess.CalledProcessError(1, ["gh"], stderr=self.cancel_refusal)
                 self.cancelled_at = self.stamp(0)
                 if self.settles:
                     self.state.update(status="completed", conclusion="cancelled")
@@ -340,6 +346,8 @@ class FakeGitHub:
         if "/releases" in url:
             return json.dumps([{"tag_name": "v1.2.3", "draft": True}])
         if "/contents/.github/workflows/release.yml" in url:
+            if self.workflow_unreadable:
+                raise subprocess.CalledProcessError(1, ["gh"], stderr="Bad Gateway (HTTP 502)")
             return self.workflow
         if "/issues?" in url:
             return json.dumps([{"number": 42, "labels": [{"name": "release-blocked"}]}] if self.issue else [])
@@ -362,7 +370,9 @@ class FakeGitHub:
             return json.dumps({"jobs": [{"id": 11, "name": "sign-and-upload-macos", **job, "steps": [step]}]})
         if "/jobs" in url:
             steps = [{"name": self.BUILD, "conclusion": "success",
-                      "started_at": "2026-11-01T00:00:00Z", "completed_at": "2026-11-01T00:02:00Z"}]
+                      "started_at": "2026-11-01T00:00:00Z", "completed_at": "2026-11-01T00:02:00Z"},
+                     {"name": self.SIGN, "conclusion": "success",
+                      "started_at": "2026-11-01T00:03:00Z", "completed_at": "2026-11-01T00:05:34Z"}]
             return json.dumps({"jobs": [{"name": "sign-and-upload-macos", "steps": steps if self.history else []}]})
         if "status=success" in url:
             return json.dumps({"workflow_runs": [{"id": 100 + i} for i in range(10)]})
@@ -423,7 +433,10 @@ class StallMainTests(unittest.TestCase):
 
     def test_an_api_error_after_the_cancel_does_not_abort_the_pass(self) -> None:
         fake = FakeGitHub(step_minutes_ago=45, poll_errors=2, issue=False)
+        started = time.monotonic()
         rc, out = heal_main(fake, settle_secs=30)
+        # The patched time.sleep must reach every wait (no real 20 s polls).
+        self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(rc, 0, out)
         self.assertIn("repos/o/r/actions/runs/7/rerun-failed-jobs", fake.posts)
 
@@ -478,6 +491,36 @@ class StallMainTests(unittest.TestCase):
         rc, out = heal_main(fake)
         self.assertEqual((rc, fake.posts), (0, []), out)
         self.assertIn("repos/o/r/contents/.github/workflows/release.yml?ref=tagsha", fake.reads)
+
+    def test_unreadable_workflow_judges_no_live_stall(self) -> None:
+        # Signing 22 minutes in, with green history (154 s): one notarization
+        # attempt may run 25 minutes, so the 20-minute floor alone must not decide.
+        readable = FakeGitHub(step_minutes_ago=22, step=FakeGitHub.SIGN)
+        self.assertEqual(heal_main(readable)[0], 0)
+        self.assertEqual(readable.posts, [])
+        fake = FakeGitHub(step_minutes_ago=22, step=FakeGitHub.SIGN, workflow_unreadable=True)
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (0, []), out)
+        self.assertIn("skipping stall judgement", out)
+
+    def test_unreadable_workflow_resumes_nothing(self) -> None:
+        # A human cancelled 30 minutes into notarization.
+        fake = FakeGitHub(step_minutes_ago=30, step=FakeGitHub.SIGN, status="completed",
+                          conclusion="cancelled", workflow_unreadable=True)
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (1, []), out)
+        self.assertNotIn("resume-rerun", out)
+        self.assertIn("skipping stall judgement", out)
+
+    def test_a_refused_cancel_is_reported_without_waiting(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=45, issue=False,
+                          cancel_refusal="Resource not accessible by integration (HTTP 403)")
+        started = time.monotonic()
+        rc, out = heal_main(fake, settle_secs=5)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual((rc, fake.posts), (1, ["repos/o/r/actions/runs/7/cancel"]))
+        self.assertIn("could not cancel", out)
+        self.assertNotIn("has not stopped", out)
 
     def test_unknown_step_without_history_fails_closed(self) -> None:
         fake = FakeGitHub(step_minutes_ago=22, step="Renamed signing step", workflow="", history=False)

@@ -435,7 +435,10 @@ def _run(repo: str, run_id: int) -> dict:
     return json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}"))
 
 
-def _wait_for(predicate, *, timeout: float, poll: float, sleep=time.sleep, clock=time.monotonic) -> bool:
+def _wait_for(predicate, *, timeout: float, poll: float, sleep=None, clock=None) -> bool:
+    # Resolved at call time, so a patched time.sleep reaches every caller.
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
     deadline = clock() + timeout
     while True:
         if predicate():
@@ -468,7 +471,7 @@ def _try_run(repo: str, run_id: int) -> dict | None:
 
 
 def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Stall, *, what: str,
-                      sleep=time.sleep) -> int:
+                      sleep=None) -> int:
     """Re-run a cancelled stalled run and confirm from the API that a new attempt exists.
 
     Re-run failed jobs first; GitHub does not document whether that endpoint
@@ -505,7 +508,7 @@ def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Sta
     return 0
 
 
-def cancel_and_rerun(repo: str, tag: str, run: dict, stall: Stall, *, sleep=time.sleep) -> int:
+def cancel_and_rerun(repo: str, tag: str, run: dict, stall: Stall, *, sleep=None) -> int:
     """Cancel a stalled run, wait for it to settle, then re-run it.
 
     A normal cancel, never force-cancel: force-cancel skips the job's
@@ -519,8 +522,15 @@ def cancel_and_rerun(repo: str, tag: str, run: dict, stall: Stall, *, sleep=time
         _gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
         print(f"cancel requested for run {run_id}")
     except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        m = re.search(r"\(HTTP (\d{3})\)", detail)
+        if not (m and m.group(1) == "409"):
+            # Not "already stopping": nothing was cancelled, so do not wait for it.
+            print(f"::error title=Release {tag} heal could not cancel stalled run {run_id}::"
+                  f"{detail or 'no detail'}")
+            return 1
         # A 409 when the run is already stopping; the settle wait decides.
-        print(f"cancel request for run {run_id} refused: {(exc.stderr or '').strip()}", file=sys.stderr)
+        print(f"cancel request for run {run_id} refused as already stopping: {detail}", file=sys.stderr)
 
     def settled() -> bool:
         latest = _try_run(repo, run_id)
@@ -539,21 +549,24 @@ def cancel_and_rerun(repo: str, tag: str, run: dict, stall: Stall, *, sleep=time
     return rerun_and_confirm(repo, tag, run_id, attempt, stall, what="cancelled stalled", sleep=sleep)
 
 
-def workflow_timeouts_at(repo: str, ref: str | None) -> dict[str, int]:
-    """Step timeouts from release.yml at the run's own commit, or {} if unreadable.
+def workflow_timeouts_at(repo: str, ref: str | None) -> dict[str, int] | None:
+    """Step timeouts from release.yml at the run's own commit, or None if unreadable.
 
     A tag runs its own commit's workflow, so main's copy can name steps or
-    limits the run does not have. With {} only steps that have green history
-    can be judged; the rest fail closed.
+    limits the run does not have. None is not "no timeouts": without the
+    limits a self-bounded step (a 25-minute notarization attempt) would be
+    judged on the 20-minute floor alone, so the caller skips stall judgement.
     """
     if not ref:
-        return {}
+        print("::warning::release run has no head_sha; skipping stall judgement this pass")
+        return None
     try:
         text = _gh("api", f"repos/{repo}/contents/.github/workflows/release.yml?ref={ref}",
                    "-H", "Accept: application/vnd.github.raw+json")
-    except subprocess.CalledProcessError as exc:
-        print(f"::warning::could not read release.yml at {ref}: {(exc.stderr or '').strip()}")
-        return {}
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"::warning::could not read release.yml at {ref}; skipping stall judgement this pass: "
+              f"{getattr(exc, 'stderr', '') or exc}")
+        return None
     return step_timeouts(text)
 
 
@@ -588,7 +601,9 @@ def main() -> int:
         jobs = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")).get("jobs", [])
         timeouts = workflow_timeouts_at(repo, run.get("head_sha"))
         history = _green_step_history(repo)
-        if in_flight:
+        if timeouts is None:
+            pass  # unreadable limits: judge nothing, the next pass retries
+        elif in_flight:
             stall = find_stall(jobs, now=datetime.now(timezone.utc), history=history, timeouts=timeouts)
             decision = decide_stall(run, stall) or decision
         else:

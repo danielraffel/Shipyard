@@ -409,7 +409,9 @@ and comments on an open `release-blocked` issue. If a pass dies or gives up
 after its cancel, the next pass finds a cancelled step that had run past its
 threshold and re-runs the run; a run cancelled while its steps were moving is
 left for a human, as before. At attempt 3 it neither cancels nor re-runs; it
-fails with the reason.
+fails with the reason. To keep a stalled run dead, unset the variable or
+delete the draft. If `release.yml` at the run's commit cannot be read, that
+pass judges no stall and cancels or resumes nothing.
 
 Cancelling is off until the repository variable `RELEASE_HEAL_CANCEL_STALLED`
 is `true`; until then a stall fails the heal run with the same reason and
