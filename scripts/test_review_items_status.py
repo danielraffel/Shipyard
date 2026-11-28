@@ -163,41 +163,39 @@ class ReviewItemsStatus(unittest.TestCase):
         self.assertEqual(self.judged(self.trail(approve())), "pending")
         self.assertIn(HOTSPOT, self.posted()["description"])
 
-    def test_fenced_quoted_or_near_miss_accept_lines_do_not_count(self) -> None:
-        for body in (
-                f"Reviewed.\n```\naccept-review-item: {HOTSPOT}\n```\nreviewer: pulp-review\n"
-                f"{STAMP}\nverdict: APPROVE head:{HEAD}",
-                f"Reviewed.\n> accept-review-item: {HOTSPOT}\nreviewer: pulp-review\n{STAMP}\n"
-                f"verdict: APPROVE head:{HEAD}",
-                f"Reviewed.\naccept-review-item: {HOTSPOT}.json\nreviewer: pulp-review\n{STAMP}\n"
-                f"verdict: APPROVE head:{HEAD}",
-                f"Reviewed. accept-review-item: {HOTSPOT}\nreviewer: pulp-review\n{STAMP}\n"
-                f"verdict: APPROVE head:{HEAD}"):
-            with self.subTest(body=body):
-                self.assertEqual(self.judged(self.trail(body)), "pending")
-                self.assertIn(HOTSPOT, self.posted()["description"])
-
-    def test_an_accept_github_renders_as_code_keeps_the_head_pending(self) -> None:
-        # The Fable review of #1767's bodies, each inside a counting APPROVE.
+    def test_an_accept_line_outside_the_trailer_never_counts(self) -> None:
+        # Only the trailer right above `reviewer:` counts, so no Markdown context matters: every
+        # earlier round's body (fences, quotes, lazy quotes, a list-nested fence) counts nothing.
         accept = f"accept-review-item: {HOTSPOT}"
-        for fenced in (f"~~~\n```\n{accept}\n~~~", f"````\n```\n{accept}\n````",
-                       f"```diff\n ```\n {accept}\n```"):
-            body = f"Reviewed.\n{fenced}\nreviewer: pulp-review\n{STAMP}\nverdict: APPROVE head:{HEAD}"
-            with self.subTest(fenced=fenced):
+        for middle in (
+                f"```\n{accept}\n```",                      # fenced
+                f"> {accept}",                                 # quoted
+                f"~~~\n```\n{accept}\n~~~",                  # r0: mixed fences
+                f"````\n```\n{accept}\n````",
+                f"```diff\n ```\n {accept}\n```",
+                f"> Quoted example:\n{accept}\n",             # r1: lazy quote continuation
+                f"- ```text\n  {accept}\n  ```",              # r2: a fence nested in a list
+                f"{accept}\n",                                # a blank line before reviewer:
+                f"{accept}\nsee above",                       # not the last line before it
+                f"  {accept}",                                 # indented
+                f"accept-review-item:  {HOTSPOT}",            # two spaces
+                f"Reviewed. {accept}"):                        # mid-line
+            body = f"Reviewed.\n{middle}\nreviewer: pulp-review\n{STAMP}\nverdict: APPROVE head:{HEAD}"
+            with self.subTest(middle=middle):
                 self.assertEqual(self.judged(self.trail(body)), "pending")
                 self.assertIn(HOTSPOT, self.posted()["description"])
-        # Mixed fences closed properly: the accept after them counts.
-        body = (f"Reviewed.\n~~~\n```\n~~~\n{accept}\nreviewer: pulp-review\n{STAMP}\n"
-                f"verdict: APPROVE head:{HEAD}")
+        # Control: the same line as the trailer.
+        body = f"Reviewed.\n\n{accept}\nreviewer: pulp-review\n{STAMP}\nverdict: APPROVE head:{HEAD}"
         self.assertEqual(self.judged(self.trail(body)), "success")
 
-    def test_a_lazily_quoted_accept_keeps_the_head_pending(self) -> None:
-        quoted = (f"Reviewed.\n> Quoted example:\naccept-review-item: {HOTSPOT}\n\nreviewer: pulp-review\n"
-                  f"{STAMP}\nverdict: APPROVE head:{HEAD}")
-        self.assertEqual(self.judged(self.trail(quoted)), "pending")
-        self.assertIn(HOTSPOT, self.posted()["description"])
-        unquoted = quoted.replace("Quoted example:\n", "Quoted example:\n\n")
-        self.assertEqual(self.judged(self.trail(unquoted)), "success")
+    def test_the_body_send_review_verdicts_posts_is_accepted(self) -> None:
+        # fleet-handbook's comment_body: summary, findings, a blank line, the trailer, then the
+        # reviewer and session lines; ghapp's stamper puts the stamp above the verdict line.
+        body = (f"Read the diff; the hotspot regeneration matches.\naccept-review-item: hotspot:in-prose\n\n"
+                f"accept-review-item: {HOTSPOT}\naccept-review-item: {FANOUT}\nreviewer: pulp-review\n"
+                f"session: pulp-review (team-lead team, agent pulp-review, host m3)\n{STAMP}\n"
+                f"verdict: APPROVE head:{HEAD}\n")
+        self.assertEqual(self.judged(self.trail(body), annotations=[listing(HOTSPOT, FANOUT)]), "success")
 
     def test_an_accept_from_an_approve_that_does_not_count_is_not_success(self) -> None:
         # The same counting rules as the approval: an unsigned App APPROVE
@@ -495,45 +493,29 @@ class AcceptingBody(unittest.TestCase):
         self.comment(approve(HOTSPOT), updated_at="2026-10-12T15:00:09Z")
         self.assertIsNone(self.body({"verdict_comment_id": 1, "approved_head": HEAD}))
 
-    def test_text_github_renders_inside_a_fence_accepts_nothing(self) -> None:
-        # The three bodies of the Fable review of #1767: each line toggled
-        # a naive fence state and read as an acceptance.
-        accept = "accept-review-item: hotspot:x"
-        for body in (f"~~~\n```\n{accept}\n~~~",
-                     f"````\n```\n{accept}\n````",
-                     f"```diff\n ```\n {accept}\n```",
-                     f"```\n{accept}",
-                     f"    {accept}",
-                     f"\t{accept}"):
+    def test_only_the_trailer_above_the_last_reviewer_line_counts(self) -> None:
+        accepted = self.guard.accepted_review_items
+        tail = "reviewer: pulp-review\nsession: x\nverdict: APPROVE head:" + HEAD
+        self.assertEqual(accepted(f"prose\n\naccept-review-item: {HOTSPOT}\n"
+                                  f"accept-review-item: {FANOUT}\n{tail}"), {HOTSPOT, FANOUT})
+        # The run is contiguous: a line that is not an accept line ends it.
+        self.assertEqual(accepted(f"accept-review-item: hotspot:a\nnote\naccept-review-item: {HOTSPOT}\n{tail}"),
+                         {HOTSPOT})
+        # The last reviewer: line anchors it: a trailer above an earlier reviewer: line (a quoted
+        # verdict) counts for nothing.
+        self.assertEqual(accepted(f"accept-review-item: hotspot:q\nreviewer: other\n\n{tail}"), set())
+        for body in ("accept-review-item: hotspot:x",                       # no reviewer: line
+                     f"accept-review-item: hotspot:x\n\n{tail}",            # a blank line between
+                     f"{tail}\naccept-review-item: hotspot:x",               # below reviewer:
+                     f"\taccept-review-item: hotspot:x\n{tail}",            # indented
+                     f"accept-review-item: hotspot:x \n{tail}",              # trailing space
+                     f"accept-review-item:hotspot:x\n{tail}",                # no space
+                     f"- ```text\n  accept-review-item: hotspot:x\n  ```\n{tail}",
+                     f"> Quoted example:\naccept-review-item: hotspot:x\n\n{tail}"):
             with self.subTest(body=body):
-                self.assertEqual(self.guard.accepted_review_items(body), set())
-        # Mixed fences: each closes only on its own character and length,
-        # and an accept after the real close counts.
-        self.assertEqual(self.guard.accepted_review_items(
-            f"~~~\n```\n{accept}\n```\n~~~\naccept-review-item: hotspot:after-tilde\n"
-            f"````\n```\n{accept}\n`````\n   accept-review-item: hotspot:after-ticks\n"
-            f"```py\n{accept}\n``` \naccept-review-item: hotspot:after-trailing-space"),
-            {"hotspot:after-tilde", "hotspot:after-ticks", "hotspot:after-trailing-space"})
+                self.assertEqual(accepted(body), set())
 
-    def test_a_lazy_quote_continuation_accepts_nothing(self) -> None:
-        # 1767-r1-f1: CommonMark continues a `>` paragraph onto the next non-blank line, so that
-        # line renders inside the quote. Only a blank line ends it.
-        accept = "accept-review-item: hotspot:x"
-        for body in (f"> Quoted example:\n{accept}\n\n",
-                     f"  > quoted\n> more\n{accept}",
-                     f"> quoted\nstill quoted\n{accept}"):
-            with self.subTest(body=body):
-                self.assertEqual(self.guard.accepted_review_items(body), set())
-        self.assertEqual(self.guard.accepted_review_items(f"> Quoted example:\n\n{accept}\n"),
-                         {"hotspot:x"}, "a blank line ends the quote")
-        self.assertEqual(self.guard.accepted_review_items(f"Plain paragraph.\n{accept}\n"),
-                         {"hotspot:x"}, "only a quote is lazy here")
-
-    def test_the_parsers_match_pulps_grammar(self) -> None:
-        self.assertEqual(self.guard.accepted_review_items(
-            f"accept-review-item: {HOTSPOT}\n  accept-review-item:\t{FANOUT}  \n"
-            "~~~\naccept-review-item: hotspot:fenced\n~~~\n> accept-review-item: hotspot:q\n"),
-            {HOTSPOT, FANOUT})
+    def test_the_items_parser(self) -> None:
         self.assertEqual(self.guard.parse_review_items(
             f"review-item: {HOTSPOT}\n\nreview-item: {FANOUT}\nreview-items-count: 2\n"),
             [HOTSPOT, FANOUT])

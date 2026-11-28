@@ -1418,14 +1418,8 @@ REVIEW_ITEMS_EVENT = "pull_request_target"
 REVIEW_ITEMS_TITLE = "review-items"
 _REVIEW_ITEM_LINE = re.compile(r"review-item: ([a-z][a-z0-9-]*:\S{1,240})")
 _REVIEW_ITEMS_COUNT = re.compile(r"review-items-count: (0|[1-9][0-9]{0,3})")
-# The acceptance line in an exact-head APPROVE (same grammar as Pulp's
-# tools/scripts/review_items.py ACCEPT_LINE).
-# At most three leading spaces: four, or a tab, is an indented code block.
-_ACCEPT_LINE = re.compile(r"^ {0,3}accept-review-item:[ \t]*(\S+)[ \t]*$")
-# A fence opens with up to three spaces and three or more of one character
-# (a backtick fence's info string has no backtick, as CommonMark reads it).
-_QUOTE = re.compile(r"^ {0,3}>")
-_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+# One line of the accept trailer: exactly this, from column 0, nothing else on the line.
+_ACCEPT_TRAILER_LINE = re.compile(r"accept-review-item: (\S+)")
 _WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
 _CHECK_RUN_URL = re.compile(r"https://api\.github\.com/repos/([^/]+/[^/]+)/check-runs/([0-9]+)")
 # Set by _review_gate once the policy and the verdicts are read, for
@@ -1599,41 +1593,22 @@ def is_number_id(value: Any) -> bool:
 
 
 def accepted_review_items(body: str) -> set[str]:
-    """Ids a verdict body accepts: ``accept-review-item: <id>`` lines outside
-    fenced code. A ``>`` quote never matches: the line must start with the key.
-
-    A fence closes only on a line holding nothing but the opening character,
-    at least as many times, from the first column (stricter than CommonMark,
-    which allows three spaces: a fence read as still open only makes a head
-    wait). So a ``~~~`` block holding a backtick line, a longer backtick
-    fence holding a shorter one, and a diff's `` ```'' context line all stay
-    fenced; an unclosed fence keeps the rest of the body fenced.
-
-    A non-blank line right after a ``>`` quote line, with no blank line between,
-    continues the quote (CommonMark's lazy continuation), so it is quoted text,
-    not an acceptance; only a blank line ends the quote."""
+    """Ids a verdict body accepts: only its machine-written trailer, the contiguous run of lines
+    that are exactly ``accept-review-item: <id>`` ending on the line right before the body's last
+    ``reviewer:`` line (which sits above the ``session:`` lines, the stamp and the final
+    ``verdict: APPROVE head:<sha>``). An accept line anywhere else counts for nothing, whatever
+    Markdown surrounds it, so no fence, quote, list or indentation can make text the reviewer
+    quoted read as an acceptance. A body with no ``reviewer:`` line accepts nothing."""
+    lines = body.splitlines()
+    signer = [i for i, line in enumerate(lines) if _SIGNER_LINE.fullmatch(line)]
     found: set[str] = set()
-    fence: str | None = None
-    quoted = False
-    for line in body.splitlines():
-        if fence is not None:
-            closing = line.rstrip(" \t")
-            if closing and set(closing) == {fence[0]} and len(closing) >= len(fence):
-                fence = None
-            continue
-        if not line.strip():
-            quoted = False
-            continue
-        if _QUOTE.match(line) or quoted:
-            quoted = True
-            continue
-        opening = _FENCE_OPEN.match(line)
-        if opening is not None:
-            fence = opening.group(1)
-            continue
-        match = _ACCEPT_LINE.match(line)
-        if match is not None:
-            found.add(match.group(1))
+    if not signer:
+        return found
+    for line in reversed(lines[:signer[-1]]):
+        match = _ACCEPT_TRAILER_LINE.fullmatch(line)
+        if match is None:
+            break
+        found.add(match.group(1))
     return found
 
 
@@ -1706,8 +1681,9 @@ def _review_items_checked(classification: dict[str, Any], repo: str | None,
     return False, f"{label} ({repo}): {why}", review_fix(
         "review_items_unaccepted", why, str(repo), number_int, head,
         f"a reviewer reviews each item and posts a new comment on "
-        f"https://github.com/{repo}/pull/{number} with one `accept-review-item: <id>` line per "
-        f"item above `verdict: APPROVE head:{head}`", False)
+        f"https://github.com/{repo}/pull/{number} whose trailer, the lines right above its "
+        f"`reviewer:` line, is one `accept-review-item: <id>` line per item, then the "
+        f"`reviewer:` and `verdict: APPROVE head:{head}` lines", False)
 
 
 def review_policy(config_text: str | None, repo: str, host_default: bool) -> dict[str, Any]:

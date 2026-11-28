@@ -4881,8 +4881,9 @@ head). The items come only from the newest `pull_request_target` run of that
 file on the exact head, from its job of that name in the run's own job
 listing, in that job check run's one `review-items` annotation (`review-item:
 <id>` lines and one `review-items-count: <n>`). The counting exact-head APPROVE
-comment must carry `accept-review-item: <id>` for every id, outside fenced code
-and quotes; a carried approval, a rollup, an admission, an `APPROVED` review or
+comment must carry `accept-review-item: <id>` for every id in its trailer (the
+contiguous run of exactly such lines, from column 0, right above its last
+`reviewer:` line; an accept line anywhere else never counts); a carried approval, a rollup, an admission, an `APPROVED` review or
 a `reviewed:` marker accepts none. A missing or running items run is
 `pending`, and so is an unaccepted id (`awaiting reviewer acceptance of review
 items: <ids>`: only the reviewer can fix it); a failed, ambiguous, malformed or

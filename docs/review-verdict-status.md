@@ -418,7 +418,8 @@ Why this chain and not a check run found by name:
 
 **Accepting an item.** The exact-head APPROVE comment that allows the head
 under every other rule here (signers, stamp sessions, never edited, newest
-wins, no HOLD) must carry one line per id above its marker line:
+wins, no HOLD) must carry a machine-written trailer: one line per id, ending on
+the line right before its last `reviewer:` line:
 
 ```
 accept-review-item: hotspot:docs/status/consumption-profiles.json
@@ -428,12 +429,14 @@ reviewer: pulp-review
 verdict: APPROVE head:<sha>
 ```
 
-Lines inside a fenced code block, `>` quotes (including a line that lazily
-continues a quote, with no blank line after the `>` line), and lines indented
-four spaces or a tab do not count. A fence closes only on a line holding nothing but its
-opening character, at least as many times, from the first column, so a
-`~~~` block holding a backtick line, or a longer backtick fence holding a
-shorter one, stays fenced. Extra accepts
+Only that trailer counts: the contiguous run of lines that are exactly
+`accept-review-item: <id>` (column 0, one space, nothing else on the line)
+directly above the `reviewer:` line. An accept line anywhere else in the body
+counts for nothing, whatever Markdown surrounds it: in prose, a quote, a code
+block, a list, after a blank line, or indented. So a reviewer quoting a pull
+request's text can never accept an item by accident, and no Markdown is
+parsed. The fleet's verdict sender writes the trailer from a structured field
+of the reviewer's verdict, never from its prose. Extra accepts
 are ignored. A missing one keeps the head `pending`, since only the reviewer
 can fix it with a new verdict, and the description names what is unaccepted
 (`awaiting reviewer acceptance of review items: <id>, ...`). Nothing else accepts an
