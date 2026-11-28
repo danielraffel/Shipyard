@@ -411,7 +411,27 @@ fn classifier_declines_every_write_and_every_unknown_shape() {
         argv(&["api", "repos/o/r/issues/1/comments", "-F", "body=hi"]),
         argv(&["api", "repos/o/r/pulls", "--input", "file.json"]),
         argv(&["api", "--paginate", "repos/o/r/pulls"]),
-        argv(&["api", "repos/o/r/pulls", "--jq", ".[]"]),
+        argv(&["api", "repos/o/r/pulls", "--jq", ".[] | @tsv"]),
+        argv(&["api", "repos/o/r/pulls", "--jq"]),
+        argv(&[
+            "api",
+            "repos/o/r/pulls",
+            "--paginate",
+            "--slurp",
+            "--jq",
+            ".[]",
+        ]),
+        argv(&["api", "repos/o/r/pulls", "--slurp"]),
+        argv(&[
+            "api",
+            "--paginate",
+            "--paginate",
+            "repos/o/r/pulls",
+            "--slurp",
+        ]),
+        argv(&["api", "repos/o/r/pulls", "repos/o/r/issues", "--jq", ".[]"]),
+        argv(&["api", "repos/o/r/pulls", "--jq", ".[]", "-X", "POST"]),
+        argv(&["api", "repos/o/r/pulls", "--jq=.[]"]),
         argv(&["api", "-H", "Accept: x", "repos/o/r/pulls"]),
         // REST outside one repository, or with placeholders and traversal.
         argv(&["api", "rate_limit"]),
@@ -1670,4 +1690,686 @@ mod actions {
         assert!(gh_calls(&log).is_empty(), "a timeout is not re-spent on gh");
         assert_eq!(pass.report().latency["inproc"].timeouts, 1);
     }
+}
+
+// ------------------------------------------------- paginated and filtered
+
+const RECORDED: &str = include_str!("fixtures/gh_paged_commits.json");
+
+/// Pages and `gh` output recorded from real GitHub with
+/// `ghapp api ENDPOINT --paginate ...` (see the fixture's `endpoint`).
+struct GhRecording {
+    endpoint: String,
+    pages: Vec<String>,
+    slurp: String,
+    cases: Vec<(String, String)>,
+}
+
+fn recording() -> GhRecording {
+    let value: Value = serde_json::from_str(RECORDED).expect("fixture JSON");
+    let text = |value: &Value| value.as_str().expect("string").to_owned();
+    GhRecording {
+        endpoint: text(&value["endpoint"]),
+        pages: value["pages"]
+            .as_array()
+            .expect("pages")
+            .iter()
+            .map(text)
+            .collect(),
+        slurp: text(&value["slurp"]),
+        cases: value["cases"]
+            .as_array()
+            .expect("cases")
+            .iter()
+            .map(|case| {
+                assert_eq!(case["rc"], json!(0), "only successful recordings: {case}");
+                (text(&case["jq"]), text(&case["out"]))
+            })
+            .collect(),
+    }
+}
+
+/// A GitHub that serves `pages` for `endpoint` the way the real API does:
+/// `page=N` selects a page, and every page but the last names the next one in
+/// a `Link` header under the `repositories/ID/...` spelling GitHub uses.
+fn paged_github(
+    clock: Arc<AtomicI64>,
+    endpoint: &str,
+    pages: Vec<String>,
+) -> (Mock, Arc<std::sync::OnceLock<String>>) {
+    let base = Arc::new(std::sync::OnceLock::<String>::new());
+    let base_for_handler = Arc::clone(&base);
+    let route = endpoint.split('?').next().expect("route").to_owned();
+    let mock = github(clock, move |request| {
+        if !request.path.starts_with(&route)
+            && !request
+                .path
+                .starts_with("repositories/1/pulls/1483/commits")
+        {
+            return Reply::json(404, &json!({"message": "Not Found"}));
+        }
+        let page = request
+            .path
+            .split('&')
+            .find_map(|part| part.strip_prefix("page="))
+            .map_or(1, |number| number.parse::<usize>().expect("page number"));
+        let body = pages
+            .get(page - 1)
+            .cloned()
+            .unwrap_or_else(|| "[]".to_owned());
+        let mut reply = Reply {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into_bytes(),
+            delay: Duration::ZERO,
+        };
+        if page < pages.len() {
+            let root = base_for_handler.get().expect("base url");
+            reply = reply.header(
+                "Link",
+                &format!(
+                    "<{root}/repositories/1/pulls/1483/commits?per_page=2&page={next}>; rel=\"next\", <{root}/repositories/1/pulls/1483/commits?per_page=2&page={last}>; rel=\"last\"",
+                    next = page + 1,
+                    last = pages.len()
+                ),
+            );
+        }
+        reply
+    });
+    base.set(mock.url.clone()).expect("set once");
+    (mock, base)
+}
+
+const SLUG: &str = "danielraffel/Shipyard";
+
+/// Read with the evaluator's whole filter language, so a test can check
+/// filters the production allowlist would send to `gh`.
+fn try_any_filter(
+    reads: &InprocReads,
+    args: &[String],
+    scope: Option<&str>,
+    timeout: Duration,
+) -> ReadOutcome {
+    match argv::classify_with(args, scope, super::jq::Program::parse) {
+        Some(read) => reads.try_classified(&read, timeout, None),
+        None => ReadOutcome::Declined { reason: None },
+    }
+}
+
+#[test]
+fn classifier_accepts_paged_and_filtered_rest_reads_in_any_flag_order() {
+    let path = "repos/o/r/issues/7/comments?per_page=100";
+    let shaped = |args: &[&str]| {
+        let read = argv::classify_with(&argv(args), Some("o/r"), super::jq::Program::parse)
+            .expect("accepted");
+        assert_eq!(read.repo, "o/r");
+        let ReadRequest::RestShaped {
+            path: found,
+            paginate,
+            slurp,
+            jq,
+        } = read.request
+        else {
+            panic!("not shaped: {args:?}");
+        };
+        assert_eq!(found, path);
+        (paginate, slurp, jq.is_some())
+    };
+    let jq = ".[] | {id: .id}";
+    assert_eq!(
+        shaped(&["api", "--paginate", path, "--jq", jq]),
+        (true, false, true)
+    );
+    assert_eq!(
+        shaped(&["api", path, "--paginate", "--jq", jq]),
+        (true, false, true)
+    );
+    assert_eq!(
+        shaped(&["api", path, "--jq", jq, "--paginate"]),
+        (true, false, true)
+    );
+    assert_eq!(shaped(&["api", path, "-q", jq]), (false, false, true));
+    assert_eq!(shaped(&["api", path, "--jq", jq]), (false, false, true));
+    assert_eq!(
+        shaped(&["api", path, "--paginate", "--slurp"]),
+        (true, true, false)
+    );
+    assert_eq!(
+        shaped(&["api", "--slurp", "--paginate", path]),
+        (true, true, false)
+    );
+    // A plain read keeps its own variant.
+    assert!(matches!(
+        argv::classify(&argv(&["api", path]), Some("o/r"))
+            .expect("plain")
+            .request,
+        ReadRequest::Rest { .. }
+    ));
+}
+
+#[test]
+fn paginated_reads_match_recorded_gh_output_byte_for_byte() {
+    let recording = recording();
+    let key = write_key();
+    let clock = now_clock();
+    let (mock, _base) = paged_github(
+        Arc::clone(&clock),
+        &recording.endpoint,
+        recording.pages.clone(),
+    );
+    let reads = reader(&mock, &key.path, &clock);
+    let run = |args: Vec<String>| {
+        answered(try_any_filter(
+            &reads,
+            &args,
+            Some(SLUG),
+            Duration::from_secs(10),
+        ))
+    };
+
+    let (success, slurped, stderr, meta) =
+        run(argv(&["api", &recording.endpoint, "--paginate", "--slurp"]));
+    assert!(success, "{stderr}");
+    assert_eq!(slurped, recording.slurp, "--paginate --slurp");
+    assert_eq!(meta.attempts, 3, "one request per page, no more");
+    assert_eq!(
+        mock.count("GET", "repos/danielraffel/Shipyard/pulls/1483/commits")
+            + mock.count("GET", "repositories/1/pulls/1483/commits"),
+        3
+    );
+
+    // The Link header named `repositories/1/...`; it was followed as given.
+    assert!(
+        mock.requests().iter().any(|request| request
+            .path
+            .starts_with("repositories/1/pulls/1483/commits")),
+        "the next page is requested from the Link URL"
+    );
+
+    assert!(recording.cases.len() >= 10);
+    for (filter, expected) in &recording.cases {
+        for args in [
+            argv(&["api", "--paginate", &recording.endpoint, "--jq", filter]),
+            argv(&["api", &recording.endpoint, "--jq", filter, "--paginate"]),
+        ] {
+            let (success, printed, stderr, _) = run(args);
+            assert!(success, "{filter}: {stderr}");
+            assert_eq!(&printed, expected, "--paginate --jq {filter}");
+        }
+    }
+}
+
+#[test]
+fn a_filter_without_paginate_reads_one_page_like_gh() {
+    let recording = recording();
+    let key = write_key();
+    let clock = now_clock();
+    let (mock, _base) = paged_github(
+        Arc::clone(&clock),
+        &recording.endpoint,
+        recording.pages.clone(),
+    );
+    let reads = reader(&mock, &key.path, &clock);
+    let (success, printed, _, _) = answered(try_any_filter(
+        &reads,
+        &argv(&["api", &recording.endpoint, "--jq", ".[].sha"]),
+        Some(SLUG),
+        Duration::from_secs(5),
+    ));
+    assert!(success);
+    let first_page = serde_json::from_str::<Value>(&recording.pages[0]).expect("page");
+    let expected =
+        first_page
+            .as_array()
+            .expect("array")
+            .iter()
+            .fold(String::new(), |mut text, commit| {
+                text.push_str(commit["sha"].as_str().expect("sha"));
+                text.push('\n');
+                text
+            });
+    assert_eq!(
+        printed, expected,
+        "page 1 only: no --paginate, no Link followed"
+    );
+    assert_eq!(
+        mock.count("GET", "repos/danielraffel/Shipyard/pulls/1483/commits"),
+        1
+    );
+}
+
+#[test]
+fn paged_reads_that_gh_would_answer_differently_go_to_gh() {
+    let recording = recording();
+    let key = write_key();
+    let clock = now_clock();
+    let declined = |mock: &Mock, args: Vec<String>| {
+        let reads = reader(mock, &key.path, &clock);
+        match reads.try_read(&args, Some(SLUG), Duration::from_secs(5), None) {
+            ReadOutcome::Declined {
+                reason: Some(reason),
+            } => reason,
+            other => panic!("expected a decline, got {other:?}"),
+        }
+    };
+    let slurp = argv(&["api", &recording.endpoint, "--paginate", "--slurp"]);
+
+    // An error page: gh prints the error, so gh must be asked.
+    let mock = github(Arc::clone(&clock), |_| {
+        Reply::json(404, &json!({"message": "Not Found"}))
+    });
+    let reason = declined(&mock, slurp.clone());
+    assert!(reason.contains("404"), "{reason}");
+
+    // A later page that fails.
+    let (mock, _base) = {
+        let base = Arc::new(std::sync::OnceLock::<String>::new());
+        let for_handler = Arc::clone(&base);
+        let page = recording.pages[0].clone();
+        let mock = github(Arc::clone(&clock), move |request| {
+            if request.path.contains("page=2") {
+                return Reply::json(502, &json!({"message": "Bad Gateway"}));
+            }
+            let root = for_handler.get().expect("base");
+            Reply {
+                status: 200,
+                headers: vec![(
+                    "Link".to_owned(),
+                    format!("<{root}/repositories/1/x?page=2>; rel=\"next\""),
+                )],
+                body: page.clone().into_bytes(),
+                delay: Duration::ZERO,
+            }
+        });
+        base.set(mock.url.clone()).expect("once");
+        (mock, base)
+    };
+    assert!(declined(&mock, slurp.clone()).contains("502"));
+
+    // A next page on another host is never followed with this credential.
+    let mock = github(Arc::clone(&clock), |_| {
+        Reply::json(200, &json!([{"a": 1}])).header(
+            "Link",
+            "<https://evil.example/repos/o/r?page=2>; rel=\"next\"",
+        )
+    });
+    let reason = declined(&mock, slurp.clone());
+    assert!(reason.contains("outside the API root"), "{reason}");
+    assert_eq!(
+        mock.count("GET", "repos/danielraffel/Shipyard/pulls"),
+        1,
+        "only the first page was requested"
+    );
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|request| !request.path.contains("evil")),
+        "no request carried the foreign host"
+    );
+
+    // Output gh would print differently (a non-integral number): decline.
+    let mock = github(Arc::clone(&clock), |_| {
+        Reply::json(200, &json!([{"a": 1.5}]))
+    });
+    let reads = reader(&mock, &key.path, &clock);
+    let outcome = try_any_filter(
+        &reads,
+        &argv(&["api", "repos/o/r/things", "--jq", ".[0]"]),
+        Some("o/r"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        matches!(outcome, ReadOutcome::Declined { reason: Some(_) }),
+        "{outcome:?}"
+    );
+
+    // A page body that is not compact JSON cannot be joined byte for byte.
+    let mock = github(Arc::clone(&clock), |_| Reply {
+        status: 200,
+        headers: Vec::new(),
+        body: b"[1,\n2]\n".to_vec(),
+        delay: Duration::ZERO,
+    });
+    let reads = reader(&mock, &key.path, &clock);
+    let outcome = reads.try_read(
+        &argv(&["api", "repos/o/r/things", "--paginate", "--slurp"]),
+        Some("o/r"),
+        Duration::from_secs(5),
+        None,
+    );
+    assert!(
+        matches!(outcome, ReadOutcome::Declined { reason: Some(_) }),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_paged_read_revalidates_each_page_and_keeps_its_link() {
+    let recording = recording();
+    let key = write_key();
+    let clock = now_clock();
+    let base = Arc::new(std::sync::OnceLock::<String>::new());
+    let for_handler = Arc::clone(&base);
+    let pages = recording.pages.clone();
+    let mock = github(Arc::clone(&clock), move |request| {
+        let page = request
+            .path
+            .split('&')
+            .find_map(|part| part.strip_prefix("page="))
+            .map_or(1, |number| number.parse::<usize>().expect("page"));
+        let etag = format!("\"p{page}\"");
+        if request.header("if-none-match") == Some(etag.as_str()) {
+            // A 304 carries no body; the client must remember the Link too.
+            return Reply {
+                status: 304,
+                headers: vec![("ETag".to_owned(), etag)],
+                body: Vec::new(),
+                delay: Duration::ZERO,
+            };
+        }
+        let root = for_handler.get().expect("base");
+        let mut reply = Reply {
+            status: 200,
+            headers: Vec::new(),
+            body: pages[page - 1].clone().into_bytes(),
+            delay: Duration::ZERO,
+        }
+        .header("ETag", &etag);
+        if page < pages.len() {
+            reply = reply.header(
+                "Link",
+                &format!(
+                    "<{root}/repositories/1/pulls/1483/commits?per_page=2&page={}>; rel=\"next\"",
+                    page + 1
+                ),
+            );
+        }
+        reply
+    });
+    base.set(mock.url.clone()).expect("once");
+    let reads = reader(&mock, &key.path, &clock);
+    let args = argv(&["api", &recording.endpoint, "--paginate", "--slurp"]);
+    let (_, first, _, _) =
+        answered(reads.try_read(&args, Some(SLUG), Duration::from_secs(5), None));
+    let (_, second, _, meta) =
+        answered(reads.try_read(&args, Some(SLUG), Duration::from_secs(5), None));
+    assert!(meta.conditional_hit);
+    assert_eq!(
+        first, second,
+        "every page came back as a 304 and still chained"
+    );
+    assert_eq!(
+        second, recording.slurp,
+        "all pages, joined from cached bodies"
+    );
+}
+
+/// The steward's reads of one Vellum pass that took the `gh` path before, by
+/// call site, with the argv each site builds (counts from a recorded pass on
+/// m3, 2026-11-28 03:39Z, `api_calls.sites`; argv from the code named in each
+/// comment). Every one was `gh`; the in-process client now answers them all.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_representative_pass_moves_its_shaped_reads_in_process() {
+    let record_jq = |kind: &str| {
+        // head_approval.rs REVIEW_RECORD_JQ / COMMENT_RECORD_JQ.
+        if kind == "reviews" {
+            ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: .submitted_at, state: .state, commit_id: .commit_id, body: .body, performed_via_github_app_id: .performed_via_github_app.id}"
+        } else {
+            ".[] | {id: .id, node_id: .node_id, login: .user.login, type: .user.type, association: .author_association, at: .created_at, updated_at: .updated_at, body: .body, performed_via_github_app_id: .performed_via_github_app.id}"
+        }
+    };
+    let sha = SHA;
+    let sites: Vec<(&str, u32, Vec<String>)> = vec![
+        (
+            "commits/{sha}/check-runs (advance_cmd)",
+            34,
+            argv(&[
+                "api",
+                &format!("repos/o/r/commits/{sha}/check-runs?per_page=100"),
+                "--paginate",
+                "--slurp",
+            ]),
+        ),
+        (
+            "commits/{sha}/statuses (advance_cmd)",
+            32,
+            argv(&[
+                "api",
+                &format!("repos/o/r/commits/{sha}/statuses?per_page=100"),
+                "--paginate",
+                "--slurp",
+            ]),
+        ),
+        (
+            "git/trees/{sha} (carried_commits/landed.rs)",
+            30,
+            argv(&[
+                "api",
+                &format!("repos/o/r/git/trees/{sha}"),
+                "--jq",
+                "{truncated: .truncated, tree: [.tree[] | {name: .path, mode: .mode, kind: .type, sha: .sha}]}",
+            ]),
+        ),
+        (
+            "git/ref/heads/{base} (carried_commits/landed.rs)",
+            29,
+            argv(&[
+                "api",
+                "repos/o/r/git/ref/heads/main",
+                "--jq",
+                "{sha: .object.sha, kind: .object.type}",
+            ]),
+        ),
+        (
+            "issues/{n}/comments (head_approval.rs)",
+            29,
+            argv(&[
+                "api",
+                "--paginate",
+                "repos/o/r/issues/7/comments",
+                "--jq",
+                record_jq("comments"),
+            ]),
+        ),
+        (
+            "pulls/{n}/reviews (head_approval.rs)",
+            29,
+            argv(&[
+                "api",
+                "--paginate",
+                "repos/o/r/pulls/7/reviews",
+                "--jq",
+                record_jq("reviews"),
+            ]),
+        ),
+    ];
+    let routed = |in_process: bool| -> u32 {
+        sites
+            .iter()
+            .filter(|(_, _, args)| argv::classify(args, Some("o/r")).is_some() == in_process)
+            .map(|(_, calls, _)| calls)
+            .sum()
+    };
+    let total: u32 = sites.iter().map(|(_, calls, _)| calls).sum();
+    assert_eq!(total, 183);
+    // Before this change none of these shapes classified: 183 reads on `gh`.
+    // After it all of them do.
+    assert_eq!(routed(true), 183, "reads answered in process");
+    assert_eq!(routed(false), 0, "reads left on gh");
+    // Shapes that must stay on gh still do.
+    for args in [
+        argv(&[
+            "api",
+            "-H",
+            "Accept: application/vnd.github.raw+json",
+            "repos/o/r/git/blobs/abc",
+        ]),
+        argv(&[
+            "api",
+            "repos/o/r/contents/.github/workflows?ref=main",
+            "--jq",
+            ".[] | [.name, .sha] | @tsv",
+        ]),
+        argv(&[
+            "api",
+            "--paginate",
+            "repos/o/r/issues/7/events?per_page=100",
+            "--jq",
+            ".[] | select(.event == \"labeled\") | [.label.name, .created_at] | @tsv",
+        ]),
+        argv(&["api", "--paginate", "repos/o/r/pulls"]),
+    ] {
+        assert!(argv::classify(&args, Some("o/r")).is_none(), "{args:?}");
+    }
+}
+
+#[test]
+fn only_allowlisted_filters_are_classified() {
+    let path = "repos/o/r/pulls/7/reviews";
+    // A filter the evaluator can run but the steward does not build.
+    assert!(
+        argv::classify(
+            &argv(&["api", path, "--jq", ".[] | .user.login"]),
+            Some("o/r")
+        )
+        .is_none()
+    );
+    assert!(argv::classify(&argv(&["api", path, "--jq", ".[].sha"]), Some("o/r")).is_some());
+    for filter in super::jq::ALLOWED_FILTERS {
+        assert!(
+            argv::classify(
+                &argv(&["api", "--paginate", path, "--jq", filter]),
+                Some("o/r")
+            )
+            .is_some(),
+            "{filter}"
+        );
+    }
+}
+
+#[test]
+fn gh_failures_in_the_recording_are_never_answered_in_process() {
+    let value: Value = serde_json::from_str(RECORDED).expect("fixture JSON");
+    let recording = recording();
+    let key = write_key();
+    let clock = now_clock();
+    let (mock, _base) = paged_github(
+        Arc::clone(&clock),
+        &recording.endpoint,
+        recording.pages.clone(),
+    );
+    let reads = reader(&mock, &key.path, &clock);
+    let errors = value["errors"].as_array().expect("errors");
+    assert!(errors.len() >= 6);
+    for case in errors {
+        assert_ne!(case["rc"], json!(0), "recorded as a gh failure: {case}");
+        let endpoint = case["endpoint"].as_str().expect("endpoint");
+        let filter = case["jq"].as_str().expect("jq");
+        let outcome = try_any_filter(
+            &reads,
+            &argv(&["api", "--paginate", endpoint, "--jq", filter]),
+            Some(SLUG),
+            Duration::from_secs(10),
+        );
+        assert!(
+            matches!(outcome, ReadOutcome::Declined { .. }),
+            "gh failed on {filter:?}; in-process answered: {outcome:?}"
+        );
+    }
+}
+
+#[test]
+fn paginate_asks_for_100_per_page_unless_the_query_names_a_size() {
+    let key = write_key();
+    let clock = now_clock();
+    let mock = github(Arc::clone(&clock), |_| Reply::json(200, &json!([])));
+    let reads = reader(&mock, &key.path, &clock);
+    let get = |path: &str, paginate: bool| {
+        let mut args = argv(&["api"]);
+        if paginate {
+            args.push("--paginate".to_owned());
+        }
+        args.extend(argv(&[path, "--jq", ".[].sha"]));
+        answered(reads.try_read(&args, Some("o/r"), Duration::from_secs(5), None));
+        mock.requests()
+            .iter()
+            .rev()
+            .find(|request| request.path.starts_with("repos/o/r/things"))
+            .expect("a request")
+            .path
+            .clone()
+    };
+    assert_eq!(
+        get("repos/o/r/things", true),
+        "repos/o/r/things?per_page=100"
+    );
+    assert_eq!(
+        get("repos/o/r/things?state=all", true),
+        "repos/o/r/things?state=all&per_page=100"
+    );
+    assert_eq!(
+        get("repos/o/r/things?per_page=2", true),
+        "repos/o/r/things?per_page=2"
+    );
+    assert_eq!(
+        get("repos/o/r/things?a=1&per_page=50&b=2", true),
+        "repos/o/r/things?a=1&per_page=50&b=2"
+    );
+    // Without --paginate gh sends the path as given.
+    assert_eq!(get("repos/o/r/things?x=1", false), "repos/o/r/things?x=1");
+}
+
+/// Page 1 keeps its `ETag` while a page 2 appears behind it. A 304 on page 1
+/// must not end the listing.
+#[test]
+fn a_new_page_behind_an_unchanged_one_is_not_missed() {
+    let key = write_key();
+    let clock = now_clock();
+    let grown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let base = Arc::new(std::sync::OnceLock::<String>::new());
+    let (grown_for_handler, base_for_handler) = (Arc::clone(&grown), Arc::clone(&base));
+    let mock = github(Arc::clone(&clock), move |request| {
+        if request.path.contains("page=2") {
+            return Reply::json(200, &json!([{"number": 2}])).header("ETag", "\"p2\"");
+        }
+        let has_next = grown_for_handler.load(Ordering::SeqCst);
+        if request.header("if-none-match") == Some("\"p1\"") {
+            // The ETag did not move, and a 304 carries no Link.
+            return Reply {
+                status: 304,
+                headers: vec![("ETag".to_owned(), "\"p1\"".to_owned())],
+                body: Vec::new(),
+                delay: Duration::ZERO,
+            };
+        }
+        let mut reply = Reply::json(200, &json!([{"number": 1}])).header("ETag", "\"p1\"");
+        if has_next {
+            let root = base_for_handler.get().expect("base");
+            reply = reply.header(
+                "Link",
+                &format!("<{root}/repositories/1/things?per_page=100&page=2>; rel=\"next\""),
+            );
+        }
+        reply
+    });
+    base.set(mock.url.clone()).expect("once");
+    let reads = reader(&mock, &key.path, &clock);
+    let args = argv(&[
+        "api",
+        "--paginate",
+        "repos/o/r/things",
+        "--jq",
+        ".[].number",
+    ]);
+    let read = |reads: &InprocReads| {
+        answered(reads.try_read(&args, Some("o/r"), Duration::from_secs(5), None)).1
+    };
+    assert_eq!(read(&reads), "1\n");
+    grown.store(true, Ordering::SeqCst);
+    let second = read(&reads);
+    assert_eq!(
+        second, "1\n2\n",
+        "page 2 is read, not hidden by the cached 304"
+    );
 }
