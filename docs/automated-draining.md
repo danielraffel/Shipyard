@@ -906,6 +906,7 @@ red_everywhere = "shadow"   # off | shadow (default) | enforce
 | row `next_action.action`, base tip green on the check | "Repair this PR: <check> (<test>) failed here and on N PRs with the same test, but the base tip is green on <check>, so each failure is its own. Fix the failing test in this PR." The failures are each PR's own, not a base-level cause |
 | row `next_action.action`, base tip unreadable | The cautious text: "Failing on N PRs with the same test: ... Likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green. Base health could not be read, so this is the cautious reading." |
 | `summary.log` | `red_everywhere=<episodes>` on each repository line |
+| `summary.log` | `recovery_store=<active>/<limit>` on each repository line: the recovery store's fill after the pass retired requests for pull requests that closed, merged or moved head (or aged past 7 days). `!FULL` means it cannot take another request; `ERROR` means the prune failed; `off` means recovery publication is disabled |
 | enqueue (enforce only) | a member whose head has not changed since the episode began is not enqueued: `held_red_everywhere:<check>`. Nothing is dequeued or closed |
 
 A member that pushes a new head leaves the episode; the episode ends (and is
