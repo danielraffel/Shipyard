@@ -96,8 +96,8 @@ a head that carries another open pull request's unapproved commits. Before it
 enqueues or merges pull request P, it reads P's commits that are not on the
 base (the compare API `base...head`) and, once per pass, the commits of every
 other open pull request in the repository. If P carries any commit of a pull
-request Q whose current head is not approved (a counted HOLD, or no counted
-APPROVE), P is refused with `blocked_on=carries_unapproved_commits:#Q`, and
+request Q whose current head is not approved, and a HOLD as new as P's own
+exact-head APPROVE covers it (see below), P is refused with `blocked_on=carries_unapproved_commits:#Q`, and
 `blocked_detail` names the shared commits and why Q is not approved. Commits
 already on the base never count, nor does a shared commit whose change the base tip
 already has under other shas (a non-merge commit with the patch-id of a
@@ -110,58 +110,25 @@ Q when it is P's own base-branch
 pull request, is stacked on P (following its base branch through other open
 pull requests' head branches reaches P's head branch), only inherits the
 commit (a commit counts as Q's only if it is in Q's own diff against Q's own
-base branch), merged P's branch without being stacked on it, or is a Shipyard
-rollup that merged P's head. A shared commit counts against P only when it is
-on Q's first-parent chain (`Q.base..Q.head` followed through first parents) or
-is not on P's own first-parent chain (`base..P.head`): a commit on P's
-first-parent chain that reached Q only through a merge's second parent is P's
-own. When every shared commit is P's own, Q does not hold P, and a refusal P
-still gets from another pull request ends with `#Q merged or built on #P's
-branch; not carried`. P merging held work in (the held commits are P's second parent) and
-P built straight on commits on Q's own first-parent chain (they are on both
-chains) are still refused, and a first-parent read that fails or is over the
-cap keeps the overlap. Q's own diff and its first-parent chain come from one
-read of `Q.base...Q.head`. Named residual: P built straight on commits that a
-held Q itself took in through a merge's second parent (Q = merge(Q.base, X)
-with P on X, or Q's tip re-hung as merge(Q.base, old tip)) is cleared, because
-the commit graph cannot tell that from Q having merged P's branch; X then
-lands under P's own approval, so P's reviewer reviews X as part of P's diff. Head
-ancestry never excuses Q on its own: a Q that targets the base and contains P's
-whole head (built on P, or P merged back into Q) is judged at its listed head
-like any other Q, because ancestry cannot show which pull request introduced a
-shared commit. The shared commits clear P only while Q's head is approved with
-no HOLD, or once they are on the base, with two exceptions, both for a P opened
-before Q (a lower pull request number) and a shared commit on both P's and Q's
-first-parent chains. The first is the unreviewed child: when Q is refused only
-for want of an APPROVE (no HOLD, and its approval read), that commit is P's
-own, whether Q took P's current head or an older one and whether or not Q is
-labelled. P's exact-head approval reviewed it as P's diff and nobody has said
-no to it, so an approved parent never waits on a child that is still waiting
-for review; a parent with several such children, and a child built on several
-parents, are settled parent by parent. A held or unreadable Q gets only the
-second exception, the declared older parent: when Q declares the stack (Q is labelled `stacked:<P>`, or reaches P
-through a chain of open pull requests' `stacked:<n>` labels and base
-branches), P was opened before Q (a lower pull request number), and Q's own
-diff holds P's exact current head, a shared commit on P's own first-parent
-chain is P's own even when it is on Q's first-parent chain too, because Q
-branched off P's line. This is the stack whose child targets the base while
-it is held or unreviewed; without it the approved parent and the held child
-wait on each other. The label never clears anything by itself: it only
-unlocks that graph proof, and its `labeled` event names who declared the
-stack. `Supersedes #n` and the clean-replacement marker never admit P: they
-say P is to be closed, not merged. Commits P merged in (off P's first-parent
-chain) are still refused, and so are, for a held Q, the three misses (a P
-opened after Q is refused whatever Q's verdict), each with its fix in
-the refusal detail: an undeclared Q (`#Q built on #P's head but is not
-labelled stacked:P: label it (shipyard pr --stacked-on P) or retarget #Q onto
-#P's branch`), a P opened after Q (`#Q built on #P's head but #P was opened
-after #Q: retarget #Q onto #P's branch`), and a Q that took an older head of
-P's (`#Q is on an older head of #P: merge #P into #Q`). Named residuals: a P
-opened first and reset onto a newer, unreviewed Q's commits is cleared, and
-those commits land under P's exact-head approval; and a Q labelled
-`stacked:P` whose author opened P first and reset it onto Q's held commits is
-cleared; those commits land under P's exact-head approval, and the
-label event names who declared the stack. Land or
+base branch). Otherwise HOLD
+recency decides, never graph shape, labels or opening order. P's exact-head
+APPROVE reviewed P's whole diff, the shared commits included, so a shared
+commit holds P only while some counting HOLD, on any head of Q's or of P's
+own, is at least as new as P's exact-head APPROVE. Times are the server's: a
+review's `submitted_at`, a comment's `created_at`, or its `updated_at` when
+later, so an edit never backdates a HOLD. Every HOLD on Q counts, not only
+those on heads holding the shared commits: a superset that refuses more,
+never less, and reads no heads Q has dropped. A child still waiting for
+review therefore never blocks its approved parent, a parent with several
+children and a child built on several parents are settled pair by pair, and
+a HOLD posted after P's approval stops P until P is reviewed again (the
+detail names the HOLD's head, record and time, and P's approval time). A P
+with no exact-head APPROVE of its own (one carried from an earlier head, or a
+rollup) is held by any HOLD; a verdict that cannot be read refuses with
+`carried_commits_unreadable:#Q`; under fleet-guard admission, which keeps no
+verdict timeline here, a refused Q always refuses. `stacked:<n>` labels,
+`Supersedes #n`, the clean-replacement marker and head ancestry never clear a
+HOLD. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request. A Q whose listing is larger (for example a stacked pull
@@ -445,7 +412,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `ejected_same_head:<cause>:needs_new_head` | The same, under the retry discipline ([Ejection guards](#ejection-guards)): `<cause>` is `failed_checks` with no infrastructure signature, `merge_conflict`, or `invalid_merge_commit`. Only a new head moves it; for `invalid_merge_commit` or `merge_conflict`, merge the base once and push once | author or repair lane |
 | `generated_path_batch:#<n>` | Approved and green, but this head changes a generated path (`[auto_merge] generated_paths`) that queued entry `#<n>` also changes; `blocked_detail` names the shared paths. Not an error: the steward admits it on the first pass after `#<n>` leaves the queue | steward (nothing to do) |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
-| `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved; `blocked_detail` names the commits | Q's reviewer, or the author: drop Q's commits |
+| `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved, and a HOLD at least as new as P's exact-head approval covers them; `blocked_detail` names the commits and the HOLD | P's reviewer (review P again after the HOLD), Q's reviewer, or the author: drop Q's commits |
 | `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe and #N's head reaches a root of P's commits, or P's commits have more than 50 roots; for a P over 250 commits, an unapproved #N whose own commits are over 250, have more than 50 roots, or exceed P's 100 probes; or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `waiting_code_owner:<owners>` | Approved and green, but the base's ruleset requires a code-owner review and no owner `CODEOWNERS` (at the base) assigns to a changed file has approved this exact head. The steward asks GitHub nothing and records no mutation; it posts one comment per head mentioning the owners (`+`-joined in the token). It never reads `reviewDecision`, which is `null` on a base that requires zero approvals even after the owner approves. A team or e-mail owner, or a file the PR author owns, is left to GitHub | code owner |

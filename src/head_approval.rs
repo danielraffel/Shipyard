@@ -100,10 +100,12 @@ use serde_json::Value;
 
 mod blocker;
 pub mod guard;
+pub(crate) mod history;
 mod rebase;
 pub mod trusted_signal;
 
 pub use blocker::ApprovalBlocker;
+pub use history::{HoldRecord, VerdictHistory, history_from_records, verdict_history};
 pub use rebase::{
     CarryRecord, REBASE_CARRY_ENV, REBASE_CARRY_FILE, REBASE_CARRY_LOG, patch_id, rebase_carry,
     rebase_carry_enabled,
@@ -2852,6 +2854,24 @@ fn edit_checked(
             "approval comment {id} is not among the comments read"
         ));
     };
+    if comment_ever_edited(run_gh, record)? {
+        Ok(HeadGate::NotApproved {
+            head: head.to_owned(),
+        })
+    } else {
+        Ok(gate)
+    }
+}
+
+/// Whether an approval comment was ever edited, by GitHub's GraphQL
+/// `lastEditedAt` (beyond REST `updated_at`): an edited comment never
+/// approves.
+///
+/// # Errors
+///
+/// When the record's edit metadata or its edit history cannot be read.
+pub(crate) fn comment_ever_edited(run_gh: RunGh<'_>, record: &Value) -> Result<bool, String> {
+    let id = record.get("id").and_then(Value::as_u64).unwrap_or_default();
     if !matches!(comment_edit_stamps(record), Ok(Some(_))) {
         return Err(format!(
             "approval comment {id} carries no readable edit metadata (at, updated_at)"
@@ -2882,10 +2902,8 @@ fn edit_checked(
         ));
     }
     match answer.pointer("/data/node/lastEditedAt") {
-        Some(Value::Null) => Ok(gate),
-        Some(Value::String(_)) => Ok(HeadGate::NotApproved {
-            head: head.to_owned(),
-        }),
+        Some(Value::Null) => Ok(false),
+        Some(Value::String(_)) => Ok(true),
         _ => Err(format!("approval comment {id} edit history unreadable")),
     }
 }

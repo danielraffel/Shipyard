@@ -1,5 +1,4 @@
-//! Refuse to admit a head that carries another open pull request's
-//! unapproved commits.
+//! Refuse to admit a head that carries commits a newer HOLD covers.
 //!
 //! A HOLD stops one pull request's head. It does not stop the same commits
 //! reaching the base through a second pull request: a branch that merged the
@@ -7,74 +6,42 @@
 //! approve the second pull request on its own diff, and the steward would then
 //! admit the held code. Before admitting candidate P, the steward therefore
 //! compares P's commits that are not on the base with the commits of every
-//! other open pull request Q in the repository. When P carries any commit of a
-//! Q whose current head the exact-head approval gate does not admit (a counted
-//! HOLD, or no counted APPROVE), P is refused with
-//! `carries_unapproved_commits:#Q`, and the shared commits are named.
+//! other open pull request Q in the repository. When P carries a commit of a
+//! Q whose current head the exact-head approval gate does not admit, P is
+//! refused with `carries_unapproved_commits:#Q`, naming the shared commits,
+//! unless the HOLD-recency rule clears Q ([`recency_judgement`]).
 //!
-//! Not blocked:
+//! The rule: P's exact-head APPROVE reviewed P's whole diff, the shared
+//! commits included, so a shared commit holds P back only while some counting
+//! HOLD on any head of Q's, or of P's own, is at least as new as that APPROVE.
+//! Times are the server's (a review's `submitted_at`, a comment's
+//! `created_at`, and its `updated_at` when later), read from the same verdict
+//! records the gate reads. Every HOLD on Q counts, not only those on heads
+//! holding the shared commits: a superset that refuses more, never less. A
+//! child waiting for review therefore never blocks its approved parent, a
+//! parent with several children or a child built on several parents is
+//! settled pair by pair, and a HOLD posted after P's approval stops P until P
+//! is reviewed again. A P with no exact-head APPROVE of its own (an approval
+//! carried from an earlier head, or a rollup) is held by any HOLD. A verdict
+//! that cannot be read refuses (`carried_commits_unreadable:#Q`), and under
+//! fleet-guard admission, which keeps no verdict timeline here, a refused Q
+//! always refuses. Labels (`stacked:<n>`), opening order, `Supersedes #n`, the
+//! clean-replacement marker and head ancestry never clear a HOLD: none of
+//! them says whether anyone reviewed the shared commits after the HOLD.
+//!
+//! Not blocked, before any verdict is read:
 //!
 //! * Q is P's own base-branch pull request (same repository, Q's head branch
 //!   is P's base); a properly stacked P never targets the steward's base.
 //! * Q is stacked on P, directly or transitively (following Q's base branch
 //!   through other open pull requests' head branches reaches P's head
-//!   branch): Q builds on P.
+//!   branch): Q builds on P and cannot land before it.
 //! * Q only inherits the commit: Q "introduced" a commit only if it is in Q's
 //!   own diff against Q's own base branch (`Q.base...Q.head`), not merely
 //!   reachable from Q. A pull request stacked on another branch therefore
-//!   never matches the commits its base branch already carries, which is what
-//!   keeps P admissible when P's own commit reached Q through a chain. A pull
+//!   never matches the commits its base branch already carries. A pull
 //!   request that merges another pull request's branch still has those
 //!   commits in its own diff and is still caught.
-//! * Never excused by ancestry alone: a Q that contains P's whole head (Q
-//!   built on P while targeting the base, or Q merged P back in) is judged
-//!   like any other Q. Head ancestry cannot say which pull request introduced
-//!   a shared commit, so the commits both ranges hold clear P only while Q's
-//!   listed head is approved, without a HOLD, or once they are on the base,
-//!   with two exceptions, both for a P opened before Q and a shared commit on
-//!   both first-parent chains (Q branched off P's line, at P's current head
-//!   or an older one), where that commit is P's own:
-//!   * The unreviewed child: Q's head is refused only for want of an APPROVE
-//!     (no HOLD, and its approval read). P's exact-head approval reviewed the
-//!     commit as P's own diff, and nobody has said no to it, so a child
-//!     waiting for review never blocks its parent. A parent with several such
-//!     children, and a child built on several parents (each parent's commits
-//!     on the child's first-parent chain, or merged in off it), are settled
-//!     parent by parent.
-//!   * The declared older parent, for a held Q: Q declares the stack (Q is
-//!     labelled `stacked:<P>`, or reaches P through a chain of open pull
-//!     requests' `stacked:<n>` labels and base branches) and Q's own diff
-//!     holds P's exact head. The label never clears anything by itself; it
-//!     only unlocks that graph proof, and its `labeled` event names who
-//!     declared the stack.
-//!
-//!   `Supersedes #n` and the clean-replacement marker are never read here:
-//!   they say P is to be closed, not merged. Commits P merged in (off P's
-//!   first-parent chain), a P opened after Q (P built on Q), and, for a held
-//!   or unreadable Q, an undeclared Q or a Q built on an older head of P's
-//!   stay refused, and the refusal detail names which it was and the fix.
-//!   Named residuals: a P opened first and then reset onto a newer Q's
-//!   commits is cleared when Q is only unreviewed (P's reviewer reviews those
-//!   commits as P's diff), and when Q is held only if Q is labelled
-//!   `stacked:P` (the label event names who declared it).
-//! * Q merged P's branch without being stacked on it: a shared commit counts
-//!   against P only when it is on Q's first-parent chain (`Q.base..Q.head`
-//!   walked through first parents) or is not on P's own first-parent chain
-//!   (`base..P.head`). A commit on P's first-parent chain that reached Q only
-//!   through a merge's second parent is P's own, so it does not hold P; when
-//!   every shared commit is P's own, Q is cleared, and a refusal P still gets
-//!   from another pull request says "#Q merged or built on #P's branch; not
-//!   carried".
-//!   The real catches remain: P merging held work in (the held commits are
-//!   P's second parent, so not on P's first-parent chain) and P built
-//!   straight on commits on Q's own first-parent chain (on both chains)
-//!   when P was opened after Q or Q is held (see the exceptions above). A
-//!   first-parent read that fails or is over the cap keeps the overlap.
-//!   Named residual: P built straight on commits that held Q itself took in
-//!   through a merge's second parent (Q = merge(Q.base, X) with P on X, or Q's
-//!   tip re-hung as merge(Q.base, old tip)) is cleared. The commit graph
-//!   cannot tell that from Q having merged P's branch, so X lands under P's
-//!   own approval; P's reviewer reviews X as P's diff.
 //! * A carried commit whose change is already on the base under other shas
 //!   (a merge that only re-applies landed content, a cherry-pick with the
 //!   base's patch-id and matching changed entries): see [`landed`]. The
@@ -224,17 +191,30 @@ impl Carried {
     }
 }
 
-/// The exact-head approval gate's verdict on Q's current head.
+/// Whether Q's commits may land through P: the exact-head approval gate's
+/// verdict on Q's current head, then the HOLD-recency rule
+/// ([`recency_judgement`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Judgement {
     /// The gate admits Q's head.
     Approved,
+    /// The gate does not admit Q's head, but no counting HOLD on any head of
+    /// Q's or P's is as new as P's exact-head approval, which reviewed every
+    /// commit P carries: Q holds nothing back from P.
+    Cleared(String),
     /// The gate refuses Q's head, for this reason.
     Unapproved(String),
     /// A counting HOLD names Q's head: refused, and never excused as a stack.
     Held(String),
     /// Q's approval could not be read.
     Unreadable(String),
+}
+
+impl Judgement {
+    /// Whether Q's commits may land through P.
+    pub(super) const fn clears(&self) -> bool {
+        matches!(self, Self::Approved | Self::Cleared(_))
+    }
 }
 
 /// Why P is refused: the `blocked_on` token and its detail.
@@ -273,9 +253,8 @@ pub(super) fn carried(candidate: &Candidate<'_>, others: &[OpenPr]) -> Vec<Carri
 /// The open pull requests whose commits P must not carry unapproved: every
 /// one but P itself, P's own base-branch pull request, and those stacked on
 /// P. Pure. A labelled stack is still checked here when it is unrelated to P;
-/// the label is a repair-lane marker and never excuses Q on its own (it only
-/// unlocks the older-parent graph proof, see [`older_parent_of`]). A Q stacked
-/// on P is excluded by the base-branch relation itself, regardless of labels.
+/// the label is a repair-lane marker and never excuses Q. A Q stacked on P is
+/// excluded by the base-branch relation itself, regardless of labels.
 fn unrelated<'a>(
     number: u64,
     base_ref: &'a str,
@@ -321,66 +300,6 @@ fn stacked_on(q: &OpenPr, head_ref: &str, others: &[OpenPr]) -> bool {
         }
     }
     false
-}
-
-/// Whether `q` declares a stack on P (`p_number`, head branch `p_head_ref`):
-/// walking from `q`, some pull request on the walk is labelled
-/// `stacked:<P>` or (same repository) targets P's head branch. Each step
-/// follows the `stacked:<n>` label to that open pull request, or else the
-/// base branch to the open same-repository pull request whose head branch it
-/// is. Pure; a cycle or a walk off the open pull requests ends it.
-fn declared_stack_reaches(q: &OpenPr, p_number: u64, p_head_ref: &str, others: &[OpenPr]) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut at = q;
-    while seen.insert(at.number) {
-        if at.stacked_on == Some(p_number) || (!at.cross_repository && at.base_ref == p_head_ref) {
-            return true;
-        }
-        let next = others
-            .iter()
-            .find(|s| Some(s.number) == at.stacked_on)
-            .or_else(|| {
-                others
-                    .iter()
-                    .find(|s| !s.cross_repository && s.head_ref == at.base_ref)
-            });
-        match next {
-            Some(next) => at = next,
-            None => return false,
-        }
-    }
-    false
-}
-
-/// Why P is not `q`'s older parent, when the shared commits sit on both
-/// first-parent chains. Each names the fix in the refusal detail.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OlderParentMiss {
-    /// P was opened after `q`.
-    NewerParent,
-    /// `q` does not declare a stack on P.
-    Undeclared,
-    /// `q`'s own diff does not hold P's current head.
-    HeadNotContained,
-}
-
-impl OlderParentMiss {
-    /// The refusal-detail suffix naming the fix.
-    fn detail(self, p: u64, q: u64) -> String {
-        match self {
-            Self::Undeclared => format!(
-                "; #{q} built on #{p}'s head but is not labelled stacked:{p}: label it \
-                 (shipyard pr --stacked-on {p}) or retarget #{q} onto #{p}'s branch"
-            ),
-            Self::NewerParent => format!(
-                "; #{q} built on #{p}'s head but #{p} was opened after #{q}: retarget #{q} \
-                 onto #{p}'s branch"
-            ),
-            Self::HeadNotContained => {
-                format!("; #{q} is on an older head of #{p}: merge #{p} into #{q}")
-            }
-        }
-    }
 }
 
 /// What an overlap with `q` narrows to once `q`'s own diff is read.
@@ -431,8 +350,7 @@ fn introduced_overlap(
         }
         Carried::Unbounded { .. } => (own.clone(), false),
     };
-    // The same read later gives `q`'s first-parent chain, so `q`'s own diff
-    // and its chain describe one comparison even if `q`'s base moves.
+    // One cached read per `(base, head)` for the pass.
     match cached_graph(run_gh, repo, graphs, &q.base_ref, &q.head_sha)? {
         CommitGraph::Complete(introduced) => {
             let shared: Vec<String> = candidates
@@ -553,7 +471,7 @@ fn resolve_overlap(
                 number: q.number,
                 total,
             };
-            if judgement == Judgement::Approved {
+            if judgement.clears() {
                 return Some((unbounded, judgement));
             }
             match probe_introduced(run_gh, repo, base, q, &probe, reachable) {
@@ -638,7 +556,7 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
     let mut unreadable = Vec::new();
     for (carried, judgement) in judged {
         match (carried, judgement) {
-            (_, Judgement::Approved) => {}
+            (_, Judgement::Approved | Judgement::Cleared(_)) => {}
             (Carried::Shares { .. }, Judgement::Unapproved(reason) | Judgement::Held(reason)) => {
                 carries.push((carried, reason));
             }
@@ -672,9 +590,9 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
         return Some(Refusal {
             token: format!("carries_unapproved_commits:#{}", first.number()),
             detail: format!(
-                "{detail}. Land or approve that pull request first, or drop its commits from \
-                 this branch; a branch built on another pull request should target that pull \
-                 request's branch"
+                "{detail}. Have this head reviewed again after that HOLD, land or approve that \
+                 pull request first, or drop its commits from this branch; a branch built on \
+                 another pull request should target that pull request's branch"
             ),
         });
     }
@@ -718,8 +636,8 @@ pub(super) struct PassCache {
     /// Each open pull request's own roots, by number and listed head, for
     /// every over-cap candidate and admission path in the pass.
     roots: BTreeMap<(u64, String), Result<Roots, String>>,
-    /// Commit graphs (`base...head` with parents), by `(base, head)`: a
-    /// pull request's own diff and its first-parent chain come from one read.
+    /// Commit graphs (`base...head` with parents), by `(base, head)`, read
+    /// once per pass.
     graphs: GraphCache,
 }
 
@@ -814,6 +732,8 @@ pub(super) fn refusal_for(
     );
     let mut report_policy = policy.clone();
     report_policy.dry_run = true;
+    let histories = std::cell::RefCell::new(BTreeMap::new());
+    let p_dated = std::cell::RefCell::new(None);
     let mut judge = |q: &OpenPr| -> Judgement {
         let queue = match super::native_arm::read_queue_state(actions, repo, q.number) {
             Ok(queue) => queue,
@@ -838,7 +758,7 @@ pub(super) fn refusal_for(
             }
             None => queue,
         };
-        match crate::head_approval::evaluate_with_policy_for_author_with_diagnosis(
+        let gate = match crate::head_approval::evaluate_with_policy_for_author_with_diagnosis(
             &run_gh,
             repo,
             q.number,
@@ -848,7 +768,47 @@ pub(super) fn refusal_for(
             q.author.as_deref(),
         ) {
             Ok((gate, _, blocker)) => judgement_of(&gate, blocker.as_ref(), comment_source),
-            Err(error) => Judgement::Unreadable(error),
+            Err(error) => return Judgement::Unreadable(error),
+        };
+        // Under fleet-guard admission there is no verdict timeline to date
+        // P's approval by, so a refused Q keeps refusing: fail closed.
+        if !comment_source || gate.clears() {
+            return gate;
+        }
+        let history = |number: u64, author: Option<&str>| {
+            histories
+                .borrow_mut()
+                .entry(number)
+                .or_insert_with(|| {
+                    crate::head_approval::verdict_history(
+                        &run_gh,
+                        repo,
+                        number,
+                        &report_policy,
+                        author,
+                    )
+                })
+                .clone()
+        };
+        // P is dated only by an approval the gate would count: never an
+        // edited one, by GraphQL's edit history, read once per candidate.
+        let p_history = p_dated
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                history(pr.number, pr.author.as_deref())
+                    .and_then(|history| history.without_edited_approvals(&run_gh, &pr.head_sha))
+            })
+            .clone();
+        match (p_history, history(q.number, q.author.as_deref())) {
+            (Ok(p_history), Ok(q_history)) => recency_judgement(
+                gate,
+                pr.number,
+                &pr.head_sha,
+                &p_history,
+                q.number,
+                &q_history,
+            ),
+            (Err(error), _) | (_, Err(error)) => Judgement::Unreadable(error),
         }
     };
     refusal_with(
@@ -861,6 +821,59 @@ pub(super) fn refusal_for(
         cache,
         &mut judge,
     )
+}
+
+/// Whether a Q the gate refuses still holds P back, by HOLD recency. P's
+/// exact-head approval reviewed every commit P carries, Q's included, so a
+/// shared commit stops P only while some counting HOLD is at least as new as
+/// that approval: a HOLD on any head of Q's, or of P's own. Every HOLD on Q
+/// counts, not only those on heads that contain the shared commits: a
+/// deliberate superset that refuses more, never less, and needs no reads of
+/// heads Q has since dropped. With no such HOLD Q is
+/// [`Judgement::Cleared`]; with one Q is [`Judgement::Held`], naming the
+/// HOLD and the remedy (a review of P's head after it). A P with no counting,
+/// unedited exact-head APPROVE of its own (one carried from an earlier head,
+/// or a rollup) has nothing to date, so any HOLD holds it. Only server-set
+/// times are compared, never labels, numbers or commit dates. An approved,
+/// cleared or unreadable `gate` is returned as it is. Pure.
+pub(super) fn recency_judgement(
+    gate: Judgement,
+    p_number: u64,
+    p_head: &str,
+    p_history: &crate::head_approval::VerdictHistory,
+    q_number: u64,
+    q_history: &crate::head_approval::VerdictHistory,
+) -> Judgement {
+    let reason = match &gate {
+        Judgement::Unapproved(reason) | Judgement::Held(reason) => reason.clone(),
+        Judgement::Approved | Judgement::Cleared(_) | Judgement::Unreadable(_) => return gate,
+    };
+    let approved_at = p_history.approved_at(p_head);
+    let newest = q_history
+        .holds
+        .iter()
+        .map(|hold| (q_number, hold))
+        .chain(p_history.holds.iter().map(|hold| (p_number, hold)))
+        .filter(|(_, hold)| approved_at.is_none_or(|approved| hold.at >= approved))
+        .max_by_key(|(_, hold)| hold.at);
+    let approval = approved_at.map_or_else(
+        || format!("#{p_number} has no exact-head APPROVE of its own at {p_head}"),
+        |at| format!("#{p_number}'s exact-head APPROVE at {}", at.to_rfc3339()),
+    );
+    match newest {
+        None => Judgement::Cleared(format!(
+            "{reason}; no HOLD on #{q_number} or #{p_number} is as new as {approval}"
+        )),
+        Some((number, hold)) => Judgement::Held(format!(
+            "{reason}; a HOLD on #{number}'s head {} ({} {}, {}) is not older than {approval}: \
+             a review of #{p_number}'s head posted after that HOLD clears it",
+            hold.head,
+            hold.record,
+            hold.id
+                .map_or_else(|| "unrecorded".to_owned(), |id| id.to_string()),
+            hold.at.to_rfc3339()
+        )),
+    }
 }
 
 /// The judgement of Q's head from the approval gate and its blocker. A HOLD
@@ -924,8 +937,6 @@ pub(super) fn refusal_with(
     };
     let overlaps = carried(&candidate, others);
     let mut judged = Vec::with_capacity(overlaps.len());
-    let mut merged_own = Vec::new();
-    let mut stack_misses = Vec::new();
     for overlap in overlaps {
         let q = others
             .iter()
@@ -944,214 +955,14 @@ pub(super) fn refusal_with(
         ) else {
             continue;
         };
-        let graphs = std::cell::RefCell::new(&mut cache.graphs);
-        let mut chain = |chain_base: &str, chain_head: &str| {
-            cached_graph(
-                run_gh,
-                repo,
-                &mut graphs.borrow_mut(),
-                chain_base,
-                chain_head,
-            )
-            .and_then(|graph| first_parent_chain(&graph, chain_base, chain_head))
-        };
-        let mut older_parent = |unreviewed: bool| {
-            let graph = cached_graph(
-                run_gh,
-                repo,
-                &mut graphs.borrow_mut(),
-                &q.base_ref,
-                &q.head_sha,
-            );
-            older_parent_of(
-                number,
-                head_sha,
-                head_ref,
-                q,
-                others,
-                unreviewed,
-                graph.as_ref(),
-            )
-        };
-        let mut miss = None;
-        match without_own_commits(
-            settled,
-            base,
-            head_sha,
-            q,
-            &mut older_parent,
-            &mut chain,
-            &mut miss,
-        ) {
-            Some(settled) => {
-                if let Some(settled) = landed::without_landed_commits(run_gh, repo, base, settled) {
-                    judged.push(settled);
-                    if let Some(miss) = miss {
-                        stack_misses.push((q.number, miss));
-                    }
-                }
-            }
-            None => merged_own.push(q.number),
+        if settled.1.clears() {
+            continue;
+        }
+        if let Some(settled) = landed::without_landed_commits(run_gh, repo, base, settled) {
+            judged.push(settled);
         }
     }
-    decide(base, &judged).map(|mut refusal| {
-        for (q, miss) in stack_misses {
-            refusal.detail.push_str(&miss.detail(number, q));
-        }
-        for q in merged_own {
-            use std::fmt::Write as _;
-            let _ = write!(
-                refusal.detail,
-                "; #{q} merged or built on #{number}'s branch; not carried"
-            );
-        }
-        refusal
-    })
-}
-
-/// Reads a `(base, head)` first-parent chain.
-type ChainReader<'a> = dyn FnMut(&str, &str) -> Result<BTreeSet<String>, String> + 'a;
-
-/// Whether `q` builds on P as a declared older parent: P (`number`, head
-/// branch `head_ref`) was opened before `q`, `q` declares the stack (see
-/// [`declared_stack_reaches`]), and `q`'s own diff (`graph`,
-/// `q.base...q.head`) holds P's exact head, so `q`'s head contains every
-/// commit P has. Pure. The miss says which condition failed, checked in that
-/// order.
-///
-/// This is the evidence the commit graph alone lacks. When P's and `q`'s
-/// first-parent chains share a run of commits, the graph cannot say whether
-/// `q` branched off P or P branched off `q`; P proposed those commits first,
-/// and P's exact-head approval reviewed them as P's own diff. For an
-/// `unreviewed` `q` (refused only for want of an APPROVE) that is enough:
-/// nobody has refused the commits, so P is judged on its own approval
-/// whether `q` sits on P's current head or an older one, declared or not.
-/// For a held `q` the declaration and the exact head are required too: an
-/// undeclared `q` and a `q` that does not contain P's current head (P moved
-/// on since `q` took it) are not older parents. A `q` older than P is never
-/// one. Named residual: a P opened first and reset onto a newer `q`'s commits
-/// is cleared when `q` is unreviewed, or held and labelled `stacked:P` (the
-/// label event names who declared it).
-fn older_parent_of(
-    number: u64,
-    p_head: &str,
-    head_ref: &str,
-    q: &OpenPr,
-    others: &[OpenPr],
-    unreviewed: bool,
-    graph: Result<&CommitGraph, &String>,
-) -> Result<(), OlderParentMiss> {
-    if number >= q.number {
-        return Err(OlderParentMiss::NewerParent);
-    }
-    if unreviewed {
-        return Ok(());
-    }
-    if !declared_stack_reaches(q, number, head_ref, others) {
-        return Err(OlderParentMiss::Undeclared);
-    }
-    if matches!(graph, Ok(CommitGraph::Complete(introduced)) if introduced.contains_key(p_head)) {
-        Ok(())
-    } else {
-        Err(OlderParentMiss::HeadNotContained)
-    }
-}
-
-/// Drop from a refusing overlap with `q` the commits that are P's own: on P's
-/// first-parent chain (`base..p_head`) and either not on `q`'s
-/// (`q.base..q.head`), or on both chains while P is `q`'s older parent
-/// (`older_parent`, called with whether `q` is only unreviewed, see
-/// [`older_parent_of`]). A commit of the first kind
-/// reached `q` only through a merge's second parent, so `q` merged P's branch;
-/// one of the second kind is P's line that `q` built on. Either way P carries
-/// nothing of `q`'s through it. A shared commit off P's first-parent chain
-/// (work P merged in) is never P's own. `None` when every shared commit is
-/// P's own. An approved `q`, an unbounded overlap, and any chain that cannot
-/// be read keep the overlap as it is. When a kept commit is on both chains,
-/// `miss` is set to why P is not `q`'s older parent.
-fn without_own_commits(
-    settled: (Carried, Judgement),
-    base: &str,
-    p_head: &str,
-    q: &OpenPr,
-    older_parent: &mut dyn FnMut(bool) -> Result<(), OlderParentMiss>,
-    chain: &mut ChainReader<'_>,
-    miss: &mut Option<OlderParentMiss>,
-) -> Option<(Carried, Judgement)> {
-    let (
-        Carried::Shares {
-            number,
-            head_sha,
-            shared,
-        },
-        judgement,
-    ) = &settled
-    else {
-        return Some(settled);
-    };
-    if *judgement == Judgement::Approved {
-        return Some(settled);
-    }
-    let (Ok(p_chain), Ok(q_chain)) = (chain(base, p_head), chain(&q.base_ref, &q.head_sha)) else {
-        return Some(settled);
-    };
-    // Only a Q the gate refuses for want of an APPROVE is unreviewed: a HOLD
-    // (or fleet-guard refusal) and an unreadable judgement keep the full
-    // proof.
-    let older_parent = older_parent(matches!(judgement, Judgement::Unapproved(_)));
-    let kept: Vec<String> = shared
-        .iter()
-        .filter(|sha| !p_chain.contains(*sha) || (q_chain.contains(*sha) && older_parent.is_err()))
-        .cloned()
-        .collect();
-    if kept.is_empty() {
-        return None;
-    }
-    if kept
-        .iter()
-        .any(|sha| p_chain.contains(sha) && q_chain.contains(sha))
-    {
-        *miss = older_parent.err();
-    }
-    Some((
-        Carried::Shares {
-            number: *number,
-            head_sha: head_sha.clone(),
-            shared: kept,
-        },
-        judgement.clone(),
-    ))
-}
-
-/// `head`'s first-parent chain not on `base` (`git log --first-parent
-/// base..head`): from `head`, follow each commit's first parent while it is
-/// one of `head`'s commits not on `base`. An over-cap compare is an error, so
-/// the caller keeps the overlap.
-fn first_parent_chain(
-    graph: &CommitGraph,
-    base: &str,
-    head: &str,
-) -> Result<BTreeSet<String>, String> {
-    let graph = match graph {
-        CommitGraph::Complete(graph) => graph,
-        CommitGraph::OverCap { total } => {
-            return Err(format!(
-                "compare {base}...{head} has {total} commits, over the first-parent read cap"
-            ));
-        }
-    };
-    let mut chain = BTreeSet::new();
-    let mut at = head.to_owned();
-    while let Some(parents) = graph.get(&at) {
-        if !chain.insert(at.clone()) {
-            break;
-        }
-        match parents.first() {
-            Some(first) => at = first.clone(),
-            None => break,
-        }
-    }
-    Ok(chain)
+    decide(base, &judged)
 }
 
 /// Q's approval is judged only at the head the listing saw, so the live
@@ -1303,7 +1114,7 @@ fn over_cap_refusal(
             continue;
         }
         let judgement = judge(q);
-        if judgement != Judgement::Approved {
+        if !judgement.clears() {
             judged.push((
                 Carried::Shares {
                     number: q.number,
@@ -1325,7 +1136,7 @@ fn judge_unbounded(
     judged: &mut Vec<(Carried, Judgement)>,
 ) {
     let judgement = judge(q);
-    if judgement != Judgement::Approved {
+    if !judgement.clears() {
         judged.push((
             Carried::Unbounded {
                 number: q.number,

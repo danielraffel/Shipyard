@@ -546,6 +546,21 @@ fn first_parent_refusal(
     p_graph: Graph<'_>,
     others: &[(&OpenPr, Graph<'_>)],
 ) -> Option<super::Refusal> {
+    first_parent_judged(
+        p_head,
+        p_graph,
+        others,
+        &Judgement::Unapproved("no counted APPROVE".to_owned()),
+    )
+}
+
+/// [`first_parent_refusal`] with every other pull request judged `judgement`.
+fn first_parent_judged(
+    p_head: &str,
+    p_graph: Graph<'_>,
+    others: &[(&OpenPr, Graph<'_>)],
+    judgement: &Judgement,
+) -> Option<super::Refusal> {
     let listed = listing(
         &others
             .iter()
@@ -578,7 +593,7 @@ fn first_parent_refusal(
         }
         Err(format!("unexpected: {joined}"))
     };
-    let mut judge = |_: &OpenPr| Judgement::Unapproved("no counted APPROVE".to_owned());
+    let mut judge = |_: &OpenPr| judgement.clone();
     refusal_with(
         &run_gh,
         "Generous-Corp/pulp",
@@ -593,74 +608,30 @@ fn first_parent_refusal(
 
 const P_LINE: Graph<'static> = &[(FP_P1, &[FP_MAIN]), (FP_P2, &[FP_P1])];
 
+/// Cleared: no HOLD on Q or P is as new as P's exact-head approval.
+fn cleared() -> Judgement {
+    Judgement::Cleared("no newer HOLD".to_owned())
+}
+
 #[test]
-fn a_stacked_pr_that_merged_the_candidates_branch_does_not_hold_it() {
-    // Q (base feat/x) merged P's branch: P1 and P2 are on P's first-parent
-    // chain and reached Q only as QM's second parent.
+fn a_pr_that_merged_the_candidates_branch_holds_it_only_by_a_newer_hold() {
+    // Q (base feat/x) merged P's branch: P1 and P2 reached Q only as QM's
+    // second parent. The graph no longer clears them: whose commits they are
+    // is not something ancestry can prove, so Q's HOLD recency decides.
     let q = open(21, "feat/q2", "feat/x", FP_QM, &[FP_P1, FP_P2, FP_QM]);
     let q_graph: Graph<'_> = &[
         (FP_P1, &[FP_MAIN]),
         (FP_P2, &[FP_P1]),
         (FP_QM, &["feat-x-tip", FP_P2]),
     ];
-    assert_eq!(first_parent_refusal(FP_P2, P_LINE, &[(&q, q_graph)]), None);
+    let refusal = first_parent_refusal(FP_P2, P_LINE, &[(&q, q_graph)]).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#21");
 
-    // A refusal P still gets from another pull request says why Q is not in it.
-    let held = open(30, "feat/held", "main", FP_H2, &[FP_H1, FP_H2]);
-    let held_graph: Graph<'_> = &[(FP_H1, &[FP_MAIN]), (FP_H2, &[FP_H1])];
-    let p_graph: Graph<'_> = &[
-        (FP_P1, &[FP_MAIN]),
-        (FP_P2, &[FP_P1]),
-        (FP_H1, &[FP_MAIN]),
-        (FP_H2, &[FP_H1]),
-        (FP_PM, &[FP_P2, FP_H2]),
-    ];
-    let refusal = first_parent_refusal(FP_PM, p_graph, &[(&q, q_graph), (&held, held_graph)])
-        .expect("the held pull request still refuses");
-    assert_eq!(refusal.token, "carries_unapproved_commits:#30");
-    assert!(
-        refusal
-            .detail
-            .contains("#21 merged or built on #11363's branch; not carried"),
-        "{}",
-        refusal.detail
+    // Control: with no HOLD as new as P's approval, P is admitted.
+    assert_eq!(
+        first_parent_judged(FP_P2, P_LINE, &[(&q, q_graph)], &cleared()),
+        None
     );
-    assert!(!refusal.detail.contains("of #21"), "{}", refusal.detail);
-}
-
-#[test]
-fn a_candidate_that_merged_a_held_branch_is_refused() {
-    // Q (base feat/x) merged the held branch H1..H2, and P merged that same
-    // held branch: H1 and H2 are a merge's second parent on both sides, so on
-    // neither first-parent chain. Not being P's own, they are carried.
-    let q = open(31, "feat/held", "feat/x", FP_QM, &[FP_H1, FP_H2, FP_QM]);
-    let q_graph: Graph<'_> = &[
-        (FP_H1, &[FP_MAIN]),
-        (FP_H2, &[FP_H1]),
-        (FP_QM, &["feat-x-tip", FP_H2]),
-    ];
-    let p_graph: Graph<'_> = &[
-        (FP_P1, &[FP_MAIN]),
-        (FP_H1, &[FP_MAIN]),
-        (FP_H2, &[FP_H1]),
-        (FP_PM, &[FP_P1, FP_H2]),
-    ];
-    let refusal = first_parent_refusal(FP_PM, p_graph, &[(&q, q_graph)]).expect("refused");
-    assert_eq!(refusal.token, "carries_unapproved_commits:#31");
-    assert!(refusal.detail.contains(FP_H1), "{}", refusal.detail);
-    assert!(refusal.detail.contains(FP_H2), "{}", refusal.detail);
-}
-
-#[test]
-fn a_candidate_fast_forwarded_onto_a_held_prs_commits_is_refused() {
-    // P built straight on Q's commits: they are on both first-parent chains.
-    let q = open(32, "feat/held", "main", FP_H2, &[FP_H1, FP_H2]);
-    let q_graph: Graph<'_> = &[(FP_H1, &[FP_MAIN]), (FP_H2, &[FP_H1])];
-    let p_graph: Graph<'_> = &[(FP_H1, &[FP_MAIN]), (FP_H2, &[FP_H1]), (FP_P1, &[FP_H2])];
-    let refusal = first_parent_refusal(FP_P1, p_graph, &[(&q, q_graph)]).expect("refused");
-    assert_eq!(refusal.token, "carries_unapproved_commits:#32");
-    assert!(refusal.detail.contains(FP_H1), "{}", refusal.detail);
-    assert!(refusal.detail.contains(FP_H2), "{}", refusal.detail);
 }
 
 #[test]
@@ -677,9 +648,10 @@ fn a_pr_stacked_on_the_candidate_still_never_blocks_it() {
 }
 
 #[test]
-fn a_merge_of_the_candidates_branch_with_one_real_q_commit_is_refused_for_that_commit() {
+fn a_merge_of_the_candidates_branch_with_one_real_q_commit_names_every_shared_commit() {
     // P is built on Q1, Q's own first-parent commit; Q later merged P's branch,
-    // which is how P1 and P2 reached Q. Only Q1 is carried.
+    // which is how P1 and P2 reached Q. Under a newer HOLD every shared commit
+    // is named.
     let q = open(
         34,
         "feat/q4",
@@ -697,13 +669,17 @@ fn a_merge_of_the_candidates_branch_with_one_real_q_commit_is_refused_for_that_c
     let refusal = first_parent_refusal(FP_P2, p_graph, &[(&q, q_graph)]).expect("refused");
     assert_eq!(refusal.token, "carries_unapproved_commits:#34");
     assert!(
-        refusal.detail.contains("carries 1 commit(s) of #34"),
+        refusal.detail.contains("carries 3 commit(s) of #34"),
         "{}",
         refusal.detail
     );
     assert!(refusal.detail.contains(FP_Q1), "{}", refusal.detail);
-    assert!(!refusal.detail.contains(FP_P1), "{}", refusal.detail);
-    assert!(!refusal.detail.contains(FP_P2), "{}", refusal.detail);
+
+    // Control: cleared by recency, P is admitted.
+    assert_eq!(
+        first_parent_judged(FP_P2, p_graph, &[(&q, q_graph)], &cleared()),
+        None
+    );
 }
 
 #[test]
@@ -801,8 +777,9 @@ fn a_candidate_that_merged_a_held_pr_and_then_main_is_refused() {
 }
 
 #[test]
-fn a_criss_cross_merge_is_refused_for_qs_own_commit_only() {
-    // P merged Q1 and Q (base feat/x) merged P1: P1 is P's own, Q1 is Q's.
+fn a_criss_cross_merge_under_a_newer_hold_is_refused() {
+    // P merged Q1 and Q (base feat/x) merged P1. Under a newer HOLD both
+    // shared commits are named: ancestry no longer clears P1.
     let q = open(38, "feat/q8", "feat/x", FP_QM, &[FP_Q1, FP_P1, FP_QM]);
     let q_graph: Graph<'_> = &[
         (FP_Q1, &[FP_MAIN]),
@@ -817,16 +794,21 @@ fn a_criss_cross_merge_is_refused_for_qs_own_commit_only() {
     let refusal = first_parent_refusal(FP_PM, p_graph, &[(&q, q_graph)]).expect("refused");
     assert_eq!(refusal.token, "carries_unapproved_commits:#38");
     assert!(refusal.detail.contains(FP_Q1), "{}", refusal.detail);
-    assert!(!refusal.detail.contains(FP_P1), "{}", refusal.detail);
+    assert!(refusal.detail.contains(FP_P1), "{}", refusal.detail);
+
+    // Control: cleared by recency, P is admitted.
+    assert_eq!(
+        first_parent_judged(FP_PM, p_graph, &[(&q, q_graph)], &cleared()),
+        None
+    );
 }
 
 #[test]
-fn residual_a_candidate_built_on_commits_a_held_pr_merged_in_is_cleared() {
-    // Named residual, documented as current behaviour: held Q (base feat/x)
-    // is merge(feat/x tip, X2), taking X1..X2 in as a second parent, and P is
-    // built straight on X2. X1 and X2 are on P's first-parent chain and not
-    // on Q's, which the graph cannot tell from Q having merged P's branch, so
-    // Q is cleared and X lands under P's own approval.
+fn a_candidate_built_on_commits_a_held_pr_merged_in_is_refused_under_a_newer_hold() {
+    // Held Q (base feat/x) is merge(feat/x tip, X2), taking X1..X2 in as a
+    // second parent, and P is built straight on X2. This used to be a named
+    // residual (cleared by the first-parent rule); a HOLD newer than P's
+    // approval now refuses it.
     let q = open(39, "feat/q9", "feat/x", FP_QM, &[FP_H1, FP_H2, FP_QM]);
     let q_graph: Graph<'_> = &[
         (FP_H1, &[FP_MAIN]),
@@ -834,7 +816,15 @@ fn residual_a_candidate_built_on_commits_a_held_pr_merged_in_is_cleared() {
         (FP_QM, &["feat-x-tip", FP_H2]),
     ];
     let p_graph: Graph<'_> = &[(FP_H1, &[FP_MAIN]), (FP_H2, &[FP_H1]), (FP_P1, &[FP_H2])];
-    assert_eq!(first_parent_refusal(FP_P1, p_graph, &[(&q, q_graph)]), None);
+    let held = Judgement::Held("HOLD newer than P's approval".to_owned());
+    let refusal = first_parent_judged(FP_P1, p_graph, &[(&q, q_graph)], &held).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#39");
+
+    // Control: an approval of P after the HOLD clears it.
+    assert_eq!(
+        first_parent_judged(FP_P1, p_graph, &[(&q, q_graph)], &cleared()),
+        None
+    );
 }
 
 #[test]

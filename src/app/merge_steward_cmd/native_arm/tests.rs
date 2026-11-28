@@ -1120,9 +1120,30 @@ fn carrying_a_commit_of_11361_live_at(
     q_comments: &str,
     live_head: &str,
 ) -> String {
+    carrying_a_commit_of_11361_approved_at(
+        log,
+        q_reviews,
+        q_comments,
+        live_head,
+        "2026-10-04T01:00:00Z",
+    )
+}
+
+/// [`carrying_a_commit_of_11361_live_at`], with this head's own approving
+/// review posted at `approved_at`.
+#[cfg(unix)]
+fn carrying_a_commit_of_11361_approved_at(
+    log: &str,
+    q_reviews: &str,
+    q_comments: &str,
+    live_head: &str,
+    approved_at: &str,
+) -> String {
     const HELD_HEAD: &str = "883bb3f600000000000000000000000000000000";
     const CARRIED: &str = "c26a23be00000000000000000000000000000000";
-    let review = r#"{"login":"someone","type":"User","at":"2026-10-04T01:00:00Z","state":"APPROVED","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    let review = format!(
+        r#"{{"login":"someone","type":"User","at":"{approved_at}","state":"APPROVED","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#
+    );
     let listing = format!(
         r#"{{"data":{{"repository":{{"pullRequests":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{{"number":11361,"headRefName":"feat/real-world-inputs-t2","baseRefName":"main","headRefOid":"{HELD_HEAD}","isCrossRepository":false,"author":{{"login":"author"}},"carriedCommits":{{"totalCount":2,"nodes":[{{"commit":{{"oid":"{CARRIED}"}}}},{{"commit":{{"oid":"{HELD_HEAD}"}}}}]}}}}]}}}}}}}}"#
     );
@@ -1138,7 +1159,7 @@ case "$*" in
   *isInMergeQueue*number=11361*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":11361,"state":"OPEN","headRefOid":"{live_head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
 esac
 {}"#,
-        approval_required(log, review)
+        approval_required(log, &review)
     )
 }
 
@@ -1198,6 +1219,50 @@ fn the_backstop_never_arms_a_head_carrying_another_prs_held_commit() {
         assert_eq!(
             reports[0].blocked.blocked_on,
             "carries_unapproved_commits:#11361"
+        );
+    }
+}
+
+/// The same held #11361, but this head was approved after the HOLD: its
+/// review covered the carried commit, so the backstop arms it. Read from the
+/// live verdict records, not from labels or numbers.
+#[cfg(unix)]
+#[test]
+fn the_backstop_arms_a_head_approved_after_the_carried_prs_hold() {
+    let held_head = "883bb3f600000000000000000000000000000000";
+    let hold = format!(
+        r#"{{"id":777,"login":"someone","type":"User","at":"2026-10-04T02:00:00Z","body":"verdict: HOLD head:{held_head}"}}"#
+    );
+    for (approved_at, armed) in [
+        ("2026-10-04T03:00:00Z", true),
+        ("2026-10-04T02:00:00Z", false),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls.log");
+        let actions = fake_gh(
+            &temp,
+            &carrying_a_commit_of_11361_approved_at(
+                &log.display().to_string(),
+                "",
+                &hold,
+                held_head,
+                approved_at,
+            ),
+        );
+        let observation = observation(pr_row(&serde_json::json!({})), true);
+        let reports = report(StewardDecision::Unmanaged);
+        let (status, _) = apply_native_arm_backstop(
+            &actions,
+            &observation,
+            &reports,
+            "shipyard:no-auto-merge",
+            true,
+            no_authority_needed,
+        );
+        let expected = if armed { "armed" } else { "skipped" };
+        assert_eq!(
+            status.results[0].outcome, expected,
+            "approved at {approved_at}: {status:?}"
         );
     }
 }
