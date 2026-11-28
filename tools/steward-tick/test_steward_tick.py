@@ -321,6 +321,27 @@ class StewardTickArchiveTests(unittest.TestCase):
             self.summary_line(),
         )
 
+    def test_a_full_recovery_store_is_named_in_the_summary_line(self):
+        body = json.dumps({"repos": [
+            {"repo": "acme/repo", "prs": [], "errors": [],
+             "recovery_store": {"active": 1024, "limit": 1024, "retired_dead": 0, "retired_aged": 0}},
+        ]})
+        (self.home / "pass.json").write_text(body)
+        stub = self.home / ".local" / "bin" / "shipyard"
+        stub.write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = --version ]; then echo 'shipyard 1.0'; exit 0; fi\n"
+            f"cat '{self.home / 'pass.json'}'\n"
+        )
+        stub.chmod(0o755)
+        self.run_tick()
+        self.assertIn(" recovery_store=1024/1024!FULL", self.summary_line())
+
+    def test_a_pass_without_recovery_publication_reports_the_store_off(self):
+        self.steward_prints([], rc=0)
+        self.run_tick()
+        self.assertIn(" recovery_store=off", self.summary_line())
+
     def test_a_spaced_hint_token_is_compacted(self):
         self.steward_prints_invariants([
             {"id": "required_context_producer", "ok": False, "detail": "d", "fix_hint_token": "a b;c"}])
