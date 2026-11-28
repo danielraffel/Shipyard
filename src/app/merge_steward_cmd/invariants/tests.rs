@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 
 use super::clones::{self, CloneArgs, RemoteForm};
 use super::{
-    ADMISSION, Facts, Invariant, NEVER_RAN, PRODUCER, VERDICTS, attach_fix_hints, evaluate,
-    fix_hint, record, summary_hints, summary_token,
+    ADMISSION, Facts, Invariant, NEVER_RAN, PRODUCER, RECOVERY_CONSUMER, RecoveryConsumerFacts,
+    VERDICTS, attach_fix_hints, evaluate, fix_hint, record, summary_hints, summary_token,
 };
 use crate::app::merge_steward_cmd::PrReport;
 use crate::app::merge_steward_cmd::blocked_on::Stall;
@@ -69,6 +69,7 @@ struct Fixture {
     rows: Vec<PrReport>,
     base_config: Result<Option<toml::Table>, String>,
     workflows: Result<Vec<String>, String>,
+    recovery_consumer: Option<RecoveryConsumerFacts>,
 }
 
 impl Fixture {
@@ -90,6 +91,7 @@ impl Fixture {
                 REVIEW_VERDICT_WORKFLOW.to_owned(),
                 TEST_WORKFLOW.to_owned(),
             ]),
+            recovery_consumer: None,
         }
     }
 
@@ -104,6 +106,7 @@ impl Fixture {
             rows: &self.rows,
             base_config: &self.base_config,
             workflows: &self.workflows,
+            recovery_consumer: self.recovery_consumer,
             now: now(),
         })
     }
@@ -224,6 +227,7 @@ fn a_base_with_no_automatic_admission_is_an_incident() {
         ],
         base_config: Ok(None),
         workflows: Ok(vec!["jobs:\n  check:\n".to_owned()]),
+        recovery_consumer: None,
     };
     let invariants = fixture.evaluate();
     let admission = find(&invariants, ADMISSION);
@@ -867,6 +871,7 @@ fn a_pass_reads_workflows_through_the_api_once_and_caches_blobs_by_sha() {
             "review-verdict",
             &state,
             true,
+            None,
             now(),
         )
     };
@@ -929,6 +934,7 @@ fn a_pass_in_a_checkout_of_the_base_reads_workflows_from_disk() {
         "review-verdict",
         &temp.path().join("state.json"),
         false,
+        None,
         now(),
     );
     assert!(find(&invariants, PRODUCER).ok, "{invariants:?}");
@@ -951,6 +957,7 @@ fn a_pass_in_a_checkout_of_the_base_reads_workflows_from_disk() {
         "review-verdict",
         &temp.path().join("state.json"),
         false,
+        None,
         now(),
     );
     assert!(find(&invariants, PRODUCER).incident(), "{invariants:?}");
@@ -1046,4 +1053,72 @@ fn the_release_is_read_once_per_pass_and_never_when_everything_passes() {
     let reads = std::fs::read_to_string(&log).expect("log");
     assert_eq!(reads.matches("releases/latest").count(), 1, "{reads}");
     assert!(failing.iter().all(|row| row.fix_hint.is_some()));
+}
+
+fn consumer(oldest_min_ago: Option<i64>, ran_min_ago: Option<i64>) -> Fixture {
+    let mut fixture = Fixture::clean();
+    fixture.recovery_consumer = Some(RecoveryConsumerFacts {
+        oldest_unattempted: oldest_min_ago.map(|m| now() - chrono::Duration::minutes(m)),
+        backlog_unknown: false,
+        last_worker_run: ran_min_ago.map(|m| now() - chrono::Duration::minutes(m)),
+    });
+    fixture
+}
+
+/// The m3 incident, and the state after the prune empties the backlog: the
+/// steward refuses every request, so the invariant fails whatever is waiting.
+#[test]
+fn a_stale_worker_fails_the_invariant_whatever_the_backlog() {
+    for (oldest, ran) in [
+        (Some(60 * 24 * 7), None),
+        (Some(60 * 24 * 7), Some(60 * 24)),
+        (None, None),
+        (None, Some(60 * 24)),
+        (Some(5), None),
+    ] {
+        let invariants = consumer(oldest, ran).evaluate();
+        let found = find(&invariants, RECOVERY_CONSUMER);
+        assert!(found.incident(), "{oldest:?} {ran:?}: {found:?}");
+        assert!(
+            found
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("recovery-worker"))
+        );
+        assert_eq!(summary_token(&invariants), "FAIL:recovery_consumer");
+    }
+}
+
+#[test]
+fn a_recent_worker_run_holds_whatever_the_backlog() {
+    for oldest in [None, Some(30), Some(60 * 24)] {
+        assert!(find(&consumer(oldest, Some(30)).evaluate(), RECOVERY_CONSUMER).ok);
+    }
+}
+
+#[test]
+fn an_unreadable_backlog_does_not_hide_a_stale_worker() {
+    let mut fixture = consumer(None, None);
+    fixture.recovery_consumer = fixture
+        .recovery_consumer
+        .map(|facts| RecoveryConsumerFacts {
+            backlog_unknown: true,
+            ..facts
+        });
+    let invariants = fixture.evaluate();
+    let found = find(&invariants, RECOVERY_CONSUMER);
+    assert!(
+        found.incident() && found.detail.contains("backlog unreadable"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn the_invariant_is_absent_when_recovery_publication_is_off() {
+    let invariants = Fixture::clean().evaluate();
+    assert!(
+        invariants
+            .iter()
+            .all(|invariant| invariant.id != RECOVERY_CONSUMER)
+    );
 }

@@ -3913,7 +3913,10 @@ the same run no longer blocks it; see
 [references/merge-steward.md](references/merge-steward.md#infra-reruns---infra-rerun-every-open-pull-request).
 Every pass also reports tick-start invariants in `repos[].invariants`
 (`{id, ok, detail, fix}`: `required_context_producer`,
-`approval_admission_config`, `required_never_ran`, `reviewer_verdicts_counted`);
+`approval_admission_config`, `required_never_ran`, `reviewer_verdicts_counted`, and
+`recovery_consumer` when recovery publication is on: it fails whenever no `shipyard runner
+recovery-worker --apply` ran in the last 3 hours (whatever the backlog), and while that holds the steward defers new requests as
+`recovery_request_deferred:no_consumer`);
 they only read and report, and `--no-invariants` turns them off. `shipyard runner
 steward-invariants --fleet-repos F --clones D [--heal]` checks, once per tick,
 that every fleet repository has a steward config clone, and with `--heal` clones a
