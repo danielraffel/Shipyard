@@ -1424,6 +1424,7 @@ _REVIEW_ITEMS_COUNT = re.compile(r"review-items-count: (0|[1-9][0-9]{0,3})")
 _ACCEPT_LINE = re.compile(r"^ {0,3}accept-review-item:[ \t]*(\S+)[ \t]*$")
 # A fence opens with up to three spaces and three or more of one character
 # (a backtick fence's info string has no backtick, as CommonMark reads it).
+_QUOTE = re.compile(r"^ {0,3}>")
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
 _WORKFLOW_PATH = re.compile(r"\.github/workflows/[A-Za-z0-9._-]+\.ya?ml")
 _CHECK_RUN_URL = re.compile(r"https://api\.github\.com/repos/([^/]+/[^/]+)/check-runs/([0-9]+)")
@@ -1546,11 +1547,16 @@ def read_review_items(repo: str, head: str, items: dict[str, str]) -> tuple[str,
     if not counting:
         result: tuple[str, Any] = ("waiting", f"no {REVIEW_ITEMS_EVENT} run of {workflow} on "
                                               f"head {head[:12]} yet")
+        # Cached too: the judgement is for one moment, and every pull request sharing the head
+        # is judged in it.
+        _REVIEW_ITEMS_CACHE[key] = result
         return result
     run = max(counting, key=lambda row: row["id"])
     run_id = run["id"]
     if run.get("status") != "completed":
-        return "waiting", f"{workflow} run {run_id} has not completed"
+        result = ("waiting", f"{workflow} run {run_id} has not completed")
+        _REVIEW_ITEMS_CACHE[key] = result
+        return result
     if run.get("conclusion") != "success":
         result = ("refused", f"{workflow} run {run_id} concluded {run.get('conclusion')}")
         _REVIEW_ITEMS_CACHE[key] = result
@@ -1601,14 +1607,25 @@ def accepted_review_items(body: str) -> set[str]:
     which allows three spaces: a fence read as still open only makes a head
     wait). So a ``~~~`` block holding a backtick line, a longer backtick
     fence holding a shorter one, and a diff's `` ```'' context line all stay
-    fenced; an unclosed fence keeps the rest of the body fenced."""
+    fenced; an unclosed fence keeps the rest of the body fenced.
+
+    A non-blank line right after a ``>`` quote line, with no blank line between,
+    continues the quote (CommonMark's lazy continuation), so it is quoted text,
+    not an acceptance; only a blank line ends the quote."""
     found: set[str] = set()
     fence: str | None = None
+    quoted = False
     for line in body.splitlines():
         if fence is not None:
             closing = line.rstrip(" \t")
             if closing and set(closing) == {fence[0]} and len(closing) >= len(fence):
                 fence = None
+            continue
+        if not line.strip():
+            quoted = False
+            continue
+        if _QUOTE.match(line) or quoted:
+            quoted = True
             continue
         opening = _FENCE_OPEN.match(line)
         if opening is not None:

@@ -428,8 +428,9 @@ reviewer: pulp-review
 verdict: APPROVE head:<sha>
 ```
 
-Lines inside a fenced code block, `>` quotes, and lines indented four spaces
-or a tab do not count. A fence closes only on a line holding nothing but its
+Lines inside a fenced code block, `>` quotes (including a line that lazily
+continues a quote, with no blank line after the `>` line), and lines indented
+four spaces or a tab do not count. A fence closes only on a line holding nothing but its
 opening character, at least as many times, from the first column, so a
 `~~~` block holding a backtick line, or a longer backtick fence holding a
 shorter one, stays fenced. Extra accepts

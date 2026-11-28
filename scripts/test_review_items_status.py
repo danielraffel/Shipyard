@@ -191,6 +191,14 @@ class ReviewItemsStatus(unittest.TestCase):
                 f"verdict: APPROVE head:{HEAD}")
         self.assertEqual(self.judged(self.trail(body)), "success")
 
+    def test_a_lazily_quoted_accept_keeps_the_head_pending(self) -> None:
+        quoted = (f"Reviewed.\n> Quoted example:\naccept-review-item: {HOTSPOT}\n\nreviewer: pulp-review\n"
+                  f"{STAMP}\nverdict: APPROVE head:{HEAD}")
+        self.assertEqual(self.judged(self.trail(quoted)), "pending")
+        self.assertIn(HOTSPOT, self.posted()["description"])
+        unquoted = quoted.replace("Quoted example:\n", "Quoted example:\n\n")
+        self.assertEqual(self.judged(self.trail(unquoted)), "success")
+
     def test_an_accept_from_an_approve_that_does_not_count_is_not_success(self) -> None:
         # The same counting rules as the approval: an unsigned App APPROVE
         # carrying every accept is no approval at all.
@@ -386,6 +394,19 @@ class ReviewItemsStatus(unittest.TestCase):
         self.assertEqual(self.posted()["state"], "success", result.stdout + result.stderr)
         self.assertEqual(self.calls().count("/annotations?"), 1)
 
+    def test_a_shared_head_reads_a_missing_or_unfinished_items_run_once(self) -> None:
+        # 1767-r1-f2: the waiting answers are cached too, so two pull requests on the head cost
+        # one runs listing for the items (plus refresh_head_check's own).
+        for runs in ([], [items_run(status="in_progress", conclusion=None)]):
+            with self.subTest(runs=runs):
+                answers = self.shared(approve(HOTSPOT))
+                listed = VERDICT_RUNS + runs
+                answers.insert(0, ("actions/runs?head_sha", {"pages": [
+                    {"total_count": len(listed), "workflow_runs": listed}]}))
+                result = self.post(answers)
+                self.assertEqual(self.posted()["state"], "pending", result.stdout + result.stderr)
+                self.assertEqual(self.calls().count("actions/runs?head_sha"), 2, self.calls())
+
     def test_a_backfill_style_pull_request_target_run_applies_the_same_rule(self) -> None:
         event = {"pull_request": {"number": 784}}
         result = self.post(self.answers(self.trail(approve())), "pull_request_target", event)
@@ -493,6 +514,20 @@ class AcceptingBody(unittest.TestCase):
             f"````\n```\n{accept}\n`````\n   accept-review-item: hotspot:after-ticks\n"
             f"```py\n{accept}\n``` \naccept-review-item: hotspot:after-trailing-space"),
             {"hotspot:after-tilde", "hotspot:after-ticks", "hotspot:after-trailing-space"})
+
+    def test_a_lazy_quote_continuation_accepts_nothing(self) -> None:
+        # 1767-r1-f1: CommonMark continues a `>` paragraph onto the next non-blank line, so that
+        # line renders inside the quote. Only a blank line ends it.
+        accept = "accept-review-item: hotspot:x"
+        for body in (f"> Quoted example:\n{accept}\n\n",
+                     f"  > quoted\n> more\n{accept}",
+                     f"> quoted\nstill quoted\n{accept}"):
+            with self.subTest(body=body):
+                self.assertEqual(self.guard.accepted_review_items(body), set())
+        self.assertEqual(self.guard.accepted_review_items(f"> Quoted example:\n\n{accept}\n"),
+                         {"hotspot:x"}, "a blank line ends the quote")
+        self.assertEqual(self.guard.accepted_review_items(f"Plain paragraph.\n{accept}\n"),
+                         {"hotspot:x"}, "only a quote is lazy here")
 
     def test_the_parsers_match_pulps_grammar(self) -> None:
         self.assertEqual(self.guard.accepted_review_items(
