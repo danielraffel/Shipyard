@@ -2048,10 +2048,12 @@ fn a_paged_read_revalidates_each_page_and_keeps_its_link() {
             };
         }
         let root = for_handler.get().expect("base");
-        let mut reply = Reply::json(
-            200,
-            &serde_json::from_str::<Value>(&pages[page - 1]).expect("page"),
-        )
+        let mut reply = Reply {
+            status: 200,
+            headers: Vec::new(),
+            body: pages[page - 1].clone().into_bytes(),
+            delay: Duration::ZERO,
+        }
         .header("ETag", &etag);
         if page < pages.len() {
             reply = reply.header(
