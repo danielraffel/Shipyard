@@ -128,7 +128,15 @@ rollup) is held by any HOLD; a verdict that cannot be read refuses with
 `carried_commits_unreadable:#Q`; under fleet-guard admission, which keeps no
 verdict timeline here, a refused Q always refuses. `stacked:<n>` labels,
 `Supersedes #n`, the clean-replacement marker and head ancestry never clear a
-HOLD. Land or
+HOLD. A P that contains the exact head a HOLD at Q's current head names is
+refused however old that HOLD is. Named residuals: a HOLD older than P's
+exact-head APPROVE does not stop P, even when P merged or was reset onto Q's
+held commits afterwards, because P's reviewer, who approved a diff containing
+the held commits, is the control; an erased HOLD (its verdict line edited
+away, or deleted) no longer counts, as on a single pull request; and a review
+of P started before Q's HOLD and posted after it clears P. The author's fix
+for a refusal is to push a new head of P (for example, merge `origin/main`
+once), which re-enters review and is dated after the HOLD. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read
 per pull request. A Q whose listing is larger (for example a stacked pull
@@ -412,7 +420,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `ejected_same_head:<cause>:needs_new_head` | The same, under the retry discipline ([Ejection guards](#ejection-guards)): `<cause>` is `failed_checks` with no infrastructure signature, `merge_conflict`, or `invalid_merge_commit`. Only a new head moves it; for `invalid_merge_commit` or `merge_conflict`, merge the base once and push once | author or repair lane |
 | `generated_path_batch:#<n>` | Approved and green, but this head changes a generated path (`[auto_merge] generated_paths`) that queued entry `#<n>` also changes; `blocked_detail` names the shared paths. Not an error: the steward admits it on the first pass after `#<n>` leaves the queue | steward (nothing to do) |
 | `waiting_full_test_tier`, `waiting_enqueue_requirements` | Admission waits on a deferred check tier or a GitHub requirement | CI |
-| `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved, and a HOLD at least as new as P's exact-head approval covers them; `blocked_detail` names the commits and the HOLD | P's reviewer (review P again after the HOLD), Q's reviewer, or the author: drop Q's commits |
+| `carries_unapproved_commits:#Q` | Approved and green, but carries commits of open pull request #Q, whose head is not approved, and a HOLD at least as new as P's exact-head approval covers them; `blocked_detail` names the commits and the HOLD | The author: push a new head (for example, merge `origin/main` once) so P is reviewed after the HOLD, or drop Q's commits; or Q's reviewer approves Q |
 | `carried_commits_over_cap:#N`, `carried_commits_unreadable` | Whether the head carries unapproved commits could not be proven (an unapproved #N whose own diff is over 250 commits while P has more than 50 commits to probe and #N's head reaches a root of P's commits, or P's commits have more than 50 roots; for a P over 250 commits, an unapproved #N whose own commits are over 250, have more than 50 roots, or exceed P's 100 probes; or a failed read) | author, or next pass |
 | `revalidating` | The head or queue changed during the pass | next pass |
 | `waiting_code_owner:<owners>` | Approved and green, but the base's ruleset requires a code-owner review and no owner `CODEOWNERS` (at the base) assigns to a changed file has approved this exact head. The steward asks GitHub nothing and records no mutation; it posts one comment per head mentioning the owners (`+`-joined in the token). It never reads `reviewDecision`, which is `null` on a base that requires zero approvals even after the owner approves. A team or e-mail owner, or a file the PR author owns, is left to GitHub | code owner |

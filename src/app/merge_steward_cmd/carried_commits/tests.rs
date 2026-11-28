@@ -610,7 +610,10 @@ const P_LINE: Graph<'static> = &[(FP_P1, &[FP_MAIN]), (FP_P2, &[FP_P1])];
 
 /// Cleared: no HOLD on Q or P is as new as P's exact-head approval.
 fn cleared() -> Judgement {
-    Judgement::Cleared("no newer HOLD".to_owned())
+    Judgement::Cleared {
+        detail: "no newer HOLD".to_owned(),
+        head_held: false,
+    }
 }
 
 #[test]
@@ -626,6 +629,13 @@ fn a_pr_that_merged_the_candidates_branch_holds_it_only_by_a_newer_hold() {
     ];
     let refusal = first_parent_refusal(FP_P2, P_LINE, &[(&q, q_graph)]).expect("refused");
     assert_eq!(refusal.token, "carries_unapproved_commits:#21");
+    // No HOLD is named (as under fleet-guard admission), so no fresh-review
+    // advice is given.
+    assert!(
+        !refusal.detail.contains("Push a new head"),
+        "{}",
+        refusal.detail
+    );
 
     // Control: with no HOLD as new as P's approval, P is admitted.
     assert_eq!(

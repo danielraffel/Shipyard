@@ -374,10 +374,11 @@ fn callers_move(kind: &str, facts: &Facts<'_>, stall: &Stall) -> Option<NextActi
         "carries_unapproved_commits" => NextAction::new(
             Actor::Author,
             format!(
-                "This head carries commits of open {arg}, whose head is not approved, and a \
-                 HOLD at least as new as this head's own approval covers them{detail_suffix}: \
-                 have this head reviewed again after that HOLD, wait for {arg}'s approval, or \
-                 drop its commits from this branch."
+                "This head carries commits of open {arg}, whose head is not \
+                 approved{detail_suffix}: when the detail names a HOLD on it newer than this \
+                 head's approval, push a new head (for example, merge origin/main once) so this \
+                 pull request is reviewed after that HOLD; otherwise wait for {arg}'s approval, \
+                 or drop its commits from this branch."
             ),
         ),
         "direct_merge_refused" => NextAction::stop(

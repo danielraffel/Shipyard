@@ -354,6 +354,13 @@ fn a_parent_with_unreviewed_children_on_its_head_is_admitted() {
         "the unheld child does not hold P: {}",
         refused.detail
     );
+    assert!(
+        refused
+            .detail
+            .contains("Push a new head of this branch (for example, merge origin/main once)"),
+        "names the author's move: {}",
+        refused.detail
+    );
 }
 
 #[test]
@@ -571,4 +578,41 @@ fn each_parent_of_an_unreviewed_merge_child_is_admitted() {
             "carries_unapproved_commits:#110"
         );
     }
+}
+
+#[test]
+fn a_parent_carrying_a_held_childs_exact_head_is_refused_whatever_the_hold_age() {
+    // P (#599) is built on Q's (#600) exact head, which a HOLD names. The
+    // HOLD predates P's approval, but P carries the whole held state.
+    const QH: &str = "ad00000000000000000000000000000000000000";
+    const PH: &str = "ae00000000000000000000000000000000000000";
+    let rows = [
+        Row {
+            number: 599,
+            head: PH,
+            range: &[(QH, &[BASE_TIP]), (PH, &[QH])],
+            stacked_on: None,
+        },
+        Row {
+            number: 600,
+            head: QH,
+            range: &[(QH, &[BASE_TIP])],
+            stacked_on: None,
+        },
+    ];
+    let verdicts = Verdicts::default().hold(600, QH, 9).approve(599, PH, 10);
+    let held_at_head = |_: u64| Judgement::Held("HOLD names this head".to_owned());
+    let refused = refusal(run_gated(&rows, 599, &verdicts, &held_at_head));
+    assert_eq!(refused.token, "carries_unapproved_commits:#600");
+    assert!(
+        refused
+            .detail
+            .contains("is held and this head carries that exact head"),
+        "{}",
+        refused.detail
+    );
+
+    // Control: Q's current head not held (the HOLD named an older state), the
+    // same older HOLD clears P.
+    assert_eq!(run(&rows, 599, &verdicts), None);
 }

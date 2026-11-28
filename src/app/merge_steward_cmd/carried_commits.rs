@@ -1,10 +1,9 @@
 //! Refuse to admit a head that carries commits a newer HOLD covers.
 //!
-//! A HOLD stops one pull request's head. It does not stop the same commits
-//! reaching the base through a second pull request: a branch that merged the
-//! held branch (or a branch that did) carries the held commits, a reviewer can
-//! approve the second pull request on its own diff, and the steward would then
-//! admit the held code. Before admitting candidate P, the steward therefore
+//! A HOLD stops one pull request's head. Without this guard it would not stop
+//! the same commits reaching the base through a second pull request approved
+//! before the HOLD was posted, or through one that carries the held head
+//! itself. Before admitting candidate P, the steward therefore
 //! compares P's commits that are not on the base with the commits of every
 //! other open pull request Q in the repository. When P carries a commit of a
 //! Q whose current head the exact-head approval gate does not admit, P is
@@ -27,7 +26,18 @@
 //! fleet-guard admission, which keeps no verdict timeline here, a refused Q
 //! always refuses. Labels (`stacked:<n>`), opening order, `Supersedes #n`, the
 //! clean-replacement marker and head ancestry never clear a HOLD: none of
-//! them says whether anyone reviewed the shared commits after the HOLD.
+//! them says whether anyone reviewed the shared commits after the HOLD. One
+//! narrowing does not depend on age: a P that contains the exact head a HOLD
+//! at Q's current head names is refused however old that HOLD is.
+//!
+//! Named residuals:
+//! * A HOLD older than P's exact-head APPROVE does not stop P, even when P
+//!   merged or was reset onto Q's held commits afterwards: P's reviewer, who
+//!   approved a diff containing the held commits, is the control.
+//! * A HOLD erased (its verdict line edited away, or deleted) no longer
+//!   counts, as on a single pull request.
+//! * A reviewer who started on P before Q's HOLD and approves after it clears
+//!   P without having seen the HOLD: the window is one review's duration.
 //!
 //! Not blocked, before any verdict is read:
 //!
@@ -121,6 +131,9 @@ const LISTING_PAGE: usize = 50;
 /// Listing pages read per pass before failing closed.
 const MAX_LISTING_PAGES: usize = 20;
 
+/// How a recency refusal names the HOLD that keeps it: `a HOLD on #<n>`.
+const HOLD_NAMED: &str = "a HOLD on #";
+
 /// Shared shas named in one detail line.
 const SHAS_NAMED: usize = 10;
 
@@ -200,8 +213,10 @@ pub(super) enum Judgement {
     Approved,
     /// The gate does not admit Q's head, but no counting HOLD on any head of
     /// Q's or P's is as new as P's exact-head approval, which reviewed every
-    /// commit P carries: Q holds nothing back from P.
-    Cleared(String),
+    /// commit P carries: Q holds nothing back from P. `head_held` says the
+    /// gate refused Q for a HOLD at Q's current head (then P carrying that
+    /// exact head still refuses, see [`refusal_with`]).
+    Cleared { detail: String, head_held: bool },
     /// The gate refuses Q's head, for this reason.
     Unapproved(String),
     /// A counting HOLD names Q's head: refused, and never excused as a stack.
@@ -213,7 +228,7 @@ pub(super) enum Judgement {
 impl Judgement {
     /// Whether Q's commits may land through P.
     pub(super) const fn clears(&self) -> bool {
-        matches!(self, Self::Approved | Self::Cleared(_))
+        matches!(self, Self::Approved | Self::Cleared { .. })
     }
 }
 
@@ -556,7 +571,7 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
     let mut unreadable = Vec::new();
     for (carried, judgement) in judged {
         match (carried, judgement) {
-            (_, Judgement::Approved | Judgement::Cleared(_)) => {}
+            (_, Judgement::Approved | Judgement::Cleared { .. }) => {}
             (Carried::Shares { .. }, Judgement::Unapproved(reason) | Judgement::Held(reason)) => {
                 carries.push((carried, reason));
             }
@@ -587,12 +602,23 @@ pub(super) fn decide(base: &str, judged: &[(Carried, Judgement)]) -> Option<Refu
             })
             .collect::<Vec<_>>()
             .join("; ");
+        // Only a refusal the recency rule decided names a HOLD; under
+        // fleet-guard admission none was read, so none is named.
+        let fresh_review = carries
+            .iter()
+            .any(|(_, reason)| reason.contains(HOLD_NAMED));
+        let fix = if fresh_review {
+            "Push a new head of this branch (for example, merge origin/main once) so it is \
+             reviewed after that HOLD, land or approve that pull request first, or drop its \
+             commits from this branch"
+        } else {
+            "Land or approve that pull request first, or drop its commits from this branch"
+        };
         return Some(Refusal {
             token: format!("carries_unapproved_commits:#{}", first.number()),
             detail: format!(
-                "{detail}. Have this head reviewed again after that HOLD, land or approve that \
-                 pull request first, or drop its commits from this branch; a branch built on \
-                 another pull request should target that pull request's branch"
+                "{detail}. {fix}; a branch built on another pull request should target that pull \
+                 request's branch"
             ),
         });
     }
@@ -732,8 +758,7 @@ pub(super) fn refusal_for(
     );
     let mut report_policy = policy.clone();
     report_policy.dry_run = true;
-    let histories = std::cell::RefCell::new(BTreeMap::new());
-    let p_dated = std::cell::RefCell::new(None);
+    let reads = std::cell::RefCell::new(RecencyReads::default());
     let mut judge = |q: &OpenPr| -> Judgement {
         let queue = match super::native_arm::read_queue_state(actions, repo, q.number) {
             Ok(queue) => queue,
@@ -770,46 +795,16 @@ pub(super) fn refusal_for(
             Ok((gate, _, blocker)) => judgement_of(&gate, blocker.as_ref(), comment_source),
             Err(error) => return Judgement::Unreadable(error),
         };
-        // Under fleet-guard admission there is no verdict timeline to date
-        // P's approval by, so a refused Q keeps refusing: fail closed.
-        if !comment_source || gate.clears() {
-            return gate;
-        }
-        let history = |number: u64, author: Option<&str>| {
-            histories
-                .borrow_mut()
-                .entry(number)
-                .or_insert_with(|| {
-                    crate::head_approval::verdict_history(
-                        &run_gh,
-                        repo,
-                        number,
-                        &report_policy,
-                        author,
-                    )
-                })
-                .clone()
-        };
-        // P is dated only by an approval the gate would count: never an
-        // edited one, by GraphQL's edit history, read once per candidate.
-        let p_history = p_dated
-            .borrow_mut()
-            .get_or_insert_with(|| {
-                history(pr.number, pr.author.as_deref())
-                    .and_then(|history| history.without_edited_approvals(&run_gh, &pr.head_sha))
-            })
-            .clone();
-        match (p_history, history(q.number, q.author.as_deref())) {
-            (Ok(p_history), Ok(q_history)) => recency_judgement(
-                gate,
-                pr.number,
-                &pr.head_sha,
-                &p_history,
-                q.number,
-                &q_history,
-            ),
-            (Err(error), _) | (_, Err(error)) => Judgement::Unreadable(error),
-        }
+        judge_after_gate(
+            &run_gh,
+            repo,
+            &report_policy,
+            comment_source,
+            pr,
+            q,
+            gate,
+            &mut reads.borrow_mut(),
+        )
     };
     refusal_with(
         &run_gh,
@@ -821,6 +816,67 @@ pub(super) fn refusal_for(
         cache,
         &mut judge,
     )
+}
+
+/// The verdict histories one candidate's recency judgements share.
+#[derive(Debug, Default)]
+pub(super) struct RecencyReads {
+    /// Every pull request's counting verdicts, by number.
+    histories: BTreeMap<u64, Result<crate::head_approval::VerdictHistory, String>>,
+    /// P's, with edited approvals dropped by GraphQL's edit history.
+    p_dated: Option<Result<crate::head_approval::VerdictHistory, String>>,
+}
+
+/// Judge Q after the approval gate's `gate` judgement, as the production
+/// guard does: an approved Q, and every refused Q under fleet-guard admission
+/// (`comment_source` false: no verdict timeline to date P's approval by), keep
+/// the gate's judgement; otherwise P's and Q's verdict histories are read
+/// (once per candidate, in `reads`) and [`recency_judgement`] decides. P is
+/// dated only by an approval the gate would count: GraphQL's edit history
+/// drops edited ones. Any failed read is [`Judgement::Unreadable`].
+#[allow(clippy::too_many_arguments)]
+pub(super) fn judge_after_gate(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    policy: &crate::head_approval::ApprovalPolicy,
+    comment_source: bool,
+    pr: &crate::merge_steward::StewardPullRequest,
+    q: &OpenPr,
+    gate: Judgement,
+    reads: &mut RecencyReads,
+) -> Judgement {
+    if !comment_source || gate.clears() {
+        return gate;
+    }
+    let mut history = |number: u64, author: Option<&str>| {
+        reads
+            .histories
+            .entry(number)
+            .or_insert_with(|| {
+                crate::head_approval::verdict_history(run_gh, repo, number, policy, author)
+            })
+            .clone()
+    };
+    let p_history = if let Some(read) = &reads.p_dated {
+        read.clone()
+    } else {
+        let read = history(pr.number, pr.author.as_deref())
+            .and_then(|history| history.without_edited_approvals(run_gh, &pr.head_sha));
+        reads.p_dated = Some(read.clone());
+        read
+    };
+    let q_history = history(q.number, q.author.as_deref());
+    match (p_history, q_history) {
+        (Ok(p_history), Ok(q_history)) => recency_judgement(
+            gate,
+            pr.number,
+            &pr.head_sha,
+            &p_history,
+            q.number,
+            &q_history,
+        ),
+        (Err(error), _) | (_, Err(error)) => Judgement::Unreadable(error),
+    }
 }
 
 /// Whether a Q the gate refuses still holds P back, by HOLD recency. P's
@@ -846,8 +902,9 @@ pub(super) fn recency_judgement(
 ) -> Judgement {
     let reason = match &gate {
         Judgement::Unapproved(reason) | Judgement::Held(reason) => reason.clone(),
-        Judgement::Approved | Judgement::Cleared(_) | Judgement::Unreadable(_) => return gate,
+        Judgement::Approved | Judgement::Cleared { .. } | Judgement::Unreadable(_) => return gate,
     };
+    let head_held = matches!(gate, Judgement::Held(_));
     let approved_at = p_history.approved_at(p_head);
     let newest = q_history
         .holds
@@ -861,11 +918,14 @@ pub(super) fn recency_judgement(
         |at| format!("#{p_number}'s exact-head APPROVE at {}", at.to_rfc3339()),
     );
     match newest {
-        None => Judgement::Cleared(format!(
-            "{reason}; no HOLD on #{q_number} or #{p_number} is as new as {approval}"
-        )),
+        None => Judgement::Cleared {
+            detail: format!(
+                "{reason}; no HOLD on #{q_number} or #{p_number} is as new as {approval}"
+            ),
+            head_held,
+        },
         Some((number, hold)) => Judgement::Held(format!(
-            "{reason}; a HOLD on #{number}'s head {} ({} {}, {}) is not older than {approval}: \
+            "{reason}; {HOLD_NAMED}{number}'s head {} ({} {}, {}) is not older than {approval}: \
              a review of #{p_number}'s head posted after that HOLD clears it",
             hold.head,
             hold.record,
@@ -954,6 +1014,26 @@ pub(super) fn refusal_with(
             judge,
         ) else {
             continue;
+        };
+        // Hardening: P that carries the exact head a HOLD at Q's current head
+        // names carries the whole held state, not an ancestor of it, so the
+        // HOLD's age does not clear it.
+        let settled = match settled {
+            (
+                carried,
+                Judgement::Cleared {
+                    detail,
+                    head_held: true,
+                },
+            ) if own.contains(&q.head_sha) => (
+                carried,
+                Judgement::Held(format!(
+                    "{detail}; but #{}'s current head {} is held and this head carries \
+                         that exact head",
+                    q.number, q.head_sha
+                )),
+            ),
+            settled => settled,
         };
         if settled.1.clears() {
             continue;
@@ -1470,6 +1550,9 @@ mod stacked_verdict_tests;
 
 #[cfg(test)]
 mod parent_child_tests;
+
+#[cfg(test)]
+mod recency_glue_tests;
 
 #[cfg(test)]
 mod tests;
