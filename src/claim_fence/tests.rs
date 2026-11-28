@@ -24,6 +24,8 @@ fn record(id: u64, at: &str, body: &str) -> String {
 /// `read_cost` of the fence's clock.
 struct FakeGitHub {
     comments: Vec<String>,
+    /// PR 463, open on `other`.
+    other: Vec<String>,
     fail_reads: Cell<u32>,
     calls: Cell<u32>,
     clock: Cell<Duration>,
@@ -38,6 +40,7 @@ impl FakeGitHub {
                 .iter()
                 .map(|(id, at, body)| record(*id, at, body))
                 .collect(),
+            other: Vec::new(),
             fail_reads: Cell::new(0),
             calls: Cell::new(0),
             clock: Cell::new(Duration::ZERO),
@@ -62,6 +65,14 @@ impl FakeGitHub {
         )) {
             return Ok("462\n".to_owned());
         }
+        if path.starts_with(&format!(
+            "repos/{REPO}/pulls?state=open&head=Generous-Corp:other"
+        )) {
+            return Ok("463\n".to_owned());
+        }
+        if path == &format!("repos/{REPO}/issues/463/comments") {
+            return Ok(self.other.join("\n"));
+        }
         if path.starts_with(&format!("repos/{REPO}/pulls?")) {
             return Ok(String::new());
         }
@@ -76,6 +87,7 @@ fn on(owner: Option<&str>) -> FenceEnv {
     FenceEnv {
         owner: owner.map(str::to_owned),
         enabled: true,
+        records: Vec::new(),
     }
 }
 
@@ -431,4 +443,317 @@ fn pushed_branches_reads_the_hook_s_stdin() {
         pushed_branches(stdin),
         vec!["fix".to_owned(), "old".to_owned()]
     );
+}
+
+// A session's own claim, proven by the record `shipyard claim post` wrote in
+// its worktree rather than by an environment variable.
+
+const MINE: &str = "repair-claim: lane-a until 2026-11-16T22:00:00Z";
+
+/// The record `post` writes for comment `comment_id` on `repo#pr`.
+fn mine(pr: u64, comment_id: u64) -> FenceEnv {
+    FenceEnv {
+        owner: None,
+        enabled: true,
+        records: vec![ClaimRecord {
+            repo: REPO.to_ascii_lowercase(),
+            pr,
+            owner: "lane-a".to_owned(),
+            until: "2026-11-16T22:00:00Z".to_owned(),
+            comment_id,
+        }],
+    }
+}
+
+fn push(github: &FakeGitHub, env: &FenceEnv, branch: &str) -> Outcome {
+    let read = |repo: &str, args: &[String], timeout: Duration| github.read(repo, args, timeout);
+    let io = FenceIo {
+        read: &read,
+        sleep: &|_| {},
+        elapsed: &|| Duration::ZERO,
+        now: at(18, 36),
+    };
+    check_push(&io, env, REPO, &[branch.to_owned()])
+}
+
+#[test]
+fn a_record_naming_the_live_claim_allows_its_own_push() {
+    let github = FakeGitHub::new(&[(10, "2026-11-16T18:00:00Z", MINE)]);
+    let outcome = push(&github, &mine(462, 10), "fix");
+    assert_eq!(outcome.fence, Fence::Allow);
+    assert!(outcome.notes.is_empty(), "{:?}", outcome.notes);
+    // The same comments without the record: the claim is someone else's.
+    refused(&push(&github, &on(None), "fix").fence);
+}
+
+#[test]
+fn a_record_naming_another_comment_than_the_live_claim_is_refused() {
+    // Another session claimed under the same owner name: its comment, not ours.
+    let github = FakeGitHub::new(&[
+        (10, "2026-11-16T18:00:00Z", MINE),
+        (12, "2026-11-16T18:10:00Z", MINE),
+    ]);
+    let outcome = push(&github, &mine(462, 10), "fix");
+    let text = refused(&outcome.fence);
+    assert!(text.contains("comment 12"), "{text}");
+    assert!(
+        outcome.notes[0].contains("names comment 10 by lane-a"),
+        "{:?}",
+        outcome.notes
+    );
+}
+
+#[test]
+fn a_record_for_an_expired_released_or_taken_claim_does_not_count() {
+    let reclaimed = "repair-claim: lane-a until 2026-11-16T23:00:00Z";
+    let cases: [&[(u64, &str, &str)]; 3] = [
+        // Expired at 18:30; the name is claimed again by another session.
+        &[
+            (
+                10,
+                "2026-11-16T18:00:00Z",
+                "repair-claim: lane-a until 2026-11-16T18:30:00Z",
+            ),
+            (12, "2026-11-16T18:31:00Z", reclaimed),
+        ],
+        // Released; the name is claimed again by another session.
+        &[
+            (10, "2026-11-16T18:00:00Z", MINE),
+            (11, "2026-11-16T18:20:00Z", "repair-claim-released: lane-a"),
+            (12, "2026-11-16T18:21:00Z", reclaimed),
+        ],
+        // Taken by lane-b: the claim is lane-b's now.
+        &[
+            (10, "2026-11-16T18:00:00Z", MINE),
+            (
+                11,
+                "2026-11-16T18:20:00Z",
+                "repair-claim-taken: lane-b from lane-a reason=idle",
+            ),
+        ],
+    ];
+    for comments in cases {
+        let github = FakeGitHub::new(comments);
+        let outcome = push(&github, &mine(462, 10), "fix");
+        refused(&outcome.fence);
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|note| note.contains("not a live claim")),
+            "{:?}",
+            outcome.notes
+        );
+    }
+    // Expired and nothing else live: there is no claim to respect.
+    let github = FakeGitHub::new(&[(
+        10,
+        "2026-11-16T18:00:00Z",
+        "repair-claim: lane-a until 2026-11-16T18:30:00Z",
+    )]);
+    assert_eq!(push(&github, &mine(462, 10), "fix").fence, Fence::Allow);
+}
+
+#[test]
+fn a_record_does_not_exempt_another_session_s_claim() {
+    let github = FakeGitHub::new(&[
+        (10, "2026-11-16T18:00:00Z", MINE),
+        (11, "2026-11-16T18:05:00Z", INCIDENT),
+    ]);
+    let text = refused(&push(&github, &mine(462, 10), "fix").fence).to_owned();
+    assert!(text.contains("by team-lead"), "{text}");
+}
+
+#[test]
+fn a_record_for_another_pull_request_or_branch_is_refused() {
+    let mut github = FakeGitHub::new(&[(10, "2026-11-16T18:00:00Z", MINE)]);
+    // The same owner and comment id, but recorded for #463.
+    let outcome = push(&github, &mine(463, 10), "fix");
+    refused(&outcome.fence);
+    // A push of `other` (#463, claimed by lane-a in comment 10) with the
+    // record for #462.
+    github.other = vec![record(10, "2026-11-16T18:00:00Z", MINE)];
+    let text = refused(&push(&github, &mine(462, 10), "other").fence).to_owned();
+    assert!(text.contains("pull request #463"), "{text}");
+    // The repository counts too, case aside.
+    let mut env = mine(462, 10);
+    env.records[0].repo = "generous-corp/pulp".to_owned();
+    refused(&push(&github, &env, "fix").fence);
+    env.records[0].repo = "GENEROUS-CORP/VELLUM".to_ascii_lowercase();
+    assert_eq!(push(&github, &env, "fix").fence, Fence::Allow);
+}
+
+#[test]
+fn a_record_reads_back_from_its_config_line() {
+    let record = ClaimRecord {
+        repo: "generous-corp/x.github.io".to_owned(),
+        pr: 462,
+        owner: "repair-lane/repair-2".to_owned(),
+        until: "2026-11-27T22:00:00Z".to_owned(),
+        comment_id: 123,
+    };
+    let key = ClaimRecord::key("Generous-Corp/x.github.io", 462);
+    assert_eq!(key, "shipyard.claim.generous-corp/x.github.io#462.record");
+    assert_eq!(
+        ClaimRecord::parse(&format!("{key} {}", record.value())),
+        Some(record)
+    );
+    assert_eq!(
+        ClaimRecord::parse(&format!("{key} lane-a 2026-11-27T22:00:00Z")),
+        None
+    );
+    assert_eq!(ClaimRecord::parse(&format!("{key} lane-a t 1 extra")), None);
+    assert_eq!(ClaimRecord::parse("shipyard.other.x#1.record a b 1"), None);
+    let pattern = regex::Regex::new(RECORD_KEY_PATTERN).expect("pattern");
+    assert!(pattern.is_match(&key));
+}
+
+fn post_with(
+    github: &FakeGitHub,
+    owner: &str,
+    posted: &RefCell<Vec<Vec<String>>>,
+) -> Result<(ClaimRecord, String), TakeError> {
+    let read = |repo: &str, args: &[String], timeout: Duration| github.read(repo, args, timeout);
+    let io = FenceIo {
+        read: &read,
+        sleep: &|_| {},
+        elapsed: &|| Duration::ZERO,
+        now: at(18, 36),
+    };
+    let write = |repo: &str, args: &[String]| {
+        assert_eq!(repo, REPO);
+        posted.borrow_mut().push(args.to_vec());
+        let body = args[3].strip_prefix("body=").expect("body field");
+        // A guard may stamp the comment below the line.
+        Ok(
+            json!({"id": 99, "body": format!("{body}\n<!-- session: x -->"),
+                  "html_url": "https://github.com/x/99"})
+            .to_string(),
+        )
+    };
+    post(&io, &write, REPO, 462, owner, at(22, 0))
+}
+
+#[test]
+fn a_post_writes_the_claim_both_checkers_read_and_its_record() {
+    let mut github = FakeGitHub::new(&[]);
+    let posted = RefCell::new(Vec::new());
+    let (record, out) = post_with(&github, "repair-lane/repair-2", &posted).expect("post");
+    let line = "repair-claim: repair-lane/repair-2 until 2026-11-16T22:00:00Z";
+    assert!(out.starts_with(line), "{out}");
+    assert_eq!(posted.borrow()[0][3], format!("body={line}"));
+    assert_eq!(
+        record,
+        ClaimRecord {
+            repo: "generous-corp/vellum".to_owned(),
+            pr: 462,
+            owner: "repair-lane/repair-2".to_owned(),
+            until: "2026-11-16T22:00:00Z".to_owned(),
+            comment_id: 99,
+        }
+    );
+    // This crate's parser reads it with the same owner and time.
+    let lines = crate::work_claim::claim_lines(line);
+    assert_eq!(lines[0].owner, "repair-lane/repair-2");
+    assert_eq!(
+        crate::work_claim::claim_expiry(&lines[0].until),
+        Some(at(22, 0))
+    );
+    // And the posted comment, with its record, is this session's own.
+    github.comments.push(record_json(99, line));
+    let env = FenceEnv {
+        records: vec![record],
+        ..on(None)
+    };
+    assert_eq!(push(&github, &env, "fix").fence, Fence::Allow);
+}
+
+fn record_json(id: u64, body: &str) -> String {
+    record(id, "2026-11-16T18:36:00Z", body)
+}
+
+#[test]
+fn a_post_is_refused_over_another_live_claim_and_for_an_owner_pulp_cannot_read() {
+    let github = FakeGitHub::new(&[(1, "2026-11-16T18:17:00Z", INCIDENT)]);
+    let posted = RefCell::new(Vec::new());
+    let error = post_with(&github, "lane-a", &posted).expect_err("held");
+    assert!(error.0.contains("team-lead holds it"), "{error:?}");
+    assert!(error.0.contains("shipyard claim take"), "{error:?}");
+    let github = FakeGitHub::new(&[]);
+    for owner in ["a:b", "a/b/c", "a b", "", "x@y", &"a".repeat(65)] {
+        post_with(&github, owner, &posted).expect_err(owner);
+    }
+    assert!(posted.borrow().is_empty(), "nothing posted on a refusal");
+    // The same owner claiming again is a renewal.
+    let github = FakeGitHub::new(&[(1, "2026-11-16T18:00:00Z", MINE)]);
+    post_with(&github, "lane-a", &posted).expect("renewal");
+}
+
+fn release_with(github: &FakeGitHub, record: &ClaimRecord) -> (String, Vec<Vec<String>>) {
+    let read = |repo: &str, args: &[String], timeout: Duration| github.read(repo, args, timeout);
+    let io = FenceIo {
+        read: &read,
+        sleep: &|_| {},
+        elapsed: &|| Duration::ZERO,
+        now: at(18, 36),
+    };
+    let posted = RefCell::new(Vec::new());
+    let write = |_: &str, args: &[String]| {
+        posted.borrow_mut().push(args.to_vec());
+        let body = args[3].strip_prefix("body=").expect("body field");
+        Ok(json!({"id": 100, "body": body}).to_string())
+    };
+    let out = release(&io, &write, REPO, record).expect("release");
+    (out, posted.into_inner())
+}
+
+#[test]
+fn a_release_posts_the_named_release_while_its_comment_holds_the_claim() {
+    let github = FakeGitHub::new(&[(10, "2026-11-16T18:00:00Z", MINE)]);
+    let record = mine(462, 10).records.remove(0);
+    let (out, posted) = release_with(&github, &record);
+    assert!(out.starts_with("repair-claim-released: lane-a"), "{out}");
+    assert_eq!(posted[0][1], format!("repos/{REPO}/issues/462/comments"));
+}
+
+#[test]
+fn a_stale_record_s_release_posts_nothing_over_another_session_s_reclaim() {
+    // Comment 12 is another session's claim under the same owner name.
+    let github = FakeGitHub::new(&[
+        (
+            10,
+            "2026-11-16T18:00:00Z",
+            "repair-claim: lane-a until 2026-11-16T18:30:00Z",
+        ),
+        (12, "2026-11-16T18:31:00Z", MINE),
+    ]);
+    let record = mine(462, 10).records.remove(0);
+    let (out, posted) = release_with(&github, &record);
+    assert!(posted.is_empty(), "posted {posted:?}");
+    assert!(out.contains("posted nothing"), "{out}");
+}
+
+#[test]
+fn a_record_exempts_only_its_own_owner_s_line_in_a_shared_comment() {
+    // One comment carries two owners' claim lines; lane-a's record names it.
+    let github = FakeGitHub::new(&[(
+        10,
+        "2026-11-16T18:00:00Z",
+        "repair-claim: lane-a until 2026-11-16T22:00:00Z\nrepair-claim: lane-b until 2026-11-16T22:00:00Z",
+    )]);
+    let text = refused(&push(&github, &mine(462, 10), "fix").fence).to_owned();
+    assert!(text.contains("by lane-b"), "{text}");
+}
+
+#[test]
+fn until_reads_a_time_or_a_duration_and_stays_within_a_day() {
+    let now = at(18, 36);
+    assert_eq!(parse_until("2h", now), Ok(at(20, 36)));
+    assert_eq!(parse_until("90m", now), Ok(at(20, 6)));
+    assert_eq!(parse_until("1h30m", now), Ok(at(20, 6)));
+    assert_eq!(parse_until("2026-11-16T22:00Z", now), Ok(at(22, 0)));
+    for bad in ["m", "h", "", "soon", "2026-11-16T18:00Z", "25h", "-5m"] {
+        assert!(parse_until(bad, now).is_err(), "{bad}");
+    }
+    assert_eq!(claim_time(at(22, 0)), "2026-11-16T22:00:00Z");
 }

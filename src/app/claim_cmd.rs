@@ -1,6 +1,7 @@
 //! `shipyard claim`: the push claim fence (`check-push`, called by a git
-//! pre-push hook) and its explicit release-and-take path (`take`). The
-//! decision lives in [`crate::claim_fence`]; this module only does the I/O.
+//! pre-push hook), a session's own claim (`post`, `release`), and the explicit
+//! take of another's (`take`). The decision lives in [`crate::claim_fence`];
+//! this module only does the I/O.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -13,7 +14,8 @@ use chrono::Utc;
 use super::CliFailure;
 use super::cli::ClaimCommand;
 use crate::claim_fence::{
-    DONE_ENV, Fence, FenceEnv, FenceIo, already_checked, check_push, pushed_branches, take,
+    ClaimRecord, DONE_ENV, Fence, FenceEnv, FenceIo, RECORD_KEY_PATTERN, already_checked,
+    check_push, parse_until, post, pushed_branches, release, take,
 };
 
 /// `ghread`'s answer for a repository it does not serve (`danielraffel/*`).
@@ -51,28 +53,27 @@ pub(super) fn claim_command<W: Write>(
                 return Ok(ExitCode::SUCCESS);
             }
             match github_target(&url) {
-                Ok(repo) => Ok(report(&run_fence(&repo, &branches, None))),
+                Ok(repo) => Ok(report(&run_fence(cwd, &repo, &branches, None))),
                 Err(note) => {
                     eprintln!("{note}");
                     Ok(ExitCode::SUCCESS)
                 }
             }
         }
+        ClaimCommand::Post {
+            pr,
+            repo,
+            owner,
+            until,
+        } => post_command(cwd, stdout, pr, repo, &owner, &until),
+        ClaimCommand::Release { pr, repo } => release_command(cwd, stdout, pr, repo),
         ClaimCommand::Take {
             from,
             reason,
             pr,
             repo,
         } => {
-            let repo = match repo {
-                Some(repo) => repo,
-                None => super::ship_cmd::git_repo_slug(cwd).ok_or_else(|| {
-                    CliFailure::new(
-                        2,
-                        "origin is not a GitHub repository; pass --repo OWNER/REPO",
-                    )
-                })?,
-            };
+            let repo = repo_or_origin(cwd, repo)?;
             let read = |repo: &str, args: &[String], timeout: Duration| {
                 fleet_gh(repo, args, None, timeout)
             };
@@ -100,6 +101,95 @@ pub(super) fn claim_command<W: Write>(
     }
 }
 
+/// `shipyard claim post`: post this session's claim, then record that exact
+/// comment in this worktree's own config.
+fn post_command<W: Write>(
+    cwd: &Path,
+    stdout: &mut W,
+    pr: u64,
+    repo: Option<String>,
+    owner: &str,
+    until: &str,
+) -> Result<ExitCode, CliFailure> {
+    let repo = repo_or_origin(cwd, repo)?;
+    let now = Utc::now();
+    let until = parse_until(until, now)
+        .map_err(|error| CliFailure::new(2, format!("claim post refused: {error}")))?;
+    let read = |repo: &str, args: &[String], timeout: Duration| fleet_gh(repo, args, None, timeout);
+    let started = Instant::now();
+    let elapsed = || started.elapsed();
+    let io = FenceIo {
+        read: &read,
+        sleep: &std::thread::sleep,
+        elapsed: &elapsed,
+        now,
+    };
+    let write = |repo: &str, args: &[String]| {
+        run_tool("ghapp", repo, args, true, WRITE_TIMEOUT).map_err(|error| error.text)
+    };
+    let (record, posted) = post(&io, &write, &repo, pr, owner, until)
+        .map_err(|error| CliFailure::new(1, format!("claim post refused: {}", error.0)))?;
+    write_record(cwd, &record).map_err(|error| {
+        CliFailure::new(
+            1,
+            format!(
+                "{posted}\nclaim post: the claim is posted but this worktree could not \
+                 record it ({error}), so the fence will not count it as yours; post \
+                 `repair-claim-released: {owner}` on {repo}#{pr} and try again"
+            ),
+        )
+    })?;
+    writeln!(
+        stdout,
+        "{posted}\nrecorded in this worktree: {} = {}",
+        ClaimRecord::key(&repo, pr),
+        record.value()
+    )
+    .map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `shipyard claim release`: release the claim this worktree recorded.
+fn release_command<W: Write>(
+    cwd: &Path,
+    stdout: &mut W,
+    pr: u64,
+    repo: Option<String>,
+) -> Result<ExitCode, CliFailure> {
+    let repo = repo_or_origin(cwd, repo)?;
+    let record = read_records(cwd)
+        .into_iter()
+        .find(|record| record.repo == repo.to_ascii_lowercase() && record.pr == pr)
+        .ok_or_else(|| {
+            CliFailure::new(
+                1,
+                format!("claim release refused: this worktree has no claim record for {repo}#{pr}"),
+            )
+        })?;
+    let read = |repo: &str, args: &[String], timeout: Duration| fleet_gh(repo, args, None, timeout);
+    let started = Instant::now();
+    let elapsed = || started.elapsed();
+    let io = FenceIo {
+        read: &read,
+        sleep: &std::thread::sleep,
+        elapsed: &elapsed,
+        now: Utc::now(),
+    };
+    let write = |repo: &str, args: &[String]| {
+        run_tool("ghapp", repo, args, true, WRITE_TIMEOUT).map_err(|error| error.text)
+    };
+    let posted = release(&io, &write, &repo, &record)
+        .map_err(|error| CliFailure::new(1, format!("claim release refused: {}", error.0)))?;
+    remove_record(cwd, &repo, pr).map_err(|error| {
+        CliFailure::new(
+            1,
+            format!("{posted}\nclaim release: the record could not be removed: {error}"),
+        )
+    })?;
+    writeln!(stdout, "{posted}").map_err(|error| CliFailure::new(1, error.to_string()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The fence before `shipyard pr`/ship pushes `branch`: a refusal is a
 /// failure; anything else is reported on stderr and the push goes ahead.
 /// `gh_override` is the command's own `--gh-command`, when given. Returns the
@@ -116,7 +206,7 @@ pub(super) fn fence_before_push(
     let Some(repo) = super::ship_cmd::git_repo_slug(cwd) else {
         return Ok(Vec::new());
     };
-    match run_fence(&repo, &[branch.to_owned()], gh_override) {
+    match run_fence(cwd, &repo, &[branch.to_owned()], gh_override) {
         Fence::Refuse(text) => Err(CliFailure::new(1, text)),
         other => {
             if let Some(message) = other.message() {
@@ -156,10 +246,14 @@ fn head_sha(cwd: &Path) -> Option<String> {
     (output.status.success() && sha.len() == 40).then_some(sha)
 }
 
-fn run_fence(repo: &str, branches: &[String], gh_override: Option<&Path>) -> Fence {
+fn run_fence(cwd: &Path, repo: &str, branches: &[String], gh_override: Option<&Path>) -> Fence {
     if branches.is_empty() {
         return Fence::Allow;
     }
+    let env = FenceEnv {
+        records: read_records(cwd),
+        ..fence_env()
+    };
     let read =
         |repo: &str, args: &[String], timeout: Duration| fleet_gh(repo, args, gh_override, timeout);
     let started = Instant::now();
@@ -170,11 +264,164 @@ fn run_fence(repo: &str, branches: &[String], gh_override: Option<&Path>) -> Fen
         elapsed: &elapsed,
         now: Utc::now(),
     };
-    let outcome = check_push(&io, &fence_env(), repo, branches);
+    let outcome = check_push(&io, &env, repo, branches);
     for note in &outcome.notes {
         eprintln!("{note}");
     }
     outcome.fence
+}
+
+fn repo_or_origin(cwd: &Path, repo: Option<String>) -> Result<String, CliFailure> {
+    match repo {
+        Some(repo) => Ok(repo),
+        None => super::ship_cmd::git_repo_slug(cwd).ok_or_else(|| {
+            CliFailure::new(
+                2,
+                "origin is not a GitHub repository; pass --repo OWNER/REPO",
+            )
+        }),
+    }
+}
+
+/// `git` in `cwd`, finding its repository from `cwd` alone: a hook exports
+/// `GIT_DIR`, and a `-c` from the caller must not reach the config read.
+fn git_here(cwd: &Path) -> Command {
+    let mut command =
+        crate::config::clear_repository_selecting_env(crate::supervised::git_supervised());
+    command.current_dir(cwd);
+    command
+}
+
+/// The claim records in this worktree's own config (`config.worktree`).
+/// A record anywhere else (the clone's shared `.git/config`, a global or a
+/// `-c`) is not this worktree's and does not count: git reads
+/// `config.worktree` only with `extensions.worktreeConfig`, and
+/// `--show-scope` says which file each entry came from.
+fn read_records(cwd: &Path) -> Vec<ClaimRecord> {
+    let Ok(output) = git_here(cwd)
+        .args(["config", "--show-scope", "--get-regexp", RECORD_KEY_PATTERN])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree\t"))
+        .filter_map(ClaimRecord::parse)
+        .collect()
+}
+
+fn git_ok(command: &mut Command) -> Result<String, String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("git could not run: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+/// Write `record` to this worktree's own config, turning on
+/// `extensions.worktreeConfig` first if it is off: without it `--worktree`
+/// writes the clone's shared config, which every worktree reads.
+///
+/// With the extension on, git stops reading `core.bare` and `core.worktree`
+/// from the shared config as the main worktree's own, so a bare clone's linked
+/// worktrees would stop working and a shared `core.worktree` would move every
+/// worktree's top level. Like git's own `worktree add`, this first moves them
+/// to the main worktree's `config.worktree`.
+fn write_record(cwd: &Path, record: &ClaimRecord) -> Result<(), String> {
+    let enabled =
+        git_ok(git_here(cwd).args(["config", "--type=bool", "extensions.worktreeConfig"]))
+            .is_ok_and(|value| value == "true");
+    if !enabled {
+        enable_worktree_config(cwd)?;
+    }
+    git_ok(git_here(cwd).args([
+        "config",
+        "--worktree",
+        &ClaimRecord::key(&record.repo, record.pr),
+        &record.value(),
+    ]))
+    .map(drop)
+}
+
+/// Turn on `extensions.worktreeConfig`, moving a shared `core.bare=true` and
+/// `core.worktree` to the main worktree's `config.worktree` first.
+fn enable_worktree_config(cwd: &Path) -> Result<(), String> {
+    let common =
+        git_ok(git_here(cwd).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]))?;
+    // Every `--file` edit runs from the common git dir: run from a linked
+    // worktree, git would resolve a relative `core.worktree` against that
+    // worktree once the extension is on, and die before the edit.
+    let common_dir = Path::new(&common);
+    let shared = Path::new(&common).join("config");
+    let main_worktree = Path::new(&common).join("config.worktree");
+    let shared_arg = shared.to_string_lossy().into_owned();
+    let main_arg = main_worktree.to_string_lossy().into_owned();
+    let read = |args: &[&str]| -> Option<String> {
+        git_ok(
+            git_here(common_dir)
+                .args(["config", "--file", &shared_arg])
+                .args(args),
+        )
+        .ok()
+        .filter(|value| !value.is_empty())
+    };
+    let bare = read(&["--type=bool", "core.bare"]).is_some_and(|value| value == "true");
+    let worktree = read(&["core.worktree"]);
+    if bare {
+        git_ok(git_here(common_dir).args(["config", "--file", &main_arg, "core.bare", "true"]))?;
+    }
+    if let Some(worktree) = &worktree {
+        git_ok(git_here(common_dir).args([
+            "config",
+            "--file",
+            &main_arg,
+            "core.worktree",
+            worktree,
+        ]))?;
+    }
+    git_ok(git_here(common_dir).args([
+        "config",
+        "--file",
+        &shared_arg,
+        "extensions.worktreeConfig",
+        "true",
+    ]))?;
+    if bare {
+        git_ok(git_here(common_dir).args([
+            "config",
+            "--file",
+            &shared_arg,
+            "--unset",
+            "core.bare",
+        ]))?;
+    }
+    if worktree.is_some() {
+        git_ok(git_here(common_dir).args([
+            "config",
+            "--file",
+            &shared_arg,
+            "--unset",
+            "core.worktree",
+        ]))?;
+    }
+    Ok(())
+}
+
+fn remove_record(cwd: &Path, repo: &str, pr: u64) -> Result<(), String> {
+    git_ok(git_here(cwd).args([
+        "config",
+        "--worktree",
+        "--unset",
+        &ClaimRecord::key(repo, pr),
+    ]))
+    .map(drop)
 }
 
 /// The `OWNER/REPO` a remote URL names, or the note to print when it names

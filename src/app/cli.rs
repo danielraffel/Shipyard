@@ -3672,6 +3672,35 @@ pub(super) enum ClaimCommand {
         #[arg(long = "branch", value_name = "BRANCH")]
         branches: Vec<String>,
     },
+    /// Claim a pull request for this session: post `repair-claim: <owner> until
+    /// <time>` as the App, then record that exact comment in this worktree's
+    /// own git config. The fence counts that one claim as yours in this
+    /// worktree; no environment variable is needed.
+    Post {
+        /// The pull request.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+        /// The claim's owner id: `name` or `name/tag` (letters, digits, ._-).
+        #[arg(long)]
+        owner: String,
+        /// When the claim ends: a UTC time (`2026-11-27T22:00Z`) or a duration
+        /// from now (`90m`, `2h`, `1h30m`), at most 24h.
+        #[arg(long)]
+        until: String,
+    },
+    /// Release the claim this worktree posted: post `repair-claim-released:
+    /// <owner>` and remove the worktree's record.
+    Release {
+        /// The pull request.
+        #[arg(long)]
+        pr: u64,
+        /// Exact OWNER/REPO. Defaults to the `origin` remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
     /// Take another owner's live claim: post `repair-claim-taken: <you> from
     /// <owner> reason=...` as `$SHIPYARD_CLAIM_OWNER`.
     Take {
