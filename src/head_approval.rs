@@ -2811,6 +2811,17 @@ pub fn evaluate_excusing_with_policy(
     )?;
     verdict_records_checked(&reviews, &comments, policy)
         .map_err(|error| format!("PR #{pr}'s verdicts are unreadable: {error}"))?;
+    // An approval counts only for the base it was given against.
+    let (reviews, comments, voided) = base_change::void_approvals(
+        run_gh,
+        repo,
+        pr,
+        head,
+        reviews,
+        comments,
+        policy,
+        author.as_deref(),
+    )?;
     let gate = decide_for_author(
         policy,
         head,
@@ -2831,7 +2842,18 @@ pub fn evaluate_excusing_with_policy(
     };
     let gate = with_carry(run_gh, &input, gate);
     let gate = with_rollup(run_gh, &input, gate);
+    let allowed_by_comments = gate.allows();
     let gate = edit_checked(run_gh, head, &comments, gate)?;
+    let edited_away = allowed_by_comments && !gate.allows();
+    let gate = match (gate, voided) {
+        (HeadGate::NotApproved { head }, Some(change))
+            if !edited_away
+                && head_hold(&head, &reviews, &comments, policy, author.as_deref()).is_none() =>
+        {
+            HeadGate::BaseChanged { head, change }
+        }
+        (gate, _) => gate,
+    };
     trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate)
 }
 

@@ -1,9 +1,6 @@
 use serde_json::{Value, json};
 
-use super::{
-    BASE_CHANGE_QUERY, MERGED_PARENT_QUERY, ancestor_status, base_changes, floor_change,
-    merged_parent_head, without_approvals_through,
-};
+use super::{BASE_CHANGE_QUERY, base_changes, without_approvals_through};
 use crate::head_approval::{ApprovalBlocker, HeadGate};
 
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -40,16 +37,8 @@ fn the_shared_cases_judge_as_written() {
             continue;
         }
         let changes = changes.unwrap_or_else(|error| panic!("{name}: {error}"));
-        // The merged-parent reads, answered from the case.
-        let safe = |change: &super::BaseChange| {
-            let Some(parent) = case.pointer(&format!("/parents/{}", change.from)) else {
-                return false;
-            };
-            merged_parent_head(&parent["answer"], change).is_some()
-                && parent["compare"].as_str().is_some_and(ancestor_status)
-        };
-        let kept = match floor_change(&changes, safe) {
-            Some(change) => without_approvals_through(records, &change).0,
+        let kept = match changes.last() {
+            Some(change) => without_approvals_through(records, change).0,
             None => records,
         };
         let kept: Vec<u64> = kept.iter().filter_map(|r| r["id"].as_u64()).collect();
@@ -60,20 +49,6 @@ fn the_shared_cases_judge_as_written() {
             .filter_map(Value::as_u64)
             .collect();
         assert_eq!(kept, want, "{name}");
-    }
-}
-
-#[test]
-fn the_parent_read_asks_for_merged_pull_requests_by_branch() {
-    for part in [
-        "headRefName:$head",
-        "baseRefName:$base",
-        "states:[MERGED]",
-        "totalCount",
-        "headRefOid",
-        "mergedAt",
-    ] {
-        assert!(MERGED_PARENT_QUERY.contains(part), "{part}");
     }
 }
 
@@ -136,6 +111,8 @@ fn gh<'a>(
                 .join("\n"))
         } else if joined.contains(".commit.committer.date") {
             Ok("2026-11-20T09:00:00Z\n".to_owned())
+        } else if joined.contains("pulls/7 --jq .user.login") {
+            Ok("someone\n".to_owned())
         } else {
             Err(format!("unexpected gh call: {joined}"))
         }
@@ -289,104 +266,79 @@ fn a_self_approval_after_the_retarget_does_not_revive_it() {
     assert!(!gate.allows(), "{gate:?}");
 }
 
-fn auto_retarget(at: &str) -> Value {
-    json!([{"__typename": "AutomaticBaseChangeSucceededEvent", "createdAt": at,
-            "oldBase": "parent", "newBase": "main"}])
-}
-
-/// The stacked child after GitHub retargeted it once its parent merged, with
-/// `compare` as the `parent...child` status.
-fn judge_auto(compare: Result<&str, &str>, parent: &Value) -> Judged {
+/// GitHub's own retarget after the parent merged voids too: the parent's
+/// branch may have moved backwards after the approval, so nothing GitHub
+/// records proves the approved diff is the diff that lands.
+#[test]
+fn an_automatic_retarget_after_the_approval_voids_it() {
     let reads = std::cell::Cell::new(0);
     let comments = [approve(7, "2026-11-20T10:00:00Z", "reviewer")];
-    let inner = gh(
-        &comments,
-        Ok(timeline(&auto_retarget("2026-11-20T11:00:00Z"))),
-        &reads,
+    let auto = json!([{"__typename": "AutomaticBaseChangeSucceededEvent",
+                       "createdAt": "2026-11-20T11:00:00Z",
+                       "oldBase": "parent", "newBase": "main"}]);
+    let (gate, blocker) = judge(&comments, Ok(timeline(&auto)), &reads).expect("readable");
+    assert!(matches!(gate, HeadGate::BaseChanged { .. }), "{gate:?}");
+    assert_eq!(
+        blocker.map(|blocker| blocker.token()),
+        Some("approval_void:base_changed".to_owned())
     );
-    let parent_head = "b".repeat(40);
-    let gh = |args: &[String]| {
-        let joined = args.join(" ");
-        if joined.contains("pullRequests(headRefName") {
-            assert!(
-                joined.contains("head=parent") && joined.contains("base=main"),
-                "{joined}"
-            );
-            return Ok(parent.to_string());
-        }
-        if joined.contains("/compare/") {
-            assert!(
-                joined.contains(&format!("compare/{parent_head}...{HEAD}")),
-                "{joined}"
-            );
-            return compare
-                .map(|status| format!("{status}\n"))
-                .map_err(str::to_owned);
-        }
-        inner(args)
-    };
-    crate::head_approval::with_host_sessions(None, || {
-        let policy =
-            crate::head_approval::read_policy_repository_side(&gh, "Generous-Corp/pulp", "main")?;
-        crate::head_approval::evaluate_with_policy_for_author_with_diagnosis(
-            &gh,
-            "Generous-Corp/pulp",
-            7,
-            HEAD,
-            &policy,
-            &crate::head_approval::tests::empty_queue(HEAD),
-            Some("someone"),
-        )
-        .map(|(gate, _, blocker)| (gate, blocker))
-    })
 }
 
-fn merged_parent(merged_at: &[&str]) -> Value {
-    let nodes: Vec<Value> = merged_at
-        .iter()
-        .enumerate()
-        .map(|(index, at)| {
-            json!({"number": 40 + index, "mergedAt": at,
-                                  "headRefOid": "b".repeat(40)})
+/// Only a voided APPROVE of this head is reported as void: a dropped
+/// approval of an earlier head leaves the normal refusal.
+#[test]
+fn a_voided_approval_of_another_head_reports_the_normal_refusal() {
+    let reads = std::cell::Cell::new(0);
+    let mut earlier = approve(7, "2026-11-20T10:00:00Z", "reviewer");
+    earlier["body"] = json!(format!(
+        "reviewer: pulp-review\n<!-- session: Daniels-Mac-Studio-m3/r1 agent: reviewer -->\n\
+         verdict: APPROVE head:{}",
+        "c".repeat(40)
+    ));
+    let (gate, blocker) = judge(
+        &[earlier],
+        Ok(timeline(&retarget("2026-11-20T11:00:00Z"))),
+        &reads,
+    )
+    .expect("readable");
+    assert!(matches!(gate, HeadGate::NotApproved { .. }), "{gate:?}");
+    assert_ne!(
+        blocker.map(|blocker| blocker.token()),
+        Some("approval_void:base_changed".to_owned())
+    );
+}
+
+/// The second Rust reader (`evaluate_excusing_with_policy`: the steward's
+/// native-arm backstop, `shipyard ship`'s arm, base health) applies the
+/// rule too: an APPROVE at 10:00 and a manual retarget at 11:00.
+#[test]
+fn the_excusing_reader_voids_an_approval_before_a_retarget() {
+    let reads = std::cell::Cell::new(0);
+    let comments = [approve(7, "2026-11-20T10:00:00Z", "reviewer")];
+    let judge = |answer: Value| {
+        let gh = gh(&comments, Ok(answer), &reads);
+        crate::head_approval::with_host_sessions(None, || {
+            let policy = crate::head_approval::read_policy_repository_side(
+                &gh,
+                "Generous-Corp/pulp",
+                "main",
+            )
+            .expect("policy");
+            crate::head_approval::evaluate_excusing_with_policy(
+                &gh,
+                "Generous-Corp/pulp",
+                7,
+                HEAD,
+                &policy,
+                &crate::head_approval::tests::empty_queue(HEAD),
+                false,
+            )
+            .expect("readable")
         })
-        .collect();
-    json!({"data": {"repository": {"pullRequests": {"totalCount": nodes.len(), "nodes": nodes}}}})
-}
-
-/// GitHub's own retarget after the parent merged, with the parent's final
-/// head an ancestor of the child's head: the approval keeps counting.
-#[test]
-fn an_auto_retarget_onto_a_merged_ancestor_parent_keeps_the_approval() {
-    let parent = merged_parent(&["2026-11-20T10:59:58Z"]);
-    let (gate, blocker) = judge_auto(Ok("ahead"), &parent).expect("readable");
-    assert!(gate.allows(), "{gate:?}");
-    assert_eq!(blocker, None);
-    let (gate, _) = judge_auto(Ok("identical"), &parent).expect("readable");
-    assert!(gate.allows(), "{gate:?}");
-}
-
-/// Not an ancestor, an unreadable compare or parent, or several candidate
-/// parents: the approval is void, as for a manual retarget.
-#[test]
-fn an_auto_retarget_that_is_not_provably_safe_voids() {
-    let one = merged_parent(&["2026-11-20T10:59:58Z"]);
-    let several = merged_parent(&["2026-11-19T10:00:00Z", "2026-11-20T10:59:58Z"]);
-    let unreadable = json!({"errors": [{"message": "rate limited"}], "data": null});
-    for (compare, parent) in [
-        (Ok("diverged"), &one),
-        (Ok("behind"), &one),
-        (Err("gh: HTTP 502"), &one),
-        (Ok("ahead"), &several),
-        (Ok("ahead"), &unreadable),
-    ] {
-        let (gate, blocker) = judge_auto(compare, parent).expect("readable");
-        assert!(
-            matches!(gate, HeadGate::BaseChanged { .. }),
-            "{compare:?} {parent}: {gate:?}"
-        );
-        assert_eq!(
-            blocker.map(|blocker| blocker.token()),
-            Some("approval_void:base_changed".to_owned())
-        );
-    }
+    };
+    let control = judge(timeline(&json!([])));
+    assert!(control.allows(), "control: {control:?}");
+    let gate = judge(timeline(&retarget("2026-11-20T11:00:00Z")));
+    assert!(matches!(gate, HeadGate::BaseChanged { .. }), "{gate:?}");
+    assert_eq!(reads.get(), 2);
 }

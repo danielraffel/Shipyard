@@ -484,6 +484,10 @@ fn jsonl(records: &[serde_json::Value]) -> String {
 /// how many arm mutations were sent.
 fn ship_9438_head(head: &str, comments: &[serde_json::Value]) -> (ArmOutcome, usize) {
     let gh = FakeGh::new(vec![
+        (
+            "BASE_REF_CHANGED_EVENT",
+            Ok(crate::head_approval::base_change::NO_BASE_CHANGES.to_owned()),
+        ),
         ("pr view", Ok(pr_view("PR_9438", false))),
         ("isInMergeQueue", Ok(pr_9438_queue(head).to_string())),
         (

@@ -123,6 +123,8 @@ class Hub:
     def __init__(self, scratch: Scratch) -> None:
         self.scratch = scratch
         self.pulls: list[dict[str, Any]] = []
+        # When a pull request was retargeted by hand, by number.
+        self.retargeted: dict[int, str] = {}
 
     def pull(self, number: int, branch: str, head: str, head_repo: str = REPO) -> None:
         self.pulls.append({"number": number, "state": "open", "draft": False, "head": {
@@ -134,9 +136,14 @@ class Hub:
 
     def __call__(self, args: list[str]) -> Any:
         if any("BASE_REF_CHANGED_EVENT" in arg for arg in args):
-            # The member's base-change timeline: never retargeted.
+            # The member's base-change timeline.
+            number = int(next(arg for arg in args if arg.startswith("number="))[7:])
+            nodes = ([{"__typename": "BaseRefChangedEvent", "createdAt": self.retargeted[number],
+                       "previousRefName": "parent", "currentRefName": "main"}]
+                     if number in self.retargeted else [])
             return {"data": {"repository": {"pullRequest": {"baseRefName": "main", "timelineItems": {
-                "filteredCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}}}}}
+                "filteredCount": len(nodes), "pageInfo": {"hasNextPage": False},
+                "nodes": nodes}}}}}
         if "graphql" in args:
             query = next(arg for arg in args if arg.startswith("query="))
             expressions = [json.loads(match) for match in
@@ -262,6 +269,26 @@ class RollupAcceptance(unittest.TestCase):
             self.assertIsNone(guard.member_review(REPO, 11, heads[0], policy, True))
             comment["body"] = f"verdict: HOLD head:{heads[0]}"
             self.assertIsNotNone(guard.member_review(REPO, 11, heads[0], policy, True))
+
+    def test_a_member_retargeted_after_its_approval_is_refused(self) -> None:
+        hub, heads, _ = self.rollup(["a.txt"])
+        comment = {"id": 5, "user": {"login": "shipyard-review[bot]", "type": "Bot"},
+                   "author_association": "NONE", "created_at": "2026-10-04T00:00:00Z",
+                   "updated_at": "2026-10-04T00:00:00Z", "node_id": "IC_5",
+                   "body": f"verdict: APPROVE head:{heads[0]}"}
+        policy = guard.review_policy('[auto_merge]\narm_requires_head_approval = true\n'
+                                     'reviewer_identities = ["shipyard-review[bot]"]\n',
+                                     REPO, False)
+        pages = {f"repos/{REPO}/issues/11/comments?per_page=100": [comment],
+                 f"repos/{REPO}/pulls/11/reviews?per_page=100": []}
+        with mock.patch.object(guard, "run_real_gh", side_effect=hub), \
+                mock.patch.object(guard, "_rest_pages", side_effect=pages.__getitem__), \
+                mock.patch.object(guard, "comment_last_edited", return_value=None):
+            self.assertIsNone(guard.member_review(REPO, 11, heads[0], policy, True))  # control
+            hub.retargeted[11] = "2026-10-04T01:00:00Z"
+            refusal = guard.member_review(REPO, 11, heads[0], policy, True)
+            self.assertIsNotNone(refusal)
+            self.assertIn("member #11", refusal)
 
     def test_a_merge_that_carries_another_members_change_is_refused(self) -> None:
         # Merge 1 already brings both changes and merge 2 changes nothing: the

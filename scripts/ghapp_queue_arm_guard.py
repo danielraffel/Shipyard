@@ -3719,15 +3719,6 @@ BASE_CHANGE_QUERY = (
 )
 
 
-# The merged parent read for an automatic base change. Kept byte-equal to
-# MERGED_PARENT_QUERY in src/head_approval/base_change.rs.
-MERGED_PARENT_QUERY = (
-    "query($owner:String!,$name:String!,$head:String!,$base:String!){repository(owner:$owner,"
-    "name:$name){pullRequests(headRefName:$head,baseRefName:$base,states:[MERGED],first:20)"
-    "{totalCount nodes{number mergedAt headRefOid}}}}"
-)
-
-
 def _aware(value: Any) -> datetime | None:
     """A timestamp with a UTC offset, else ``None``."""
     when = _timestamp(value)
@@ -3796,68 +3787,6 @@ def read_base_changes(repo: str, number: int) -> list[dict[str, Any]]:
                                 {"owner": owner, "name": name, "number": str(number)}))
 
 
-def merged_parent_head(answer: Any, change: dict[str, Any]) -> str | None:
-    """The final head of the one pull request from ``change["from"]`` into
-    ``change["to"]`` merged at or before the change, from a
-    ``MERGED_PARENT_QUERY`` answer; ``None`` when the answer has errors, is
-    incomplete or malformed, or names none or several. Same as
-    src/head_approval/base_change.rs ``merged_parent_head``."""
-    if not isinstance(answer, dict) or answer.get("errors") is not None:
-        return None
-    data = answer.get("data")
-    repository = data.get("repository") if isinstance(data, dict) else None
-    pulls = repository.get("pullRequests") if isinstance(repository, dict) else None
-    nodes = pulls.get("nodes") if isinstance(pulls, dict) else None
-    total = pulls.get("totalCount") if isinstance(pulls, dict) else None
-    if (not isinstance(nodes, list) or not isinstance(total, int) or isinstance(total, bool)
-            or total != len(nodes)):
-        return None
-    event = _aware(change.get("at"))
-    if event is None:
-        return None
-    candidates = []
-    for node in nodes:
-        if not isinstance(node, dict):
-            return None
-        merged = _aware(node.get("mergedAt"))
-        head = node.get("headRefOid")
-        if merged is None or not is_api_sha(head):
-            return None
-        if merged <= event:
-            candidates.append(head.lower())
-    return candidates[0] if len(candidates) == 1 else None
-
-
-def ancestor_status(status: Any) -> bool:
-    """Whether a ``parent...child`` compare status proves the parent's head is
-    an ancestor of, or equal to, the child's head."""
-    return status in ("ahead", "identical")
-
-
-def floor_change(changes: list[dict[str, Any]], safe: Any) -> dict[str, Any] | None:
-    """The newest change that is not ``safe``; a manual change never is."""
-    for change in reversed(changes):
-        if not (change["automatic"] and safe(change)):
-            return change
-    return None
-
-
-def automatic_change_safe(repo: str, head: str, change: dict[str, Any]) -> bool:
-    """Whether GitHub's retarget ``change`` is provably safe for a child at
-    ``head``: its one merged parent's final head is an ancestor of ``head``.
-    Any read that fails is not safe."""
-    try:
-        owner, name = split_repo(repo)
-        parent = merged_parent_head(graphql(MERGED_PARENT_QUERY, {
-            "owner": owner, "name": name, "head": change["from"], "base": change["to"]}), change)
-        if parent is None:
-            return False
-        compare = run_real_gh(["api", f"repos/{repo}/compare/{parent}...{head}"])
-    except GuardError:
-        return False
-    return isinstance(compare, dict) and ancestor_status(compare.get("status"))
-
-
 def describe_base_change(change: dict[str, Any]) -> str:
     return (f"its base changed from {change['from']} to {change['to']} at {change['at']}"
             + (" (GitHub retargeted it after the old base merged)" if change["automatic"]
@@ -3891,26 +3820,27 @@ def without_voided_approvals(
     reviews: list[dict[str, Any]], policy: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
     """``(comments, reviews, void)``: the records without every APPROVE posted
-    at or before the pull request's newest base change that is not provably
-    safe (``floor_change``, ``automatic_change_safe``), and that change when
-    a counting APPROVE was dropped. The timeline is read only when some
+    at or before the pull request's latest base change, and that change when
+    a counting APPROVE of ``head`` was dropped. The timeline is read only when some
     APPROVE exists; ``GuardError`` when it cannot be read in full. Same as
     src/head_approval.rs ``evaluate_events_by_source``."""
     if not (any(_is_approval(c, False) for c in comments)
             or any(_is_approval(r, True) for r in reviews)):
         return comments, reviews, None
-    change = floor_change(read_base_changes(repo, number),
-                          lambda change: automatic_change_safe(repo, head, change))
-    if change is None:
+    changes = read_base_changes(repo, number)
+    if not changes:
         return comments, reviews, None
+    change = changes[-1]
     floor = _aware(change["at"])
     assert floor is not None  # base_changes refuses an unreadable time
     comments, dropped_comments = _approvals_through(comments, False, floor)
     reviews, dropped_reviews = _approvals_through(reviews, True, floor)
     # Judging what was dropped must not report its exclusions a second time.
     mark = len(EXCLUDED_APPROVALS)
-    voided = any(entry[1] == "APPROVE" for entry in counting_verdicts(
-        author, dropped_comments, dropped_reviews, policy))
+    # Only a dropped APPROVE of this head is reported as void; an earlier
+    # head's leaves the normal refusal.
+    voided = any(entry[1] == "APPROVE" and entry[2] == head.lower() for entry in
+                 counting_verdicts(author, dropped_comments, dropped_reviews, policy))
     del EXCLUDED_APPROVALS[mark:]
     return comments, reviews, (change if voided else None)
 

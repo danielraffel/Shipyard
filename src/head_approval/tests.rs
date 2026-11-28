@@ -2563,6 +2563,8 @@ fn the_arm_path_reads_the_author_before_judging() {
         calls.borrow_mut().push(joined.clone());
         if joined.contains("contents/.shipyard/config.toml") {
             Err("gh: Not Found (HTTP 404)".to_owned())
+        } else if joined.contains("BASE_REF_CHANGED_EVENT") {
+            Ok(super::base_change::NO_BASE_CHANGES.to_owned())
         } else if joined.contains("/reviews") {
             Ok(String::new())
         } else if joined.contains("/comments") {

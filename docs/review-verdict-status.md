@@ -197,17 +197,20 @@ retargeted to the default branch with the same head, that APPROVE would land
 the parent's commits. The guard reads the pull request's base changes
 (`BaseRefChangedEvent`, and `AutomaticBaseChangeSucceededEvent` for GitHub's
 own retarget after a parent merges) and leaves out every APPROVE posted at or
-before the newest change that is not provably safe. A manual retarget is never
-safe. GitHub's own retarget is safe only when exactly one pull request from
-the old base into the new base merged before it and that pull request's final
-head is an ancestor of, or equal to, the child's head (compare `ahead` or
-`identical`): then the approved diff is exactly the child's own content on top
-of what landed. Anything unreadable or ambiguous voids. If that leaves the head unapproved the status is
+before the latest one. GitHub's own retarget voids too: the parent's branch
+may have moved backwards (a force-push, or a delete and recreate) after the
+child was approved, and GitHub does not record the base tip the reviewer
+diffed against. A sound exception would need that base oid, which the verdict
+line could carry later. If that leaves the head unapproved the status is
 `pending` (cause `approval_void`, "re-review against the new base"); a new
 verdict posted after the change counts as usual. A timeline it cannot read in
 full is `failure`, never "no change". The Rust gate
 (`src/head_approval/base_change.rs`) applies the same rule, so the steward
-reports `approval_void:base_changed`.
+reports `approval_void:base_changed` when a voided APPROVE named the current
+head (otherwise the normal awaiting-review token). Guard mode
+(`approval_source = "guard"`) does not apply this rule: authorization there
+comes from the fleet admission check, which binds the head only, so the
+admission App must apply it.
 
 ## The verdict App leg
 
