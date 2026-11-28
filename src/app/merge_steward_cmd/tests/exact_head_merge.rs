@@ -191,6 +191,7 @@ case "$*" in
   *"enqueuePullRequest"*) echo "a no-queue base must never enqueue" >&2; exit 91 ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"/check-runs?"*) printf '%s' '{{"check_runs":[{check_runs}]}}' ;;
   *"/statuses?"*) printf '%s' '[{statuses}]' ;;

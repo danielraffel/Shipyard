@@ -69,6 +69,16 @@ pub enum ApprovalBlocker {
         /// Why.
         detail: String,
     },
+    /// An approval named this head but is void: it was given before the
+    /// pull request's base changed ([`super::base_change`]).
+    Void {
+        /// Stable machine token for the reason (`base_changed`).
+        reason: &'static str,
+        /// The reason in words.
+        detail: String,
+        /// When the base changed.
+        at: Option<String>,
+    },
     /// The fleet admission check refused this head.
     AdmissionRefused {
         /// The refusing check run.
@@ -80,7 +90,8 @@ pub enum ApprovalBlocker {
 
 impl ApprovalBlocker {
     /// One stable machine token: `no_verdict`, `held`,
-    /// `approval_excluded:<reason>`, or `ejection_cap`.
+    /// `approval_excluded:<reason>`, `approval_void:<reason>`, or
+    /// `ejection_cap`.
     #[must_use]
     pub fn token(&self) -> String {
         match self {
@@ -90,6 +101,7 @@ impl ApprovalBlocker {
             Self::StaleHead { .. } => "approval_excluded:stale_head".to_owned(),
             Self::EjectionCap { .. } => "ejection_cap".to_owned(),
             Self::SelfApproved { .. } => "approval_excluded:self_approved".to_owned(),
+            Self::Void { reason, .. } => format!("approval_void:{reason}"),
             Self::AdmissionMissing { .. } => "admission_missing".to_owned(),
             Self::AdmissionRefused { .. } => "admission_refused".to_owned(),
         }
@@ -102,6 +114,7 @@ impl ApprovalBlocker {
             Self::Held { at, .. }
             | Self::Excluded { at, .. }
             | Self::StaleHead { at, .. }
+            | Self::Void { at, .. }
             | Self::EjectionCap { at } => at.as_deref(),
             Self::NoVerdict
             | Self::SelfApproved { .. }
@@ -140,6 +153,15 @@ pub(super) fn diagnose(
             at: ejections.last().and_then(|ejection| ejection.at.clone()),
         }),
         HeadGate::NotApproved { .. } => Some(not_approved(records, policy, author)),
+        HeadGate::BaseChanged { change, .. } => Some(ApprovalBlocker::Void {
+            reason: super::base_change::BASE_CHANGED,
+            detail: format!(
+                "every approval of this head predates the latest base change: {}; \
+                 re-review against the new base",
+                change.describe()
+            ),
+            at: Some(change.at.clone()),
+        }),
         HeadGate::NotAdmitted { detail, .. } | HeadGate::UntrustedSignal { detail, .. } => {
             Some(ApprovalBlocker::AdmissionMissing {
                 detail: detail.clone(),

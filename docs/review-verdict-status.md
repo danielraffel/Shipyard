@@ -191,6 +191,28 @@ re-runs the job when a pull request is retargeted. `queue-arm-guard` reads the
 policy from the default branch too; `shipyard review-verdict` refuses another
 base the same way.
 
+An approval also counts only for the base it was given against. A child
+stacked on a parent's branch is approved for its diff against that parent;
+retargeted to the default branch with the same head, that APPROVE would land
+the parent's commits. The guard reads the pull request's base changes
+(`BaseRefChangedEvent`, and `AutomaticBaseChangeSucceededEvent` for GitHub's
+own retarget after a parent merges) and leaves out every APPROVE posted at or
+before the latest one. GitHub's own retarget voids too: the parent's branch
+may have moved backwards (a force-push, or a delete and recreate) after the
+child was approved, and GitHub does not record the base tip the reviewer
+diffed against. A sound exception would need that base oid, which the verdict
+line could carry later. If that leaves the head unapproved the status is
+`pending` (cause `approval_void`, "re-review against the new base"); a new
+verdict posted after the change counts as usual. A timeline it cannot read in
+full is `failure`, never "no change". So is a timeline whose current base is not the base the guard
+checked: the pull request was retargeted while the guard read it. The Rust gate
+(`src/head_approval/base_change.rs`) applies the same rule, so the steward
+reports `approval_void:base_changed` when a voided APPROVE named the current
+head (otherwise the normal awaiting-review token). Guard mode
+(`approval_source = "guard"`) does not apply this rule: authorization there
+comes from the fleet admission check, which binds the head only, so the
+admission App must apply it.
+
 ## The verdict App leg
 
 When `REVIEW_VERDICT_APP_ID` is set, the job posts the same status twice:

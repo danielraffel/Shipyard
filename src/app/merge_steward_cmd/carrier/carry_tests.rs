@@ -347,6 +347,7 @@ fn gh_body(scenario: &Scenario, bare: &Path, head: &str, state: &Path) -> String
         r#"
 export GIT_AUTHOR_NAME=GitHub GIT_AUTHOR_EMAIL=noreply@github.com GIT_COMMITTER_NAME=GitHub GIT_COMMITTER_EMAIL=noreply@github.com
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["{REVIEWER}"]' ;;
   *disablePullRequestAutoMerge*)
     {disarm} ;;

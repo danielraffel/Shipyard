@@ -541,6 +541,15 @@ fn reviewers_move(kind: &str, facts: &Facts<'_>) -> Option<NextAction> {
                  head and comment `dispute: <reason>`. Waiting does not help."
             ),
         ),
+        "approval_void" => NextAction::new(
+            Actor::Reviewer,
+            format!(
+                "Re-review against the new base: the APPROVE of this head is void \
+                 ({arg}{detail_suffix}). It was given before the pull request's base changed, \
+                 and an approval counts only for the base it was given against. The reviewer \
+                 posts a new APPROVE or HOLD naming this head; nothing for the author to do."
+            ),
+        ),
         "approval_excluded" => NextAction::new(
             Actor::Reviewer,
             format!(
@@ -818,6 +827,27 @@ mod tests {
             },
             &stall(token, detail),
         )
+    }
+
+    #[test]
+    fn a_void_approval_asks_the_reviewer_to_re_review_against_the_new_base() {
+        let next = next(
+            "approval_void:base_changed",
+            Some("its base changed from parent to main at 2026-11-20T11:00:00Z"),
+            true,
+            "CLEAN",
+        );
+        assert_eq!(next.actor, Actor::Reviewer);
+        assert!(
+            next.action.starts_with("Re-review against the new base"),
+            "{}",
+            next.action
+        );
+        assert!(
+            next.action.contains("from parent to main"),
+            "{}",
+            next.action
+        );
     }
 
     #[test]

@@ -128,6 +128,7 @@ case "$*" in
   "pr view "*) printf '%s' '__PR_VIEW__' ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '__COMMENTS__' ;;
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{"data":{"repository":{"pullRequest":{"baseRefName":"main","timelineItems":{"filteredCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}'; exit 0 ;;
   *"lastEditedAt"*) printf '%s' '{"data":{"node":{"lastEditedAt":null}}}' ;;
   *"commits/__HEAD__"*) printf '%s' '2026-10-31T00:00:00Z' ;;
   *"repos/owner/repo/pulls/42") printf '%s' '{"base":{"ref":"main"}}' ;;

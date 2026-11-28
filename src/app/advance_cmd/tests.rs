@@ -107,6 +107,12 @@ impl Fake {
             };
             return Ok(pr_json(&head, &self.labels));
         }
+        if args
+            .iter()
+            .any(|arg| arg.contains("BASE_REF_CHANGED_EVENT"))
+        {
+            return Ok(crate::head_approval::base_change::NO_BASE_CHANGES.to_owned());
+        }
         if args.iter().any(|arg| arg.contains("lastEditedAt")) {
             return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
         }

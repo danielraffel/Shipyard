@@ -744,6 +744,7 @@ case "$*" in
   *contents/.shipyard/config.toml*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["pulp-reviewer"]' '[queue]' 'tiered_required_checks = ["macos"]' 'tier_record_app = "pulp-tier-records"' ;;
   *"--paginate"*"/reviews"*) ;;
   *"--paginate"*"/comments"*) printf '%s\n' '{approval}' ;;
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *pulls/8933*) printf '%s' '{{"number":8933,"user":{{"login":"author","type":"User"}}}}' ;;
   *isInMergeQueue*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":8933,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":true,"mergeQueueEntry":{{"state":"QUEUED","position":3}},"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;
@@ -810,6 +811,7 @@ case "$*" in
   *contents/.shipyard/config.toml*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["pulp-reviewer"]' ;;
   *"--paginate"*"/reviews"*) ;;
   *"--paginate"*"/comments"*) printf '%s\n' '{comments}' ;;
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *pulls/8933*) printf '%s' '{{"number":8933,"user":{{"login":"author","type":"User"}}}}' ;;
   *check-runs*) printf '%s' '[{{"total_count":0,"check_runs":[]}}]' ;;

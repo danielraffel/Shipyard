@@ -92,17 +92,27 @@
 //! `timelineItems(last:100)` window, so a head with more than 100 later events
 //! can be under-counted; that errs lenient, because an approval is still
 //! required.
+//!
+//! ## Base changes
+//!
+//! An approval counts only for the base it was given against
+//! ([`base_change`]). An APPROVE posted at or before the pull request's
+//! latest base change is left out of the decision, so a child retargeted from
+//! its closed parent to the default branch cannot land the parent's commits
+//! on its old approval; the steward reports `approval_void:base_changed`.
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
+pub mod base_change;
 mod blocker;
 pub mod guard;
 mod rebase;
 pub mod trusted_signal;
 
+pub use base_change::BaseChange;
 pub use blocker::ApprovalBlocker;
 pub use rebase::{
     CarryRecord, REBASE_CARRY_ENV, REBASE_CARRY_FILE, REBASE_CARRY_LOG, patch_id, rebase_carry,
@@ -2110,6 +2120,15 @@ pub enum HeadGate {
         /// Why: no run yet, a refusing run, or an unusable policy.
         detail: String,
     },
+    /// Every approval that would decide this head was posted at or before
+    /// the pull request's latest base change ([`base_change`]): it was given
+    /// against another base, so it is void.
+    BaseChanged {
+        /// The head.
+        head: String,
+        /// The latest base change.
+        change: BaseChange,
+    },
     /// A required trusted signal ([`trusted_signal`]) on this head does not
     /// come from its own workflow's successful run on this exact head.
     UntrustedSignal {
@@ -2149,6 +2168,14 @@ impl HeadGate {
                  cannot approve its own landing. Left disarmed until another agent approves \
                  it",
                 short(head)
+            ),
+            Self::BaseChanged { head, change } => format!(
+                "the approval of head {} is void (approval_void:base_changed): {} after it \
+                 was approved, and an approval counts only for the base it was given \
+                 against. Re-review against the new base: a reviewer posts a new verdict \
+                 naming this head",
+                short(head),
+                change.describe()
             ),
             Self::UntrustedSignal { head, detail } => format!(
                 "head {} is not admitted: {detail}. This repository requires that signal from \
@@ -2784,6 +2811,17 @@ pub fn evaluate_excusing_with_policy(
     )?;
     verdict_records_checked(&reviews, &comments, policy)
         .map_err(|error| format!("PR #{pr}'s verdicts are unreadable: {error}"))?;
+    // An approval counts only for the base it was given against.
+    let (reviews, comments, voided) = base_change::void_approvals(
+        run_gh,
+        repo,
+        pr,
+        head,
+        reviews,
+        comments,
+        policy,
+        author.as_deref(),
+    )?;
     let gate = decide_for_author(
         policy,
         head,
@@ -2804,7 +2842,18 @@ pub fn evaluate_excusing_with_policy(
     };
     let gate = with_carry(run_gh, &input, gate);
     let gate = with_rollup(run_gh, &input, gate);
+    let allowed_by_comments = gate.allows();
     let gate = edit_checked(run_gh, head, &comments, gate)?;
+    let edited_away = allowed_by_comments && !gate.allows();
+    let gate = match (gate, voided) {
+        (HeadGate::NotApproved { head }, Some(change))
+            if !edited_away
+                && head_hold(&head, &reviews, &comments, policy, author.as_deref()).is_none() =>
+        {
+            HeadGate::BaseChanged { head, change }
+        }
+        (gate, _) => gate,
+    };
     trusted_signal::apply(run_gh, repo, pr, head, &policy.trusted_signals, gate)
 }
 
@@ -3063,6 +3112,11 @@ fn evaluate_events_by_source(
         comments
     };
     let events = verdict_audit_events(head, &reviews, &comments, policy, author);
+    // The diagnosis of a refusal judges every record, voided ones included.
+    let (judged_reviews, judged_comments) = (reviews.clone(), comments.clone());
+    // An approval counts only for the base it was given against.
+    let (reviews, comments, voided) =
+        base_change::void_approvals(run_gh, repo, pr, head, reviews, comments, policy, author)?;
     let gate = decide_for_author(policy, head, &reviews, &comments, queue, false, author);
     let carry = CarryInput {
         repo,
@@ -3082,12 +3136,21 @@ fn evaluate_events_by_source(
     let allowed_by_comments = gate.allows();
     let gate = edit_checked(run_gh, head, &comments, gate)?;
     let edited_away = allowed_by_comments && !gate.allows();
+    let gate = match (gate, voided) {
+        // A HOLD is reported as a HOLD: only a new head moves it.
+        (HeadGate::NotApproved { head }, Some(change))
+            if !edited_away && head_hold(&head, &reviews, &comments, policy, author).is_none() =>
+        {
+            HeadGate::BaseChanged { head, change }
+        }
+        (gate, _) => gate,
+    };
     let blocker = blocker::diagnose(
         &gate,
         &blocker::Records {
             head,
-            reviews: &reviews,
-            comments: &comments,
+            reviews: &judged_reviews,
+            comments: &judged_comments,
             all_comments: &all_comments,
         },
         policy,

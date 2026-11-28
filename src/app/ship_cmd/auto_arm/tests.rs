@@ -484,6 +484,10 @@ fn jsonl(records: &[serde_json::Value]) -> String {
 /// how many arm mutations were sent.
 fn ship_9438_head(head: &str, comments: &[serde_json::Value]) -> (ArmOutcome, usize) {
     let gh = FakeGh::new(vec![
+        (
+            "BASE_REF_CHANGED_EVENT",
+            Ok(crate::head_approval::base_change::NO_BASE_CHANGES.to_owned()),
+        ),
         ("pr view", Ok(pr_view("PR_9438", false))),
         ("isInMergeQueue", Ok(pr_9438_queue(head).to_string())),
         (
@@ -633,6 +637,10 @@ fn reenqueue_8678(comments: &str) -> FakeGh {
     let runs = r#"{"total_count":1,"check_runs":[{"id":7,"name":"macos","status":"completed","conclusion":"cancelled","app":{"slug":"github-actions"}}]}"#;
     let job = r#"{"id":7,"status":"completed","conclusion":"cancelled","created_at":"2026-09-23T03:30:00Z","completed_at":"2026-09-23T03:46:00Z","runner_name":"","steps":[]}"#;
     FakeGh::new(vec![
+        (
+            "BASE_REF_CHANGED_EVENT",
+            Ok(crate::head_approval::base_change::NO_BASE_CHANGES.to_owned()),
+        ),
         (
             "lastEditedAt",
             Ok(r#"{"data":{"node":{"lastEditedAt":null}}}"#.to_owned()),

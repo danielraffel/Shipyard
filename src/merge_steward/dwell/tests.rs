@@ -172,6 +172,11 @@ fn a_configured_limit_overrides_and_zero_stops_tracking() {
 
 #[test]
 fn token_mapping_covers_the_steward_vocabulary() {
+    // An approval voided by a base change waits on a re-review.
+    assert_eq!(
+        state_for_token("approval_void:base_changed", APPROVAL),
+        Some(DwellState::NeedsReview)
+    );
     assert_eq!(
         state_for_token("approval_excluded:stale_head", APPROVAL),
         Some(DwellState::NeedsReview)

@@ -27,6 +27,7 @@ case "$*" in
   *"contents/.shipyard/config.toml"*) {config_case} ;;
   *"pulls/42/reviews"*) printf '%s\n' '{reviews}' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"commits/{head}"*) printf '%s' '2026-10-11T00:00:00Z' ;;
   *"isInMergeQueue"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"headRefOid":"{head}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}' ;;

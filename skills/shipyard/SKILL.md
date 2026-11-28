@@ -901,6 +901,28 @@ none is complete (see docs/review-verdict-status.md). A new reader of comment re
 `updated_at` (`COMMENT_RECORD_JQ`). A legitimate reviewer posts a new verdict
 rather than editing an old one.
 
+## An approval counts only for the base it was given against
+
+A reviewer judges a pull request's diff against its base. A child stacked on
+a parent's branch, approved there and then retargeted to `main` with its head
+unchanged, would otherwise land the parent's unreviewed commits. Every
+verdict reader (the Rust gate in `src/head_approval/base_change.rs`, the
+queue-arm guard's `review_gate`, rollup members included, and the
+`review-verdict` status through that guard) reads the pull request's
+`BaseRefChangedEvent` and `AutomaticBaseChangeSucceededEvent` timeline
+(`BASE_CHANGE_QUERY`, byte-equal in both) and leaves out every APPROVE posted
+at or before the latest base change. GitHub's own retarget after a stacked
+parent merges voids too, since the parent's branch may have moved backwards
+after the approval; a sound exception would need the base oid the reviewer
+diffed against, which the verdict line could carry later. HOLDs are never dropped. When that leaves the head unapproved
+and a voided APPROVE named the current head, the steward reports
+`approval_void:base_changed` (otherwise the normal awaiting-review token) with
+the next action
+"re-review against the new base", and the status reads `pending`. An
+incomplete timeline (errors, a further page, a count that does not match its
+nodes, or a latest change whose new base is not the current base) is an
+error, never "no change". The timeline is read only when some APPROVE exists.
+
 ## merge-guard is versioned and tested here
 
 `merge-guard` (refuses `pr merge` on a private repo that cannot enforce

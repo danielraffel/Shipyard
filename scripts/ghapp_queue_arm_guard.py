@@ -2537,6 +2537,10 @@ def member_review(repo: str, number: int, head: str, policy: dict[str, Any],
     if not is_login(author):
         raise GuardError(f"member #{number} names no canonical author login")
     comments, reviews = verdict_listing(repo, number)
+    # The same base-change rule as any landing (`without_voided_approvals`).
+    comments, reviews, _ = without_voided_approvals(
+        repo, number, head, author, comments, reviews, policy,
+        (pull.get("base") or {}).get("ref"))
     allowed, why = review_verdict(head, author, comments, reviews, policy)
     approved = head
     if not allowed:
@@ -3682,9 +3686,14 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
     a landing ever logs a carry. Same as src/head_approval.rs ``dry_run``."""
     EXCLUDED_APPROVALS.clear()
     HELD_EXCLUSIONS.clear()
+    classification.pop("base_change_void", None)
     result = _review_gate(classification, repo, dry_run)
+    void = classification.pop("base_change_void", None)
     if result[0]:
         result = _edit_checked(classification, repo, result)
+    elif void is not None and isinstance(result[2], dict) and result[2].get("cause") in (
+            "unreviewed", "approval_does_not_carry"):
+        result = _void_refusal(classification, repo, void)
     if HELD_EXCLUSIONS:
         classification["held_exclusions"] = sorted(set(HELD_EXCLUSIONS))
         print(f"queue-arm-guard: note: PR #{classification.get('pr')}: "
@@ -3698,6 +3707,153 @@ def review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool 
               "reviewer where the host lists signers), or a login the base lists in "
               "`[auto_merge] human_reviewers`, approves", file=sys.stderr)
     return result
+
+
+# An approval counts only for the base it was given against. Kept byte-equal
+# to BASE_CHANGE_QUERY in src/head_approval/base_change.rs (a test reads both).
+BASE_CHANGE_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
+    "{pullRequest(number:$number){baseRefName timelineItems(itemTypes:[BASE_REF_CHANGED_EVENT,"
+    "AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT],first:100){filteredCount pageInfo{hasNextPage} "
+    "nodes{__typename ... on BaseRefChangedEvent{createdAt previousRefName currentRefName} "
+    "... on AutomaticBaseChangeSucceededEvent{createdAt oldBase newBase}}}}}}"
+)
+
+
+def _aware(value: Any) -> datetime | None:
+    """A timestamp with a UTC offset, else ``None``."""
+    when = _timestamp(value)
+    return when if when is not None and when.tzinfo is not None else None
+
+
+def base_changes(answer: Any) -> list[dict[str, Any]]:
+    """Every base change in a ``BASE_CHANGE_QUERY`` answer, oldest first, as
+    ``{at, from, to, automatic}``. Raises ``GuardError`` unless the answer
+    proves it is the whole timeline: no errors, no further page, a
+    ``filteredCount`` equal to the nodes, only known events with readable
+    times and refs, and a latest change whose new base is the current base.
+    Same as src/head_approval/base_change.rs ``base_changes``."""
+    if not isinstance(answer, dict):
+        raise GuardError("the timeline read is not an object")
+    if answer.get("errors") is not None:
+        raise GuardError(f"the timeline read failed: {answer.get('errors')}")
+    data = answer.get("data")
+    repository = data.get("repository") if isinstance(data, dict) else None
+    pull = repository.get("pullRequest") if isinstance(repository, dict) else None
+    if not isinstance(pull, dict):
+        raise GuardError("the timeline read names no pull request")
+    base = pull.get("baseRefName")
+    if not isinstance(base, str) or not base:
+        raise GuardError("the timeline read names no current base")
+    items = pull.get("timelineItems")
+    if not isinstance(items, dict):
+        raise GuardError("the timeline read carries no timeline")
+    page = items.get("pageInfo")
+    if not isinstance(page, dict) or page.get("hasNextPage") is not False:
+        raise GuardError("the base-change timeline has a further page")
+    nodes = items.get("nodes")
+    if not isinstance(nodes, list):
+        raise GuardError("the base-change timeline carries no nodes")
+    count = items.get("filteredCount")
+    if not isinstance(count, int) or isinstance(count, bool) or count != len(nodes):
+        raise GuardError("the base-change timeline count does not match its nodes")
+    changes: list[tuple[datetime, dict[str, Any]]] = []
+    for node in nodes:
+        kind = node.get("__typename") if isinstance(node, dict) else None
+        if kind == "BaseRefChangedEvent":
+            keys, automatic = ("previousRefName", "currentRefName"), False
+        elif kind == "AutomaticBaseChangeSucceededEvent":
+            keys, automatic = ("oldBase", "newBase"), True
+        else:
+            raise GuardError(f"the base-change timeline carries a {kind!r} node")
+        values = [node.get(key) for key in (*keys, "createdAt")]
+        if not all(isinstance(value, str) and value for value in values):
+            raise GuardError("a base change carries no refs or time")
+        when = _aware(values[2])
+        if when is None:
+            raise GuardError("a base change time is unreadable")
+        changes.append((when, {"at": values[2], "from": values[0], "to": values[1],
+                               "automatic": automatic}))
+    changes.sort(key=lambda entry: entry[0])
+    if changes and changes[-1][1]["to"] != base:
+        raise GuardError(f"the latest base change moved it to {changes[-1][1]['to']} but its "
+                         f"base is {base}")
+    return [change for _, change in changes]
+
+
+def read_base_changes(repo: str, number: int, base: str | None = None) -> list[dict[str, Any]]:
+    """``repo#number``'s base changes (``base_changes``), or ``GuardError``.
+
+    ``base`` is the base the caller already checked: a timeline whose current
+    base (and so its latest change's new base) is another one means the pull
+    request was retargeted while the guard read it, and is refused."""
+    owner, name = split_repo(repo)
+    answer = graphql(BASE_CHANGE_QUERY, {"owner": owner, "name": name, "number": str(number)})
+    changes = base_changes(answer)
+    current = answer["data"]["repository"]["pullRequest"]["baseRefName"]
+    if base is not None and current != base:
+        raise GuardError(f"its base moved while the guard read it ({base} -> {current}); "
+                         "read it again")
+    return changes
+
+
+def describe_base_change(change: dict[str, Any]) -> str:
+    return (f"its base changed from {change['from']} to {change['to']} at {change['at']}"
+            + (" (GitHub retargeted it after the old base merged)" if change["automatic"]
+               else ""))
+
+
+def _is_approval(record: dict[str, Any], review: bool) -> bool:
+    if review:
+        return str(record.get("state") or "").upper() == "APPROVED"
+    body = record.get("body")
+    found = marker_verdict(body) if isinstance(body, str) else None
+    return found is not None and found[0] == "APPROVE"
+
+
+def _approvals_through(records: list[dict[str, Any]], review: bool,
+                       floor: datetime) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(kept, dropped)``: the approvals posted at or before ``floor``, or with
+    no readable time, are dropped."""
+    field = "submitted_at" if review else "created_at"
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for record in records:
+        when = _aware(record.get(field))
+        void = _is_approval(record, review) and (when is None or when <= floor)
+        (dropped if void else kept).append(record)
+    return kept, dropped
+
+
+def without_voided_approvals(
+    repo: str, number: int, head: str, author: str | None, comments: list[dict[str, Any]],
+    reviews: list[dict[str, Any]], policy: dict[str, Any], base: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+    """``(comments, reviews, void)``: the records without every APPROVE posted
+    at or before the pull request's latest base change, and that change when
+    a counting APPROVE of ``head`` was dropped. The timeline is read only when some
+    APPROVE exists; ``GuardError`` when it cannot be read in full, or when its
+    current base is not ``base``, the base the caller checked. Same as
+    src/head_approval.rs ``evaluate_events_by_source``."""
+    if not (any(_is_approval(c, False) for c in comments)
+            or any(_is_approval(r, True) for r in reviews)):
+        return comments, reviews, None
+    changes = read_base_changes(repo, number, base)
+    if not changes:
+        return comments, reviews, None
+    change = changes[-1]
+    floor = _aware(change["at"])
+    assert floor is not None  # base_changes refuses an unreadable time
+    comments, dropped_comments = _approvals_through(comments, False, floor)
+    reviews, dropped_reviews = _approvals_through(reviews, True, floor)
+    # Judging what was dropped must not report its exclusions a second time.
+    mark = len(EXCLUDED_APPROVALS)
+    # Only a dropped APPROVE of this head is reported as void; an earlier
+    # head's leaves the normal refusal.
+    voided = any(entry[1] == "APPROVE" and entry[2] == head.lower() for entry in
+                 counting_verdicts(author, dropped_comments, dropped_reviews, policy))
+    del EXCLUDED_APPROVALS[mark:]
+    return comments, reviews, (change if voided else None)
 
 
 COMMENT_EDIT_QUERY = "query($id: ID!) { node(id: $id) { ... on IssueComment { lastEditedAt } } }"
@@ -3758,6 +3914,26 @@ def _edit_checked(classification: dict[str, Any], repo: str | None,
         "unreviewed", f"the approval of {label} was edited after it was posted",
         str(repo), int(number) if isinstance(number, int) else 0, head,
         f"a reviewer posts a new `verdict: APPROVE head:{head}` comment on "
+        f"https://github.com/{repo}/pull/{number}", False)
+
+
+def _void_refusal(classification: dict[str, Any], repo: str | None,
+                  change: dict[str, Any]) -> tuple[bool, str, dict[str, Any] | None]:
+    """The refusal for a head whose every APPROVE predates its latest base
+    change: ``approval_void:base_changed``, re-review against the new base."""
+    repo = classification.get("repo") or repo
+    number = classification.get("pr")
+    head = str(classification.get("head") or "")
+    label = f"PR #{number}"
+    what = describe_base_change(change)
+    return False, (
+        f"{label} ({repo}): approval_void:base_changed: every APPROVE of head {head[:12]} "
+        f"was posted at or before the latest base change ({what}), and an approval counts only for the base it was given "
+        "against; re-review against the new base"), review_fix(
+        "approval_void", f"the approval of {label} is void: {what}", str(repo),
+        number if isinstance(number, int) else 0, head,
+        f"a reviewer re-reviews head {head} against the new base {change['to']} and posts a "
+        f"new `verdict: APPROVE head:{head}` (or HOLD) on "
         f"https://github.com/{repo}/pull/{number}", False)
 
 
@@ -3834,6 +4010,16 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
     admitted = admission_gate(repo, number, head, policy["source"], classification)
     if admitted is not None:
         return admitted
+    try:
+        comments, reviews, void = without_voided_approvals(
+            repo, number, head, author, comments, reviews, policy, base)
+    except GuardError as error:
+        return False, (
+            f"{label}: cannot read its base changes ({error}); refusing to land it unreviewed"
+        ), review_fix("unreadable", f"{label}'s base changes could not be read: {error}",
+                      repo, number, head, read_pull, True)
+    if void is not None:
+        classification["base_change_void"] = void
     allowed, why = review_verdict(head, author, comments, reviews, policy)
     if allowed:
         try:

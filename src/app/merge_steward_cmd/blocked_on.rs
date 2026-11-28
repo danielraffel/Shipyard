@@ -1019,7 +1019,8 @@ fn approval_blocked(blocker: &ApprovalBlocker, green_since: Option<String>) -> (
             Some(format!("the newest approval names {approved_head}"))
         }
         ApprovalBlocker::SelfApproved { agent } => Some(format!("approved and armed by {agent}")),
-        ApprovalBlocker::AdmissionMissing { detail }
+        ApprovalBlocker::Void { detail, .. }
+        | ApprovalBlocker::AdmissionMissing { detail }
         | ApprovalBlocker::AdmissionRefused { detail, .. } => Some(detail.clone()),
         // A HOLD makes its head un-approvable, so no verdict on this head can
         // move it, however approved it looks: say so where the token is read.
@@ -1061,6 +1062,7 @@ const fn approval_since_source(blocker: &ApprovalBlocker) -> &'static str {
     match blocker {
         ApprovalBlocker::Held { .. } => "hold_posted",
         ApprovalBlocker::EjectionCap { .. } => "queue_removed",
+        ApprovalBlocker::Void { .. } => "base_changed",
         _ => "approval_posted",
     }
 }

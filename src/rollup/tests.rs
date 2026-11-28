@@ -243,6 +243,8 @@ struct Hub<'a> {
     /// between the re-read and the merge.
     race: RefCell<Option<String>>,
     comments: BTreeMap<u64, Vec<Value>>,
+    /// When a pull request was retargeted by hand, by number.
+    retargeted: BTreeMap<u64, String>,
     writes: RefCell<Vec<Vec<String>>>,
     /// Run once just before the base tip is read, to move it under a reader.
     before_tip: RefCell<Option<Box<dyn FnOnce() + 'a>>>,
@@ -263,6 +265,7 @@ impl<'a> Hub<'a> {
                             "conclusion": "success", "app": 15368}]),
             race: RefCell::new(None),
             comments: BTreeMap::new(),
+            retargeted: BTreeMap::new(),
             writes: RefCell::new(Vec::new()),
             before_tip: RefCell::new(None),
         }
@@ -296,6 +299,24 @@ impl<'a> Hub<'a> {
             .iter()
             .position(|arg| *arg == "--jq")
             .map_or("", |index| args[index + 1]);
+        if args
+            .iter()
+            .any(|arg| arg.contains("BASE_REF_CHANGED_EVENT"))
+        {
+            let number = args
+                .iter()
+                .find_map(|arg| arg.strip_prefix("number="))
+                .and_then(|number| number.parse::<u64>().ok())
+                .expect("number");
+            let nodes = self.retargeted.get(&number).map_or_else(Vec::new, |at| {
+                vec![json!({"__typename": "BaseRefChangedEvent", "createdAt": at,
+                            "previousRefName": "parent", "currentRefName": "main"})]
+            });
+            return Ok(json!({"data": {"repository": {"pullRequest": {
+                "baseRefName": "main", "timelineItems": {"filteredCount": nodes.len(),
+                "pageInfo": {"hasNextPage": false}, "nodes": nodes}}}}})
+            .to_string());
+        }
         if args.iter().any(|arg| arg.contains("lastEditedAt")) {
             return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
         }
@@ -968,6 +989,36 @@ fn the_head_approval_gate_approves_a_rollup_of_approved_members_and_respects_a_h
         ],
     );
     assert!(!evaluate(&hub).allows());
+}
+
+/// A member whose APPROVE predates a manual retarget of that member has no
+/// approval, so the rollup is refused.
+#[test]
+fn a_member_retargeted_after_its_approval_stops_the_rollup() {
+    let fixture = Fixture::new(&["a.txt", "b.txt"]);
+    let mut hub = fixture.hub();
+    hub.comments
+        .insert(11, vec![verdict("APPROVE", &fixture.heads[0])]);
+    hub.comments
+        .insert(12, vec![verdict("APPROVE", &fixture.heads[1])]);
+    let evaluate = |hub: &Hub<'_>| {
+        let run = |args: &[String]| hub.run(args);
+        head_approval::evaluate_with_policy_for_author_with_events(
+            &run,
+            REPO,
+            20,
+            fixture.head(),
+            &reviewer_policy(),
+            &Value::Null,
+            None,
+        )
+        .expect("evaluates")
+        .0
+    };
+    assert!(evaluate(&hub).allows(), "control");
+    hub.retargeted.insert(12, "2026-10-04T02:00:00Z".to_owned());
+    let gate = evaluate(&hub);
+    assert!(!gate.allows(), "{gate:?}");
 }
 
 #[test]

@@ -229,6 +229,7 @@ case "$*" in
   *"/pulls/4"[0-9]" "*) printf 'feature\nmain\n' ;;
   *"query=query("*"mergeQueue(branch"*) printf '%s' '{merge_queue}' ;;
   *"/comments"*) {comments} ;;
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"/commits/"*) printf '%s' '2026-10-30T00:00:00Z' ;;
   *"/branches/main"*) printf 'main\n' ;;

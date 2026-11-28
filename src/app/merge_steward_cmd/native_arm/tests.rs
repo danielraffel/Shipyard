@@ -54,6 +54,7 @@ fn never_armed_then_arms(log: &str) -> String {
     format!(
         r#"printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *enablePullRequestAutoMerge*)
     printf '%s' '{{"data":{{"enablePullRequestAutoMerge":{{"pullRequest":{{"number":42}}}}}}}}' ;;
   *isInMergeQueue*)
@@ -71,6 +72,7 @@ fn ejected_same_head(log: &str) -> String {
     format!(
         r#"printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *isInMergeQueue*)
     printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{{"__typename":"AddedToMergeQueueEvent","createdAt":"2026-09-01T00:00:00Z","actor":{{"login":"a"}}}},{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-09-02T00:00:00Z","reason":"failed_checks","actor":{{"login":"a"}}}}]}}}}}}}}}}' ;;
   *contents/.shipyard/config.toml*)
@@ -478,6 +480,7 @@ fn an_unreadable_queue_state_arms_nothing_and_is_reported_unhealthy() {
         &format!(
             r#"printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *isInMergeQueue*) echo 'HTTP 502' >&2; exit 1 ;;
   *contents/.shipyard/config.toml*)
     printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
@@ -520,6 +523,7 @@ fn a_queue_arm_guard_refusal_is_agreement_not_a_failure() {
         &format!(
             r#"printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *enablePullRequestAutoMerge*)
     echo 'queue-arm-guard: refusing: PR #42 is already in the merge queue' >&2; exit 1 ;;
   *isInMergeQueue*)
@@ -570,6 +574,7 @@ fn approval_required(log: &str, reviews: &str) -> String {
     format!(
         r#"printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *enablePullRequestAutoMerge*)
     printf '%s' '{{"data":{{"enablePullRequestAutoMerge":{{"pullRequest":{{"number":42}}}}}}}}' ;;
   *isInMergeQueue*)
@@ -767,6 +772,7 @@ fn ejected_with_timeline(
         &format!(
             r#"printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *enablePullRequestAutoMerge*) cat '{d}/armed' ;;
   *isInMergeQueue*) cat '{fixture}' ;;
   *contents/.shipyard/config.toml*) cat '{d}/config' ;;
@@ -1130,6 +1136,7 @@ fn carrying_a_commit_of_11361_live_at(
         r#"# CARRIED_COMMITS
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"/compare/main..."*"total_commits"*) printf '%s' '{{"total":2,"shas":["{CARRIED}","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}'; exit 0 ;;
   *carriedCommits*) printf '%s' '{listing}'; exit 0 ;;
   *pulls/11361/reviews*) printf '%s' '{q_reviews}'; exit 0 ;;
