@@ -113,6 +113,7 @@ case "$*" in
   *"contents/.shipyard/config.toml"*) {policy} ;;
   *"pulls/42/reviews"*) printf '' ;;
   *"issues/42/comments"*) printf '%s\n' '{comments}' ;;
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"lastEditedAt"*) printf '%s' '{{"data":{{"node":{{"lastEditedAt":null}}}}}}' ;;
   *"/check-runs?"*) printf '%s' '{check_runs}' ;;
   *"/statuses?"*) printf '%s' '[]' ;;
@@ -905,6 +906,7 @@ for f in '{calls}'/*.args; do
   fi
 done
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"isInMergeQueue"*) printf '%s' '{queue_json}' ;;
   *"pulls/7 --jq [.head.ref, .base.ref]"*) printf 'head\nmain\n' ;;
   *"actions/runs?event=merge_group"*) printf '%s' '{{"workflow_runs":[]}}' ;;

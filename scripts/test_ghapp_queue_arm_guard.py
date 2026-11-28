@@ -1894,6 +1894,9 @@ class BatchAttributionTests(unittest.TestCase):
                 f"printf '%s\\n' \"$*\" >> '{guards / 'calls'}'\n"
                 "case \"$*\" in *contents/.shipyard/config.toml*)\n"
                 "  echo 'gh: Not Found (HTTP 404)' >&2; exit 1;; esac\n"
+                # The base-change timeline: never retargeted.
+                "case \"$*\" in *BASE_REF_CHANGED_EVENT*)\n"
+                "  echo '" + json.dumps(NO_BASE_CHANGES) + "'; exit 0;; esac\n"
                 # The deciding approval comment's edit history: never edited.
                 "case \"$*\" in *lastEditedAt*)\n"
                 "  echo '{\"data\": {\"node\": {\"lastEditedAt\": null}}}'; exit 0;; esac\n"
@@ -2524,11 +2527,80 @@ class NormalPushActivityEvidence(unittest.TestCase):
         self.assertIs(target["new_head_since_removal"], True)
 
 
+
+class ApprovalVoidOnBaseChange(unittest.TestCase):
+    """An approval counts only for the base it was given against. The cases
+    are shared with src/head_approval/base_change_tests.rs."""
+
+    CASES = SCRIPT.parent.parent / "src" / "head_approval" / "base_change_cases.json"
+    HEAD = "a" * 40
+
+    @staticmethod
+    def record(case: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        approve = case["verdict"] == "APPROVE"
+        if case["kind"] == "review":
+            return True, {"id": case["id"], "submitted_at": case["at"],
+                          "commit_id": ApprovalVoidOnBaseChange.HEAD,
+                          "state": "APPROVED" if approve else "CHANGES_REQUESTED"}
+        return False, {"id": case["id"], "created_at": case["at"],
+                       "body": f"verdict: {'APPROVE' if approve else 'HOLD'} "
+                               f"head:{ApprovalVoidOnBaseChange.HEAD}"}
+
+    def test_the_shared_cases_judge_as_written(self) -> None:
+        cases = json.loads(self.CASES.read_text(encoding="utf-8"))["cases"]
+        self.assertGreaterEqual(len(cases), 10)
+        for case in cases:
+            with self.subTest(case["name"]):
+                if case.get("error"):
+                    with self.assertRaises(guard.GuardError):
+                        guard.base_changes(case["answer"])
+                    continue
+                changes = guard.base_changes(case["answer"])
+                records = [self.record(entry) for entry in case["records"]]
+                kept = [record for _, record in records]
+                if changes:
+                    floor = guard._aware(changes[-1]["at"])
+                    kept = []
+                    for review, record in records:
+                        kept += guard._approvals_through([record], review, floor)[0]
+                self.assertEqual([record["id"] for record in kept], case["kept"])
+
+    def test_the_query_matches_the_rust_gate(self) -> None:
+        source = (SCRIPT.parent.parent / "src" / "head_approval" / "base_change.rs").read_text(
+            encoding="utf-8")
+        rust = source.split('pub const BASE_CHANGE_QUERY: &str = "', 1)[1].split('";', 1)[0]
+        self.assertEqual(rust, guard.BASE_CHANGE_QUERY)
+
+    def void_of(self, comments: list[dict[str, Any]], answer: Any) -> Any:
+        policy = guard.review_policy(None, "danielraffel/Shipyard", True)
+        with mock.patch.object(guard, "graphql", return_value=answer) as read:
+            result = guard.without_voided_approvals(
+                "danielraffel/Shipyard", 7, "someone", comments, [], policy)
+        return result, read.call_count
+
+    def test_no_approve_reads_no_timeline(self) -> None:
+        (_, _, void), reads = self.void_of([], guard.GuardError("must not be read"))
+        self.assertIsNone(void)
+        self.assertEqual(reads, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
 
 REMOVAL = SCRIPT.with_name("ghapp_queue_removal_guard.py")
+
+
+NO_BASE_CHANGES = {"data": {"repository": {"pullRequest": {"baseRefName": "main", "timelineItems": {
+    "filteredCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}}}}}
+
+
+def retargeted(at: str) -> dict[str, Any]:
+    """A base-change timeline: retargeted from ``parent`` to ``main`` at ``at``."""
+    return {"data": {"repository": {"pullRequest": {"baseRefName": "main", "timelineItems": {
+        "filteredCount": 1, "pageInfo": {"hasNextPage": False}, "nodes": [
+            {"__typename": "BaseRefChangedEvent", "createdAt": at,
+             "previousRefName": "parent", "currentRefName": "main"}]}}}}}
 
 
 def opened(graphql_response: dict[str, Any]) -> dict[str, Any]:
@@ -2705,6 +2777,8 @@ class ReviewBeforeArm(unittest.TestCase):
             ("mergeQueue(branch", {"json": {"data": {"repository": {
                 "mergeQueue": {"id": "MQ_1"} if queue else None}}}}),
             *(extra or []),
+            # The base-change timeline: never retargeted.
+            ("BASE_REF_CHANGED_EVENT", {"json": NO_BASE_CHANGES}),
             ("graphql", {"json": graphql if graphql is not None
                          else review_fixture(f"{prefix}-graphql.json")}),
             ("/reviews", {"pages": reviews if reviews is not None
@@ -3514,6 +3588,40 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.land(history, history.git("rev-parse", "HEAD"))
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("is not a merge", result.stderr)
+
+    # An approval counts only for the base it was given against: a stacked
+    # child approved on its parent's branch, then retargeted to main.
+    def retarget(self, at: str) -> list[tuple[str, dict[str, Any]]]:
+        return self.approved_784(extra=[("BASE_REF_CHANGED_EVENT", {"json": retargeted(at)})])
+
+    def test_a_retarget_after_the_approval_voids_it(self) -> None:
+        # The APPROVE comment was posted at 2026-10-12T15:19:14Z.
+        result = self.arm(784, "danielraffel/Shipyard", self.retarget("2026-10-12T16:00:00Z"))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("approval_void:base_changed", result.stderr)
+        self.assertIn("re-review against the new base", result.stderr)
+        self.assertIn('"cause": "approval_void"', result.stderr)
+
+    def test_a_retarget_before_the_approval_leaves_it_counting(self) -> None:
+        result = self.arm(784, "danielraffel/Shipyard", self.retarget("2026-10-12T15:00:00Z"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BASE_REF_CHANGED_EVENT", self.calls())
+
+    def test_no_retarget_leaves_it_counting(self) -> None:
+        result = self.arm(784, "danielraffel/Shipyard", self.approved_784())
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_incomplete_timeline_fails_closed(self) -> None:
+        further = retargeted("2026-10-12T15:00:00Z")
+        further["data"]["repository"]["pullRequest"]["timelineItems"]["pageInfo"][
+            "hasNextPage"] = True
+        for answer in ({"json": further}, {"error": "gh: HTTP 502"},
+                       {"json": {**NO_BASE_CHANGES, "errors": [{"message": "rate limited"}]}}):
+            with self.subTest(answer=str(answer)[:60]):
+                result = self.arm(784, "danielraffel/Shipyard", self.approved_784(
+                    extra=[("BASE_REF_CHANGED_EVENT", answer)]))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("cannot read its base changes", result.stderr)
 
 
 class ArmsLedgerAndSelfApproval(unittest.TestCase):

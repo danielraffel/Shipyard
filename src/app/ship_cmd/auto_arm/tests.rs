@@ -634,6 +634,10 @@ fn reenqueue_8678(comments: &str) -> FakeGh {
     let job = r#"{"id":7,"status":"completed","conclusion":"cancelled","created_at":"2026-09-23T03:30:00Z","completed_at":"2026-09-23T03:46:00Z","runner_name":"","steps":[]}"#;
     FakeGh::new(vec![
         (
+            "BASE_REF_CHANGED_EVENT",
+            Ok(crate::head_approval::base_change::NO_BASE_CHANGES.to_owned()),
+        ),
+        (
             "lastEditedAt",
             Ok(r#"{"data":{"node":{"lastEditedAt":null}}}"#.to_owned()),
         ),

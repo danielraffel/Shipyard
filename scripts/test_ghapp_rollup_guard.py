@@ -133,6 +133,10 @@ class Hub:
         return next(pull for pull in self.pulls if pull["number"] == number)
 
     def __call__(self, args: list[str]) -> Any:
+        if any("BASE_REF_CHANGED_EVENT" in arg for arg in args):
+            # The member's base-change timeline: never retargeted.
+            return {"data": {"repository": {"pullRequest": {"baseRefName": "main", "timelineItems": {
+                "filteredCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}}}}}
         if "graphql" in args:
             query = next(arg for arg in args if arg.startswith("query="))
             expressions = [json.loads(match) for match in

@@ -1,0 +1,566 @@
+{
+ "_comment": "Shared by src/head_approval/base_change_tests.rs and scripts/test_ghapp_queue_arm_guard.py: both sides must judge every case the same.",
+ "cases": [
+  {
+   "name": "no_base_change_keeps_every_approval",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 0,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": []
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 2,
+     "kind": "review",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    1,
+    2
+   ]
+  },
+  {
+   "name": "retarget_after_the_approval_voids_it",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 2,
+     "kind": "review",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "retarget_before_the_approval_keeps_it",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T10:00:00Z",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T11:00:00Z",
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 2,
+     "kind": "review",
+     "at": "2026-11-20T11:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    1,
+    2
+   ]
+  },
+  {
+   "name": "an_approval_in_the_same_second_as_the_change_is_void",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T11:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "a_hold_is_never_dropped",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "HOLD"
+    },
+    {
+     "id": 2,
+     "kind": "review",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "HOLD"
+    },
+    {
+     "id": 3,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    1,
+    2,
+    3
+   ]
+  },
+  {
+   "name": "githubs_own_retarget_voids_too",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 2,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    2
+   ]
+  },
+  {
+   "name": "the_latest_change_decides_whatever_the_node_order",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 2,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         },
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T10:00:00Z",
+          "previousRefName": "main",
+          "currentRefName": "parent"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:30:00Z",
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 2,
+     "kind": "review",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    2
+   ]
+  },
+  {
+   "name": "an_approval_with_no_readable_time_is_void_after_a_change",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T10:00:00Z",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "not a time",
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 2,
+     "kind": "comment",
+     "at": "2026-11-20T11:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    2
+   ]
+  },
+  {
+   "name": "a_further_page_is_incomplete",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": true
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "error": true
+  },
+  {
+   "name": "a_count_that_does_not_match_the_nodes_is_incomplete",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": []
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "error": true
+  },
+  {
+   "name": "errors_beside_data_are_not_an_answer",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 0,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": []
+       }
+      }
+     }
+    },
+    "errors": [
+     {
+      "message": "rate limited"
+     }
+    ]
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "error": true
+  },
+  {
+   "name": "a_latest_change_to_another_base_is_inconsistent",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "previousRefName": "main",
+          "currentRefName": "parent"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "error": true
+  },
+  {
+   "name": "an_unknown_node_is_unreadable",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "ClosedEvent",
+          "createdAt": "2026-11-20T11:00:00Z"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "error": true
+  },
+  {
+   "name": "an_unreadable_change_time_is_unreadable",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "yesterday",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "error": true
+  },
+  {
+   "name": "no_pull_request_is_unreadable",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": null
+     }
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T12:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "error": true
+  }
+ ]
+}

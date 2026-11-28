@@ -78,7 +78,10 @@ HEAD_CHECK_EVENTS = frozenset({"pull_request_target"})
 # The guard's refusal causes that mean "no counted verdict yet": the head has
 # no verdict, or only an earlier head's approval that does not carry. Every
 # other refusal (a HOLD, an unreadable review, a self-approval) is a failure.
-AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry", "admission_missing"})
+# ``approval_void``: every APPROVE predates the pull request's latest base
+# change, so it waits on a re-review against the new base.
+AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry", "admission_missing",
+                             "approval_void"})
 # A base whose `[auto_merge] approval_source = "guard"` takes authorization
 # from the fleet admission check run instead of comments; its completion
 # reaches this workflow as a ``check_run`` event (see event_target).

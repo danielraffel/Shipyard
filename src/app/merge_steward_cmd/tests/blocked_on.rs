@@ -402,6 +402,7 @@ fn the_admission_gate_read_carries_its_diagnosis_into_the_report() {
             r#"
 # CONFIG_ERROR: this fixture serves its own policy file
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'reviewer_signers = ["pulp-review"]' ;;
   *"pulls/42/reviews"*) ;;
   *"issues/42/comments"*) printf '%s\n' '{comment}' ;;
@@ -461,6 +462,7 @@ fn every_open_pull_request_in_a_pass_carries_a_token() {
         &temp,
         r#"
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{"data":{"repository":{"pullRequest":{"baseRefName":"main","timelineItems":{"filteredCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}'; exit 0 ;;
   *"commits/"*) printf '%s' '{"commit":{"committer":{"date":"2026-10-31T01:00:00Z"}}}' ;;
   *"issues/5/events"*) printf 'owner-decision\t2026-10-31T05:00:00Z\n' ;;
   *) echo "unreadable" >&2; exit 2 ;;
@@ -1292,6 +1294,7 @@ fn a_dry_run_names_an_uncounted_signer_on_a_review_verdict_red_head() {
             r#"
 # CONFIG_ERROR: this fixture serves its own policy file
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'reviewer_signers = ["pulp-review"]' ;;
   *"pulls/969/reviews"*) ;;
   *"issues/969/comments"*) printf '%s\n' '{comment}' ;;
@@ -2014,6 +2017,7 @@ fn a_quarantined_head_waiting_on_a_reviewer_names_the_diagnosis() {
         &temp,
         r#"
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{"data":{"repository":{"pullRequest":{"baseRefName":"main","timelineItems":{"filteredCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}'; exit 0 ;;
   *"issues/1434/comments"*) printf '%s\n' '{"created_at":"2026-11-17T03:06:22Z","body":"Review quarantine diagnosis: this head bundles unrelated removals. Please split.\nmore"}' ;;
   *) echo "unexpected: $*" >&2; exit 2 ;;
 esac
@@ -2281,6 +2285,7 @@ fn annotate_names_apply_derived_for_a_drift_only_red() {
             &format!(
                 r#"
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"actions/runs?head_sha={HEAD}"*) printf '%s' '{{"workflow_runs":[{{"id":500,"event":"pull_request","conclusion":"failure","head_sha":"{HEAD}","head_branch":"feature","head_repository":{{"full_name":"owner/repo"}},"pull_requests":[{{"number":77}}]}}]}}' ;;
   *"actions/runs/500/artifacts"*) printf '%s' '{{"artifacts":[{{"id":1,"name":"{artifact}","expired":false,"workflow_run":{{"head_sha":"{HEAD}"}}}}]}}' ;;
   *"commits/{HEAD}"*) printf '%s' '{{"commit":{{"message":"feat: change a script"}}}}' ;;

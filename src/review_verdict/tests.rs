@@ -45,6 +45,9 @@ fn gh_into(
                 .collect::<Vec<_>>()
                 .join("\n"));
         }
+        if joined.contains("BASE_REF_CHANGED_EVENT") {
+            return Ok(crate::head_approval::base_change::NO_BASE_CHANGES.to_owned());
+        }
         if joined.contains("lastEditedAt") {
             return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
         }

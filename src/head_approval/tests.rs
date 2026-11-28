@@ -2897,6 +2897,9 @@ impl History {
         if joined.contains("pulls/7 --jq .base.ref") {
             return Ok("main\n".to_owned());
         }
+        if joined.contains("BASE_REF_CHANGED_EVENT") {
+            return Ok(super::base_change::NO_BASE_CHANGES.to_owned());
+        }
         if let Some(sha) = args
             .iter()
             .find_map(|arg| arg.split_once("/git/blobs/").map(|(_, sha)| sha.to_owned()))
@@ -4622,6 +4625,8 @@ fn same_second_gh(edited: Result<Value, String>) -> impl Fn(&[String]) -> Result
         let joined = args.join(" ");
         if joined.contains("contents/.shipyard/config.toml") {
             Ok("[auto_merge]\nreviewer_signers = [\"pulp-review\"]\n".to_owned())
+        } else if joined.contains("BASE_REF_CHANGED_EVENT") {
+            Ok(super::base_change::NO_BASE_CHANGES.to_owned())
         } else if joined.contains("lastEditedAt") {
             assert!(joined.contains("id=IC_node7"), "{joined}");
             edited.clone().map(|value| value.to_string())

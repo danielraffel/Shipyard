@@ -296,6 +296,12 @@ impl<'a> Hub<'a> {
             .iter()
             .position(|arg| *arg == "--jq")
             .map_or("", |index| args[index + 1]);
+        if args
+            .iter()
+            .any(|arg| arg.contains("BASE_REF_CHANGED_EVENT"))
+        {
+            return Ok(crate::head_approval::base_change::NO_BASE_CHANGES.to_owned());
+        }
         if args.iter().any(|arg| arg.contains("lastEditedAt")) {
             return Ok(json!({"data": {"node": {"lastEditedAt": null}}}).to_string());
         }

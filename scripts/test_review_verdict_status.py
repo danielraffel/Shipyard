@@ -709,6 +709,19 @@ class TamperedVerdicts(unittest.TestCase):
         self.assertEqual(self.judged(trail, SIGNERS), "pending")
         self.assertIn("edited", self.posted()["description"])
 
+    def test_a_retarget_after_the_approve_awaits_a_re_review(self) -> None:
+        # A child approved on its parent's branch, then retargeted to main.
+        def retargeted(answer: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+            return [("BASE_REF_CHANGED_EVENT", answer), *self.answers(self.approved(), SIGNERS)]
+        after = self.post(retargeted({"json": arm.retargeted("2026-10-12T16:00:00Z")}))
+        self.assertEqual(self.posted()["state"], "pending", after.stdout + after.stderr)
+        self.assertIn("approval_void:base_changed", after.stdout)
+        before = self.post(retargeted({"json": arm.retargeted("2026-10-12T14:00:00Z")}))
+        self.assertEqual(self.posted()["state"], "success", before.stdout + before.stderr)
+        unreadable = self.post(retargeted({"error": "gh: HTTP 502"}))
+        self.assertEqual(self.posted()["state"], "failure",
+                         unreadable.stdout + unreadable.stderr)
+
     def test_an_approve_edited_in_its_own_second_is_not_success(self) -> None:
         # REST times have one-second resolution: an edit in the second the
         # comment was posted leaves updated_at == created_at. GraphQL's

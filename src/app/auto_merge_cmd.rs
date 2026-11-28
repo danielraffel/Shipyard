@@ -4263,6 +4263,7 @@ else:
                     ["/reviews", {"pages": [[]]}],
                     ["/comments", {"pages": [comments]}],
                     ["mergeQueue(branch", {"json": {"data": {"repository": {"mergeQueue": {"id": "MQ_1"}}}}}],
+        ["BASE_REF_CHANGED_EVENT", {"json": {"data":{"repository":{"pullRequest":{"baseRefName":"main","timelineItems":{"filteredCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}}],
         ["lastEditedAt", {"json": {"data": {"node": {"lastEditedAt": null}}}}],
                                 ["node(id:", {"json": {"data": {"node": node}}}],
                     ["pullRequest(number", {"json": {"data": {"repository": {"pullRequest": node}}}}],
@@ -5458,6 +5459,9 @@ exit 91
             calls.borrow_mut().push(joined.clone());
             if joined.contains("contents/.shipyard/config.toml?ref=main") {
                 return policy.map(str::to_owned).map_err(str::to_owned);
+            }
+            if joined.contains("BASE_REF_CHANGED_EVENT") {
+                return Ok(crate::head_approval::base_change::NO_BASE_CHANGES.to_owned());
             }
             if joined.contains("isInMergeQueue") {
                 return Ok(crate::head_approval::tests::pr_9438_queue(

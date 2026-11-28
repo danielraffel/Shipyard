@@ -41,6 +41,7 @@ impl Fixture {
             ["/reviews", {"pages": [[]]}],
             ["/comments", {"pages": [comments]}],
             // The deciding comment's edit history: never edited.
+            ["BASE_REF_CHANGED_EVENT", {"json": {"data":{"repository":{"pullRequest":{"baseRefName":"main","timelineItems":{"filteredCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}}],
             ["lastEditedAt", {"json": {"data": {"node": {"lastEditedAt": null}}}}],
             ["node(id:", {"json": {"data": {"node": {
                 "number": 4242, "state": "OPEN", "headRefOid": HEAD, "baseRefName": "main",

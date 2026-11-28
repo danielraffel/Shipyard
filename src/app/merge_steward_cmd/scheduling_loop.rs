@@ -298,6 +298,7 @@ pub(crate) fn state_for(
         | "review_quarantined"
         | "waiting_head_approval"
         | "approval_excluded"
+        | "approval_void"
         | "waiting_code_owner"
         | "code_owner_review"
         | "carries_unapproved_commits" => LoopState::AwaitingReview,
@@ -586,7 +587,7 @@ fn specific_evidence(
         LoopState::RequiredRed => source(&["check_completed"]),
         LoopState::Hold => source(&["hold_posted"]),
         LoopState::Ejected => source(&["queue_removed"]),
-        LoopState::AwaitingReview => source(&["checks_green"]),
+        LoopState::AwaitingReview => source(&["checks_green", "base_changed"]),
         LoopState::CheckRunning | LoopState::CapacityQueued => source(&["check_started"]),
         LoopState::Ready | LoopState::Dirty | LoopState::StuckGroup | LoopState::Tooling => None,
     }

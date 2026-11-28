@@ -384,7 +384,7 @@ Per row, beside `decision`, `mutation` and `error`:
 - `since`: when that state began, UTC, or `null` when nothing dates it.
 - `since_source`: which GitHub time it came from: `checks_green` (the newest
   required check finished), `check_started`, `check_completed`,
-  `approval_posted`, `hold_posted`, `queue_removed`, `merge_queue_enqueued`,
+  `approval_posted`, `hold_posted`, `base_changed`, `queue_removed`, `merge_queue_enqueued`,
   `label_added` or `head_commit`. `head_commit` is the head commit's
   committer date: a best-effort stand-in that can predate the push (and a
   `BEHIND`/`DIRTY` state, which starts when the base moves): the state may
@@ -416,6 +416,7 @@ close anything. See [superseded-close.md](superseded-close.md).
 | `review_quarantined` | The pass-runner's quarantine file lists this exact head while the row waits on a reviewer, so nothing will review it as it stands. `blocked_detail` is the first line of the reviewer's `Review quarantine diagnosis:` comment. Fix what it names and push once, or `dispute: <reason>` | author |
 | `held:review-verdict` | A counting HOLD names this head, so it is un-approvable and any APPROVE of it is ignored. `blocked_detail` reads "held head: needs a new head" when the pass read the gate, or the review-verdict status's own description (`a HOLD naming head <sha> makes it un-approvable (held by ...)`) when it did not. Consumers that key on the token's kind (before `:`) still read `held` | repair lane: address the HOLD's named items, then push a new head (if the HOLD is wrong, push a new head anyway and comment `dispute: <reason>`) |
 | `approval_excluded:<reason>` | An APPROVE names this head but does not count. Reasons: `unattributed`, `no_stamp`, `noncanonical_stamp`, `session_not_allowed`, `unlisted_stamp_session`, `no_signer_list`, `no_signer_line`, `uncounted_signer`, `unbound_identity`, `pr_author`, `impersonated_app`, `untrusted_reviewer`, `unlisted_reviewer`, `unlisted_human`, `predates_head` (posted before the head commit), `stale_head` (only an earlier head is approved), `self_approved` | reviewer or fleet config |
+| `approval_void:base_changed` | Every APPROVE of this head was posted at or before the pull request's latest base change (a retarget by hand, or GitHub's own retarget after a stacked parent merged): an approval counts only for the base it was given against. Next action: re-review against the new base. `since` is the base change (`since_source: base_changed`) | reviewer |
 | `ejection_cap` | The queue removed this head too often since its last approval | reviewer, or a new push |
 | `approval_unread` | The approval gate could not be read this pass | next pass |
 | `owner_decision` | Labelled `owner-decision` | owner |
@@ -1106,7 +1107,7 @@ that state):
 
 ```toml
 [auto_merge.dwell]
-needs_review = 20               # no_verdict, approval_excluded:stale_head|predates_head
+needs_review = 20               # no_verdict, approval_excluded:stale_head|predates_head, approval_void:*
 required_pending = 60
 required_failed_infra = 10      # transient_rerun: an interruption the steward is re-running
 required_failed = 45

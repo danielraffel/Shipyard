@@ -209,6 +209,7 @@ fn ejected_gh_body_armed_at(macos_job: &str, arm_reply: &str, armed_at: &str) ->
     format!(
         r#"
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *enablePullRequestAutoMerge*) printf '%s' '{arm_reply}' ;;
   *timelineItems*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{{"__typename":"PullRequestCommit","commit":{{"oid":"{HEAD}","checkSuites":{{"nodes":[{{"createdAt":"2026-10-09T07:00:00Z"}}]}}}}}},{{"__typename":"AutoMergeEnabledEvent","createdAt":"{armed_at}","actor":{{"login":"shipyard-local"}}}},{{"__typename":"AddedToMergeQueueEvent","createdAt":"2026-10-09T08:01:00Z","actor":{{"login":"shipyard-local"}}}},{{"__typename":"RemovedFromMergeQueueEvent","createdAt":"2026-10-09T08:30:00Z","reason":"failed_checks","actor":{{"login":"github-merge-queue"}},"beforeCommit":{{"oid":"{GROUP}","parents":{{"nodes":[{{"oid":"dddddddddddddddddddddddddddddddddddddddd"}},{{"oid":"{HEAD}"}}]}}}}}}]}}}}}}}}}}' ;;
   *issues/42/comments*) printf '%s' '[{{"id":77,"body":"Review of {HEAD}: approved.\nreviewed:{HEAD}"}}]' ;;
@@ -510,6 +511,7 @@ fn carried_head_gh(temp: &tempfile::TempDir, commit_fixture: &str, reviews: &str
     let prefix = format!(
         r#"
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *"repos/owner/repo/commits/{HEAD}"*) cat '{}'; exit 0 ;;
   *"contents/.shipyard/config.toml"*) printf '%s\n' '[auto_merge]' 'arm_requires_head_approval = true' 'reviewer_identities = ["shipyard-review[bot]"]'; exit 0 ;;
   *"repos/owner/repo/pulls/42/reviews"*) cat '{}'; exit 0 ;;
@@ -586,6 +588,7 @@ fn interrupted_gh(temp: &tempfile::TempDir, annotations: &Path) -> GitHubActions
         &format!(
             r#"
 case "$*" in
+  *"BASE_REF_CHANGED_EVENT"*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"baseRefName":"main","timelineItems":{{"filteredCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
   *timelineItems*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":42,"state":"OPEN","headRefOid":"{HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":{{"enabledAt":"2026-10-09T08:00:00Z"}},"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[{{"__typename":"PullRequestCommit","commit":{{"oid":"{HEAD}","checkSuites":{{"nodes":[{{"createdAt":"2026-10-09T07:00:00Z"}}]}}}}}},{{"__typename":"AutoMergeEnabledEvent","createdAt":"2026-10-09T08:00:00Z","actor":{{"login":"shipyard-local"}}}}]}}}}}}}}}}' ;;
   *issues/42/comments*) printf '%s' '[]' ;;
   *"actions/runs?head_sha={HEAD}&per_page=100"*) printf '%s' '{{"total_count":1,"workflow_runs":[{{"id":100,"path":".github/workflows/build.yml","name":"Build","event":"pull_request","head_sha":"{HEAD}","status":"completed","conclusion":"cancelled","run_attempt":1,"run_started_at":"2026-10-09T08:02:00Z"}}]}}' ;;
