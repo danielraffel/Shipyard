@@ -116,3 +116,71 @@ fn a_remote_that_is_not_github_is_named_as_not_checked() {
         Ok("Generous-Corp/vellum")
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_claim_record_stays_in_the_worktree_that_wrote_it() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let main = temp.path().join("main");
+    let lane = temp.path().join("lane");
+    std::fs::create_dir_all(&main).expect("main");
+    let git = |dir: &Path, args: &[&str]| {
+        let status = git_here(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            &lane.to_string_lossy(),
+            "-b",
+            "lane",
+        ],
+    );
+    let record = |pr: u64| ClaimRecord {
+        repo: "generous-corp/vellum".to_owned(),
+        pr,
+        owner: "lane-a".to_owned(),
+        until: "2026-11-27T22:00:00Z".to_owned(),
+        comment_id: 10,
+    };
+    write_record(&lane, &record(462)).expect("write");
+    assert_eq!(read_records(&lane), vec![record(462)]);
+    assert!(
+        read_records(&main).is_empty(),
+        "leaked into the main worktree"
+    );
+
+    write_record(&main, &record(463)).expect("write");
+    assert_eq!(read_records(&main), vec![record(463)]);
+    assert_eq!(
+        read_records(&lane),
+        vec![record(462)],
+        "leaked into the lane"
+    );
+
+    // A record in the clone's shared config is not this worktree's.
+    git(
+        &main,
+        &[
+            "config",
+            "--local",
+            &ClaimRecord::key("generous-corp/vellum", 464),
+            &record(464).value(),
+        ],
+    );
+    assert_eq!(read_records(&lane), vec![record(462)]);
+    assert_eq!(read_records(&main), vec![record(463)]);
+
+    remove_record(&lane, "Generous-Corp/vellum", 462).expect("remove");
+    assert!(read_records(&lane).is_empty());
+    assert_eq!(read_records(&main), vec![record(463)]);
+}

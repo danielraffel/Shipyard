@@ -53,6 +53,73 @@ pub(crate) struct FenceEnv {
     pub(crate) owner: Option<String>,
     /// `SHIPYARD_CLAIM_FENCE=on`.
     pub(crate) enabled: bool,
+    /// The claims `shipyard claim post` recorded in this worktree's own git
+    /// config. Each exempts exactly one claim comment.
+    pub(crate) records: Vec<ClaimRecord>,
+}
+
+/// The longest claim `shipyard claim post` writes.
+pub(crate) const MAX_POST_HOURS: i64 = 24;
+
+/// What `shipyard claim post` remembers about the claim it posted, in the
+/// worktree-scoped git config entry [`ClaimRecord::key`]:
+/// `<owner> <until> <comment-id>`.
+///
+/// It names one comment, so it matches one claim: the one this worktree's
+/// session posted. Another session that claims under the same owner name
+/// posts another comment, which the record does not match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClaimRecord {
+    /// `OWNER/REPO`, lowercase.
+    pub(crate) repo: String,
+    pub(crate) pr: u64,
+    pub(crate) owner: String,
+    pub(crate) until: String,
+    pub(crate) comment_id: u64,
+}
+
+/// The config name prefix every record shares; `--get-regexp` reads them.
+pub(crate) const RECORD_KEY_PATTERN: &str = r"^shipyard\.claim\..*\.record$";
+
+impl ClaimRecord {
+    /// `shipyard.claim.<owner>/<repo>#<pr>.record`. Git splits a name at its
+    /// first and last dot, so the subsection is `claim.<owner>/<repo>#<pr>`
+    /// and a repository name with dots still reads back. Subsections are
+    /// case-sensitive, so the slug is lowercase.
+    pub(crate) fn key(repo: &str, pr: u64) -> String {
+        format!("shipyard.claim.{}#{pr}.record", repo.to_ascii_lowercase())
+    }
+
+    pub(crate) fn value(&self) -> String {
+        format!("{} {} {}", self.owner, self.until, self.comment_id)
+    }
+
+    /// Read one `<key> <value>` line of `git config --get-regexp` output.
+    pub(crate) fn parse(line: &str) -> Option<Self> {
+        let (key, value) = line.trim().split_once(char::is_whitespace)?;
+        let slug = key
+            .strip_prefix("shipyard.claim.")?
+            .strip_suffix(".record")?;
+        let (repo, pr) = slug.rsplit_once('#')?;
+        let mut fields = value.split_whitespace();
+        let record = Self {
+            repo: repo.to_ascii_lowercase(),
+            pr: pr.parse().ok()?,
+            owner: fields.next()?.to_owned(),
+            until: fields.next()?.to_owned(),
+            comment_id: fields.next()?.parse().ok()?,
+        };
+        fields.next().is_none().then_some(record)
+    }
+
+    /// Whether this record names `claim` on `repo#pr`: the same pull
+    /// request, owner and comment.
+    fn names(&self, repo: &str, pr: u64, claim: &HeldClaim) -> bool {
+        self.repo == repo.to_ascii_lowercase()
+            && self.pr == pr
+            && self.owner == claim.owner
+            && self.comment_id == claim.comment_id
+    }
 }
 
 impl FenceEnv {
@@ -61,7 +128,11 @@ impl FenceEnv {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
         let enabled = env(SWITCH_ENV).is_some_and(|value| value.trim().eq_ignore_ascii_case("on"));
-        Self { owner, enabled }
+        Self {
+            owner,
+            enabled,
+            records: Vec::new(),
+        }
     }
 }
 
@@ -150,9 +221,30 @@ fn judge(
                     ),
                 });
             }
-            let foreign = held.iter().find(|claim| {
-                claim.live_at(io.now, Some(lifetime))
-                    && env.owner.as_deref() != Some(claim.owner.as_str())
+            let live: Vec<&HeldClaim> = held
+                .iter()
+                .filter(|claim| claim.live_at(io.now, Some(lifetime)))
+                .collect();
+            for record in env
+                .records
+                .iter()
+                .filter(|record| record.repo == repo.to_ascii_lowercase() && record.pr == pr)
+            {
+                if !live.iter().any(|claim| record.names(repo, pr, claim)) {
+                    notes.push(format!(
+                        "claim-fence: this worktree's claim record for {repo}#{pr} names comment {} by {}, \
+                         which is not a live claim (expired, released, taken, or claimed again); it counts \
+                         for nothing. `shipyard claim release --repo {repo} --pr {pr}` removes it.",
+                        record.comment_id, record.owner
+                    ));
+                }
+            }
+            let foreign = live.iter().find(|claim| {
+                env.owner.as_deref() != Some(claim.owner.as_str())
+                    && !env
+                        .records
+                        .iter()
+                        .any(|record| record.names(repo, pr, claim))
             });
             if let Some(claim) = foreign {
                 return Fence::Refuse(refusal(repo, branch, pr, claim));
@@ -376,6 +468,160 @@ pub(crate) fn take(
         .and_then(Value::as_str)
         .unwrap_or("(no url)");
     Ok(format!("{take_line}\nposted: {url}"))
+}
+
+/// An owner id both claim checkers read the same way: Pulp's
+/// `prepush_claim_check.py` reads `[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?`, a
+/// narrower grammar than this crate's, so a posted claim keeps to it.
+pub(crate) fn claim_owner_ok(owner: &str) -> bool {
+    let part = |text: &str| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    };
+    owner.len() <= 64
+        && match owner.split_once('/') {
+            Some((left, right)) => part(left) && part(right),
+            None => part(owner),
+        }
+}
+
+/// `--until`: a time this crate's claim grammar reads, or a duration from
+/// `now` (`90m`, `2h`, `1h30m`), at most [`MAX_POST_HOURS`] ahead.
+pub(crate) fn parse_until(text: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    let text = text.trim();
+    let duration = {
+        let (hours, rest) = match text.split_once('h') {
+            Some((hours, rest)) => (hours.parse::<i64>().ok(), rest),
+            None => (Some(0), text),
+        };
+        let minutes = match rest.strip_suffix('m') {
+            Some(minutes) => minutes.parse::<i64>().ok(),
+            None if rest.is_empty() => Some(0),
+            None => None,
+        };
+        match (hours, minutes) {
+            (Some(hours), Some(minutes)) if !text.is_empty() && !text.starts_with('m') => {
+                Some(chrono::Duration::minutes(hours * 60 + minutes))
+            }
+            _ => None,
+        }
+    };
+    let until = match duration {
+        Some(duration) => now + duration,
+        None => crate::work_claim::claim_expiry(text).ok_or_else(|| {
+            format!("--until {text:?} is neither a UTC time (2026-11-27T22:00Z) nor a duration (90m, 2h, 1h30m)")
+        })?,
+    };
+    if until <= now {
+        return Err(format!("--until {text:?} is not in the future"));
+    }
+    if until > now + chrono::Duration::hours(MAX_POST_HOURS) {
+        return Err(format!(
+            "--until {text:?} is more than {MAX_POST_HOURS}h away; claim less and post again"
+        ));
+    }
+    Ok(until)
+}
+
+/// The claim time in the one spelling both checkers read:
+/// `YYYY-MM-DDTHH:MM:SSZ`, never `+00:00` (Pulp reads that as unreadable,
+/// which it counts as live for ever).
+pub(crate) fn claim_time(until: DateTime<Utc>) -> String {
+    until.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Post `body` as a comment on `repo#pr` through `write` and check that the
+/// posted body carries `line` (a guard may stamp the comment). Returns the
+/// comment's id and URL.
+fn post_line(
+    write: Write<'_>,
+    repo: &str,
+    pr: u64,
+    line: &str,
+) -> Result<(u64, String), TakeError> {
+    let response = write(
+        repo,
+        &[
+            "api".to_owned(),
+            format!("repos/{repo}/issues/{pr}/comments"),
+            "--raw-field".to_owned(),
+            format!("body={line}"),
+        ],
+    )
+    .map_err(|error| TakeError(format!("posting failed: {error}")))?;
+    let posted: Value = serde_json::from_str(response.trim())
+        .map_err(|error| TakeError(format!("the comment's response was unreadable: {error}")))?;
+    let body = posted.get("body").and_then(Value::as_str).unwrap_or("");
+    if !body.lines().any(|posted_line| posted_line.trim() == line) {
+        return Err(TakeError(format!(
+            "the posted comment does not carry `{line}`; check the pull request"
+        )));
+    }
+    let id = posted
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| TakeError("the posted comment has no id".to_owned()))?;
+    let url = posted
+        .get("html_url")
+        .and_then(Value::as_str)
+        .unwrap_or("(no url)")
+        .to_owned();
+    Ok((id, url))
+}
+
+/// Post `repair-claim: <owner> until <time>` on `repo#pr` and return the
+/// record that names it. Refused while another owner holds a live claim
+/// there: that is what `shipyard claim take` is for.
+pub(crate) fn post(
+    io: &FenceIo<'_>,
+    write: Write<'_>,
+    repo: &str,
+    pr: u64,
+    owner: &str,
+    until: DateTime<Utc>,
+) -> Result<(ClaimRecord, String), TakeError> {
+    if !claim_owner_ok(owner) {
+        return Err(TakeError(
+            "--owner must be `name` or `name/tag` of letters, digits and ._-, at most 64 bytes"
+                .to_owned(),
+        ));
+    }
+    let comments = read_comments(io, repo, pr).map_err(TakeError)?;
+    let lifetime = chrono::Duration::hours(UNREADABLE_TIME_LIFETIME_HOURS);
+    if let Some(other) = held_claims_in_records(&comments)
+        .into_iter()
+        .find(|claim| claim.live_at(io.now, Some(lifetime)) && claim.owner != owner)
+    {
+        return Err(TakeError(format!(
+            "{owner} cannot claim {repo}#{pr}: {} holds it until {} (comment {}). \
+             To take it over, run `shipyard claim take --repo {repo} --pr {pr} --from {} --reason \"...\"`.",
+            other.owner, other.until, other.comment_id, other.owner
+        )));
+    }
+    let until = claim_time(until);
+    let line = format!("repair-claim: {owner} until {until}");
+    let (comment_id, url) = post_line(write, repo, pr, &line)?;
+    let record = ClaimRecord {
+        repo: repo.to_ascii_lowercase(),
+        pr,
+        owner: owner.to_owned(),
+        until,
+        comment_id,
+    };
+    Ok((record, format!("{line}\nposted: {url}")))
+}
+
+/// Post `repair-claim-released: <owner>` for the claim `record` names.
+pub(crate) fn release(
+    write: Write<'_>,
+    repo: &str,
+    record: &ClaimRecord,
+) -> Result<String, TakeError> {
+    let line = format!("repair-claim-released: {}", record.owner);
+    let (_, url) = post_line(write, repo, record.pr, &line)?;
+    Ok(format!("{line}\nposted: {url}"))
 }
 
 #[cfg(test)]

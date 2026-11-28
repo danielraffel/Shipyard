@@ -80,8 +80,9 @@ It does not cover:
 - a branch checked out from before the hook gained the fence line (the hook
   runs from the worktree's own checkout);
 - a clone where `core.hooksPath` was never set (git's default `.git/hooks` has
-  no such hook), or where a worktree-specific config (`extensions.worktreeConfig`)
-  overrides it;
+  no such hook), or where a worktree's own `config.worktree` sets a different
+  `core.hooksPath` (`shipyard claim post` turns on `extensions.worktreeConfig`
+  but writes only its claim record there);
 - `git push --no-verify`.
 
 Check a worktree with `git config core.hooksPath` (expect `.githooks`) and
@@ -139,8 +140,65 @@ releases and takes.
 
 ## Who you are
 
+A session proves a claim is its own in one of two ways.
+
+### Post the claim with `shipyard claim post` (any session)
+
+```sh
+shipyard claim post --pr 462 --owner lane-a --until 2h      # or --until 2026-11-27T22:00Z
+# ... repair, then push as usual; the fence counts that claim as yours
+shipyard claim release --pr 462
+```
+
+`post` posts `repair-claim: <owner> until <YYYY-MM-DDTHH:MM:SSZ>` through
+`ghapp`, checks the posted body, and writes one record to this worktree's own
+git config (`config.worktree`, turning on `extensions.worktreeConfig` if it is
+off):
+
+```text
+shipyard.claim.<owner>/<repo>#<pr>.record = <owner> <until> <comment-id>
+```
+
+The slug is lowercase. Git splits a config name at its first and last dot, so
+the trailing `.record` is what makes it a valid name; a repository name with
+dots still reads back.
+
+`post` refuses while another owner holds a live claim on the pull request
+(take it instead), refuses an `--until` in the past or more than 24h away, and
+takes `--owner` only as `name` or `name/tag` of letters, digits and `._-`, the
+grammar Pulp's `prepush_claim_check.py` reads. The time is always written with
+seconds and a `Z`, which both checkers read; Pulp reads `+00:00` as an
+unreadable time, which it counts as live for ever. Posting again under the
+same owner renews the claim and replaces the record.
+
+The fence counts a claim as yours only when all of these hold:
+
+- the record is in this worktree's own `config.worktree` (a record in the
+  clone's shared `.git/config`, a global config or a `-c` does not count, so
+  one worktree's claim never covers another worktree of the same clone);
+- it names this exact repository and pull request, and the pull request is the
+  open one whose head is the pushed branch;
+- a trusted comment with that id holds a live claim by that owner: not
+  expired, not released, not taken since. A later claim under the same owner
+  name is another comment, so it does not match.
+
+Every other live claim on the pull request still refuses the push. A record
+that matches no live claim prints a note naming it and counts for nothing.
+
+`release` posts `repair-claim-released: <owner>` for the owner the record
+names and removes the record.
+
+This is a coordination fence, not a trust boundary. The same user could write
+the record by hand, as they could set `SHIPYARD_CLAIM_OWNER`; the record is
+no weaker than that variable, and it is state the claim command produces, not
+an override.
+
+### Name the owner with `SHIPYARD_CLAIM_OWNER` (the fleet runner)
+
 `SHIPYARD_CLAIM_OWNER` is the owner name you claimed with. A live claim by that
-name does not block you; when it is unset, every live claim does.
+name does not block you; when it is unset and no record matches, every live
+claim does. The fleet runner exports it; other sessions post their claim
+instead.
 
 The owner is not inferred from the session: no environment variable carries an
 agent's team name or cmux tab title (cmux exports only UUIDs, and its title

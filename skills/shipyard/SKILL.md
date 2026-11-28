@@ -851,7 +851,13 @@ only, agents never set it, same rule as `GHAPP_ALLOW_*`), `shipyard pr`/`ship`
 and any pre-push hook that runs `shipyard claim check-push "$1" "$2"`
 (Shipyard's own does) refuse a push when an open pull request for the branch
 has another owner's live `repair-claim: <owner> [(<note>)] until <time>`.
-`SHIPYARD_CLAIM_OWNER` names your own claims. On a refusal, take the claim:
+To claim a pull request for this session, run `shipyard claim post --pr <n>
+--owner <id> --until 2h` (posts `repair-claim: <id> until <T>` and records that
+comment in this worktree's own git config); the fence then counts that one
+claim as yours in this worktree, and `shipyard claim release --pr <n>` ends it.
+A record for another comment, pull request or worktree, or for an expired,
+released or taken claim, counts for nothing. The fleet runner's
+`SHIPYARD_CLAIM_OWNER` still names its own claims. On a refusal, take the claim:
 `shipyard claim take --from <owner> --reason "..."`, with the owner exactly as
 written; it posts `repair-claim-taken: <you> from <owner> reason=...`.
 `repair-claim-released: <owner>` ends a claim (a bare one ends all). An
