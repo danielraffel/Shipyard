@@ -7,6 +7,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 
+/// Conservative defaults: four model runs an hour, two a day per pull request.
+const DEFAULT_MAX_ATTEMPTS_PER_HOUR: u64 = 4;
+const MAX_ATTEMPTS_PER_HOUR_LIMIT: u64 = 60;
+const DEFAULT_MAX_ATTEMPTS_PER_PR_PER_DAY: u64 = 2;
+const MAX_ATTEMPTS_PER_PR_PER_DAY_LIMIT: u64 = 24;
+
 const POLICY_FIELDS: &[&str] = &[
     "enabled",
     "provider",
@@ -16,6 +22,8 @@ const POLICY_FIELDS: &[&str] = &[
     "codex_home",
     "timeout_seconds",
     "max_attempts_per_head",
+    "max_attempts_per_hour",
+    "max_attempts_per_pr_per_day",
     "max_log_tail_bytes",
     "allowed_repositories",
     "repo_paths",
@@ -31,6 +39,14 @@ pub(super) struct RecoveryWorkerPolicy {
     pub(super) codex_home: PathBuf,
     pub(super) timeout_seconds: u64,
     pub(super) max_attempts_per_head: u32,
+    /// Model attempts across all repositories in any rolling hour. An
+    /// operator throttle, not request identity, so it stays out of the
+    /// policy signature.
+    #[serde(skip)]
+    pub(super) max_attempts_per_hour: u32,
+    /// Model attempts on one pull request (any head) in a rolling day.
+    #[serde(skip)]
+    pub(super) max_attempts_per_pr_per_day: u32,
     pub(super) max_log_tail_bytes: usize,
     pub(super) allowed_repositories: BTreeSet<String>,
     pub(super) repo_paths: BTreeMap<String, PathBuf>,
@@ -126,6 +142,20 @@ impl RecoveryWorkerPolicy {
         let max_attempts_per_head =
             u32::try_from(positive_u64_field(section, "max_attempts_per_head", 1, 1)?)
                 .map_err(|_| CliFailure::new(1, "max_attempts_per_head does not fit u32"))?;
+        let max_attempts_per_hour = u32::try_from(positive_u64_field(
+            section,
+            "max_attempts_per_hour",
+            DEFAULT_MAX_ATTEMPTS_PER_HOUR,
+            MAX_ATTEMPTS_PER_HOUR_LIMIT,
+        )?)
+        .map_err(|_| CliFailure::new(1, "max_attempts_per_hour does not fit u32"))?;
+        let max_attempts_per_pr_per_day = u32::try_from(positive_u64_field(
+            section,
+            "max_attempts_per_pr_per_day",
+            DEFAULT_MAX_ATTEMPTS_PER_PR_PER_DAY,
+            MAX_ATTEMPTS_PER_PR_PER_DAY_LIMIT,
+        )?)
+        .map_err(|_| CliFailure::new(1, "max_attempts_per_pr_per_day does not fit u32"))?;
         let max_log_tail_bytes = usize::try_from(positive_u64_field(
             section,
             "max_log_tail_bytes",
@@ -157,6 +187,8 @@ impl RecoveryWorkerPolicy {
             codex_home,
             timeout_seconds,
             max_attempts_per_head,
+            max_attempts_per_hour,
+            max_attempts_per_pr_per_day,
             max_log_tail_bytes,
             allowed_repositories,
             repo_paths,
