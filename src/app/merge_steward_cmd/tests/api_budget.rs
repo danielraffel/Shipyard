@@ -427,3 +427,198 @@ fn a_pass_with_publication_off_neither_prunes_nor_reports() {
     assert_eq!(record_status(&store, &gone), Pending);
     assert!(report.recovery_store.is_none());
 }
+
+/// One applying pass over a failing pull request whose recovery is already
+/// signalled, with recovery publication on. `worker_ran` writes the worker's
+/// last-run marker into the state directory first. Returns the failing row's
+/// recovery outcome.
+fn recovery_outcome(worker_ran: bool) -> Option<String> {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fixture_gh(&temp, &log);
+    let mut observation = observation_for(fixture_pr(ADMISSIBLE, false), true);
+    observation.prs.push(fixture_pr(100, true));
+    let control = mutation_control(&temp, "studio", "studio");
+    if worker_ran {
+        crate::recovery_worker::RecoveryStore::new(
+            control.state_dir.join("merge-steward").join("recovery"),
+        )
+        .expect("store")
+        .record_worker_run(Utc::now())
+        .expect("marker");
+    }
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let report = with_recovery_publication(true, || {
+        apply_repo_plan(
+            &actions,
+            &apply_args(),
+            &observation,
+            &ledger_path,
+            &mut ledger,
+            0,
+            Some(&control),
+            None,
+        )
+        .0
+    });
+    report
+        .prs
+        .iter()
+        .find(|pr| pr.number == 100)
+        .and_then(|pr| pr.mutation.clone())
+}
+
+#[test]
+fn the_steward_stops_accepting_requests_while_no_worker_has_run() {
+    assert_eq!(
+        recovery_outcome(false).as_deref(),
+        Some("recovery_request_deferred:no_consumer")
+    );
+    // The control: with a fresh worker run the gate is open, so the request
+    // goes on to the store (and fails there for the test's non-canonical
+    // paths), never reporting a missing consumer.
+    assert_ne!(
+        recovery_outcome(true).as_deref(),
+        Some("recovery_request_deferred:no_consumer")
+    );
+}
+
+#[test]
+fn consumer_facts_read_the_store_without_creating_it() {
+    let temp = tempfile::tempdir().expect("temp");
+    let control = mutation_control(&temp, "studio", "studio");
+    let root = control.state_dir.join("merge-steward").join("recovery");
+    let facts = |enabled| {
+        with_recovery_publication(enabled, || {
+            crate::app::merge_steward_cmd::recovery_worker::recovery_consumer_facts(
+                Some(&control),
+                "owner/repo",
+            )
+        })
+    };
+    assert!(facts(false).is_none());
+    let empty = facts(true).expect("facts when enabled");
+    assert!(empty.oldest_unattempted.is_none() && empty.last_worker_run.is_none());
+    assert!(!root.exists());
+
+    let store = crate::recovery_worker::RecoveryStore::new(&root).expect("store");
+    let ran = Utc::now();
+    store.record_worker_run(ran).expect("marker");
+    assert_eq!(facts(true).expect("facts").last_worker_run, Some(ran));
+
+    // One unreadable record makes the backlog unknown; the marker still reads.
+    store
+        .enqueue(recovery_request_for(100))
+        .expect("seed a record");
+    fs::write(root.join(format!("{}.json", "0".repeat(64))), b"not-json").expect("corrupt");
+    let unreadable = facts(true).expect("facts survive an unreadable record");
+    assert!(unreadable.backlog_unknown);
+    assert_eq!(unreadable.last_worker_run, Some(ran));
+}
+
+#[test]
+fn a_gated_pass_makes_no_live_read_of_the_failing_pull_request() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fixture_gh(&temp, &log);
+    let mut observation = observation_for(fixture_pr(ADMISSIBLE, false), true);
+    observation.prs.push(fixture_pr(100, true));
+    let control = mutation_control(&temp, "studio", "studio");
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let mut pass = || {
+        let before = fs::read_to_string(&log).unwrap_or_default().lines().count();
+        let report = with_recovery_publication(true, || {
+            apply_repo_plan(
+                &actions,
+                &apply_args(),
+                &observation,
+                &ledger_path,
+                &mut ledger,
+                0,
+                Some(&control),
+                None,
+            )
+            .0
+        });
+        let calls = fs::read_to_string(&log).unwrap_or_default();
+        let naming = calls
+            .lines()
+            .skip(before)
+            .filter(|line| line.contains(" 100 ") || line.ends_with(" 100"))
+            .count();
+        let outcome = report
+            .prs
+            .iter()
+            .find(|pr| pr.number == 100)
+            .and_then(|pr| pr.mutation.clone());
+        (naming, outcome)
+    };
+    let (first_calls, first) = pass();
+    let (second_calls, second) = pass();
+    // The control: the first pass pays the live revalidation, so the count
+    // does measure the read the second pass must skip.
+    assert!(first_calls >= 1, "first pass read PR 100 live");
+    assert_eq!(
+        first.as_deref(),
+        Some("recovery_request_deferred:no_consumer")
+    );
+    assert_eq!(second_calls, 0, "second pass revalidated PR 100 live");
+    assert_eq!(
+        second.as_deref(),
+        Some("recovery_request_deferred:no_consumer")
+    );
+}
+
+#[test]
+fn the_steward_pass_evaluates_the_recovery_consumer_invariant() {
+    let temp = tempfile::tempdir().expect("temp");
+    let calls = temp.path().join("calls");
+    let actions = fake_gh(
+        &temp,
+        &format!(
+            r#"
+printf '%s
+' "$*" >> '{}'
+case "$*" in
+  "api repos/owner/repo") printf '%s' '{{"full_name":"owner/repo","allow_auto_merge":true}}' ;;
+  *"rules/branches/main --paginate --slurp"*) printf '%s' '[[]]' ;;
+  *"branches/main/protection/required_status_checks"*) printf '%s' '{{"contexts":[],"checks":[]}}' ;;
+  "api graphql "*) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  "pr list "*) printf '%s' '[]' ;;
+  *"actions/runs?status="*) printf '%s' '{{"workflow_runs":[]}}' ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#,
+            calls.display()
+        ),
+    )
+    .with_repo_override("owner/repo");
+    let control = mutation_control(&temp, "studio", "studio");
+    let mut args = apply_args();
+    args.invariants = Some(crate::app::merge_steward_cmd::invariants::Settings::default());
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let mut remaining = 0;
+    let (report, _) = with_recovery_publication(true, || {
+        steward_repo_observed(
+            &actions,
+            &args,
+            "owner/repo",
+            &ledger_path,
+            &mut ledger,
+            &mut remaining,
+            Some(&control),
+            &control.global_dir,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+        )
+    });
+    let consumer = report
+        .invariants
+        .iter()
+        .find(|invariant| invariant.id == "recovery_consumer")
+        .unwrap_or_else(|| panic!("no recovery_consumer in {:?}", report.invariants));
+    assert!(consumer.incident(), "{consumer:?}");
+}

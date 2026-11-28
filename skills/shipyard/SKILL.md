@@ -3923,7 +3923,10 @@ the same run no longer blocks it; see
 [references/merge-steward.md](references/merge-steward.md#infra-reruns---infra-rerun-every-open-pull-request).
 Every pass also reports tick-start invariants in `repos[].invariants`
 (`{id, ok, detail, fix}`: `required_context_producer`,
-`approval_admission_config`, `required_never_ran`, `reviewer_verdicts_counted`);
+`approval_admission_config`, `required_never_ran`, `reviewer_verdicts_counted`, and
+`recovery_consumer` when recovery publication is on: it fails whenever no `shipyard runner
+recovery-worker --apply` ran in the last 3 hours (whatever the backlog), and while that holds the steward defers new requests as
+`recovery_request_deferred:no_consumer`);
 they only read and report, and `--no-invariants` turns them off. `shipyard runner
 steward-invariants --fleet-repos F --clones D [--heal]` checks, once per tick,
 that every fleet repository has a steward config clone, and with `--heal` clones a
@@ -4183,6 +4186,12 @@ fail-closed `codex exec` read-only/ephemeral argv, defaults to
 and runs from scratch with an empty, minimal allow-listed environment.
 Alternate runtime modes and global/state path overrides are rejected so the
 policy and one-attempt ledger cannot split.
+The worker also defers a request, leaving it pending with no attempt spent, when
+`max_attempts_per_hour` (default 4) or `max_attempts_per_pr_per_day` (default 2) is
+spent (`deferred_attempt_cap`) or another request holds an active claim on the same
+pull request (`skipped_active_claim`); a closed, merged, draft, retargeted or moved
+pull request is superseded, and a failed live read defers. A missing attempt ledger
+resets the caps; a corrupt one defers.
 Outputs are strict JSON and remain advisory. Phase 1 rejects repair and
 `no_change` verdicts, evidence, paths, and test suggestions; every accepted
 result explicitly escalates, with classification used only for routing. A
