@@ -304,3 +304,58 @@ fn recording_a_claim_keeps_a_shared_core_worktree_on_the_main_worktree_only() {
     assert_eq!(top(&lane), lane_top, "the lane's top level moved");
     assert_eq!(top(&main), main_top, "the main worktree's top level moved");
 }
+
+#[test]
+#[cfg(unix)]
+fn recording_a_claim_keeps_a_relative_core_worktree_working() {
+    // A submodule's layout: the git dir lives under the superproject's
+    // `.git/modules/<name>` and names its work tree (here at `vendor/sub`,
+    // a path other than its name) with a relative path.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let main = temp.path().join("super").join("vendor").join("sub");
+    let gitdir = temp
+        .path()
+        .join("super")
+        .join(".git")
+        .join("modules")
+        .join("sub");
+    let lane = temp.path().join("lane");
+    std::fs::create_dir_all(&main).expect("main");
+    std::fs::create_dir_all(gitdir.parent().expect("modules")).expect("modules");
+    git_must(
+        &main,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            &gitdir.to_string_lossy(),
+        ],
+    );
+    git_must(&main, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    git_must(&main, &["config", "core.worktree", "../../../vendor/sub"]);
+    git_must(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            &lane.to_string_lossy(),
+            "-b",
+            "lane",
+        ],
+    );
+    let top = |dir: &Path| {
+        std::fs::canonicalize(git_must(dir, &["rev-parse", "--show-toplevel"])).expect("top")
+    };
+    let lane_top = top(&lane);
+    let main_top = top(&main);
+
+    write_record(&lane, &a_record(462)).expect("write");
+    assert_eq!(read_records(&lane), vec![a_record(462)]);
+    git_must(&lane, &["status", "--short"]);
+    git_must(&main, &["status", "--short"]);
+    assert_eq!(top(&lane), lane_top, "the lane's top level moved");
+    assert_eq!(top(&main), main_top, "the main worktree's top level moved");
+}

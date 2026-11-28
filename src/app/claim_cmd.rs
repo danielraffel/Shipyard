@@ -355,13 +355,17 @@ fn write_record(cwd: &Path, record: &ClaimRecord) -> Result<(), String> {
 fn enable_worktree_config(cwd: &Path) -> Result<(), String> {
     let common =
         git_ok(git_here(cwd).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]))?;
+    // Every `--file` edit runs from the common git dir: run from a linked
+    // worktree, git would resolve a relative `core.worktree` against that
+    // worktree once the extension is on, and die before the edit.
+    let common_dir = Path::new(&common);
     let shared = Path::new(&common).join("config");
     let main_worktree = Path::new(&common).join("config.worktree");
     let shared_arg = shared.to_string_lossy().into_owned();
     let main_arg = main_worktree.to_string_lossy().into_owned();
     let read = |args: &[&str]| -> Option<String> {
         git_ok(
-            git_here(cwd)
+            git_here(common_dir)
                 .args(["config", "--file", &shared_arg])
                 .args(args),
         )
@@ -371,12 +375,18 @@ fn enable_worktree_config(cwd: &Path) -> Result<(), String> {
     let bare = read(&["--type=bool", "core.bare"]).is_some_and(|value| value == "true");
     let worktree = read(&["core.worktree"]);
     if bare {
-        git_ok(git_here(cwd).args(["config", "--file", &main_arg, "core.bare", "true"]))?;
+        git_ok(git_here(common_dir).args(["config", "--file", &main_arg, "core.bare", "true"]))?;
     }
     if let Some(worktree) = &worktree {
-        git_ok(git_here(cwd).args(["config", "--file", &main_arg, "core.worktree", worktree]))?;
+        git_ok(git_here(common_dir).args([
+            "config",
+            "--file",
+            &main_arg,
+            "core.worktree",
+            worktree,
+        ]))?;
     }
-    git_ok(git_here(cwd).args([
+    git_ok(git_here(common_dir).args([
         "config",
         "--file",
         &shared_arg,
@@ -384,10 +394,22 @@ fn enable_worktree_config(cwd: &Path) -> Result<(), String> {
         "true",
     ]))?;
     if bare {
-        git_ok(git_here(cwd).args(["config", "--file", &shared_arg, "--unset", "core.bare"]))?;
+        git_ok(git_here(common_dir).args([
+            "config",
+            "--file",
+            &shared_arg,
+            "--unset",
+            "core.bare",
+        ]))?;
     }
     if worktree.is_some() {
-        git_ok(git_here(cwd).args(["config", "--file", &shared_arg, "--unset", "core.worktree"]))?;
+        git_ok(git_here(common_dir).args([
+            "config",
+            "--file",
+            &shared_arg,
+            "--unset",
+            "core.worktree",
+        ]))?;
     }
     Ok(())
 }
