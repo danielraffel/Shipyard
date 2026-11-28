@@ -922,6 +922,9 @@ mod claim;
 mod enqueue;
 #[path = "recovery_worker/output.rs"]
 mod output;
+#[path = "recovery_worker/prune.rs"]
+mod prune;
+pub use prune::{MAX_PENDING_AGE_DAYS, PruneOutcome};
 #[path = "recovery_worker/pending.rs"]
 mod pending;
 #[path = "recovery_worker/store_lock.rs"]

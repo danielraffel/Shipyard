@@ -66,3 +66,5 @@ mod identity;
 mod output;
 #[path = "tests/pending.rs"]
 mod pending;
+#[path = "tests/prune.rs"]
+mod prune;
