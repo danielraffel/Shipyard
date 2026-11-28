@@ -985,6 +985,9 @@ fn the_attempt_caps_defer_a_request_without_spending_its_attempt() {
         .get(&record.request.id)
         .expect("get")
         .expect("record");
+    // The control run above already deferred the request once, so a later
+    // deferral timestamp is what shows the cap deferred it again.
+    let deferred_before = record.receipt.deferred_at.expect("control deferral");
     let report = fixture
         .process(&record)
         .expect("capped request is deferred");
@@ -997,7 +1000,14 @@ fn the_attempt_caps_defer_a_request_without_spending_its_attempt() {
         .expect("record");
     assert_eq!(after.receipt.status, RecoveryStatus::Pending);
     assert_eq!(after.receipt.attempt, 0);
-    assert!(after.receipt.deferred_at.is_some());
+    assert!(after.receipt.deferred_at.expect("deferred") > deferred_before);
+    assert!(
+        after
+            .receipt
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("daily"))
+    );
 }
 
 #[test]
@@ -1038,4 +1048,164 @@ fn the_policy_caps_are_conservative_and_outside_the_signature() {
         fixture.signature,
         "tuning a cap must not supersede queued requests"
     );
+}
+
+/// A worker run with a live-looking pull request: a policy on disk (so the
+/// claim-time refresh finds it) and a fake `gh` answering the live reads.
+struct LiveFixture {
+    inner: GuardFixture,
+    gh_dir: PathBuf,
+    gh: PathBuf,
+}
+
+const LIVE_HEAD: &str = GUARD_HEAD_A;
+
+impl LiveFixture {
+    fn new(gh_body: &str) -> Self {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&global).expect("global dir");
+        fs::create_dir_all(&repo).expect("repo dir");
+        fs::write(global.join("config.toml"), recovery_test_policy_toml(&repo))
+            .expect("policy on disk");
+        let config = LoadedConfig::load_machine_global_from_dir(global).expect("load config");
+        let policy = RecoveryWorkerPolicy::from_config(&config).expect("policy");
+        let signature = policy.signature().expect("signature");
+        let store = RecoveryStore::new(temp.path().join("store")).expect("store");
+        drop(
+            acquire_recovery_enqueue_lease(store.root(), recovery_lease_deadline())
+                .expect("enqueue lease fixture"),
+        );
+        let gh = temp.path().join("gh");
+        crate::test_support::write_executable_script(&gh, gh_body);
+        let gh_dir = temp.path().to_path_buf();
+        Self {
+            inner: GuardFixture {
+                temp,
+                store,
+                config,
+                policy,
+                signature,
+            },
+            gh_dir,
+            gh,
+        }
+    }
+
+    /// Run the real `process_record` with the fake `gh` installed.
+    fn process(
+        &self,
+        record: &RecoveryRecord,
+        apply: bool,
+    ) -> Result<RecoveryWorkerReport, CliFailure> {
+        record::GH_OVERRIDE
+            .with(|cell| *cell.borrow_mut() = Some((self.gh_dir.clone(), self.gh.clone())));
+        let result = process_record(ProcessRecordInputs {
+            store: &self.inner.store,
+            record,
+            apply,
+            policy: &self.inner.policy,
+            policy_signature: &self.inner.signature,
+            trusted_config: &self.inner.config,
+            model_lease: None,
+            state_dir: self.inner.temp.path(),
+            scratch_dir: &self.inner.temp.path().join("scratch"),
+        });
+        record::GH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        result
+    }
+
+    /// The attempt-ledger entries as `admit_attempt` counts them: one probe
+    /// attempt under an hour cap of `n` reveals whether `n` are spent.
+    fn ledger_entries(&self, repo: &str, pr: u64) -> u32 {
+        let mut used = 0;
+        for cap in 1..=8 {
+            let admission = self
+                .inner
+                .store
+                .admit_attempt(
+                    repo,
+                    pr,
+                    chrono::Utc::now(),
+                    AttemptCaps {
+                        per_hour: cap,
+                        per_pr_per_day: 100,
+                    },
+                    false,
+                )
+                .expect("probe");
+            if admission == crate::recovery_worker::AttemptAdmission::Admitted {
+                break;
+            }
+            used = cap;
+        }
+        used
+    }
+}
+
+/// A `gh` that answers a live, still-failing pull request at `LIVE_HEAD`.
+fn live_pull_gh() -> String {
+    format!(
+        r#"#!/bin/sh
+case "$*" in
+  "pr view "*)
+    printf '%s' '{{"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{head}","mergeStateStatus":"CLEAN","labels":[{{"name":"{managed}"}},{{"name":"{needs_agent}"}}],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-11-08T00:00:00Z"}}]}}' ;;
+  "api "*"/statuses"*)
+    printf '%s' '[{{"id":2,"context":"{recovery}","state":"failure","created_at":"2026-11-08T00:00:02Z"}},{{"id":1,"context":"{handoff}","state":"success","created_at":"2026-11-08T00:00:01Z"}}]' ;;
+  *) exit 1 ;;
+esac
+"#,
+        head = LIVE_HEAD,
+        managed = super::super::MANAGED_LABEL,
+        needs_agent = super::super::NEEDS_AGENT_LABEL,
+        recovery = super::super::RECOVERY_CONTEXT,
+        handoff = super::super::HANDOFF_CONTEXT,
+    )
+}
+
+fn live_record(fixture: &LiveFixture) -> RecoveryRecord {
+    // Reuse GuardFixture's enqueue under this fixture's policy signature.
+    fixture.inner.enqueue(42, LIVE_HEAD)
+}
+
+#[cfg(unix)]
+#[test]
+fn an_applying_run_counts_one_attempt_and_a_dry_run_counts_none() {
+    let fixture = LiveFixture::new(&live_pull_gh());
+    let record = live_record(&fixture);
+    let repo = record.request.repo.clone();
+
+    // Dry run: every live check passes and nothing is counted.
+    let report = fixture.process(&record, false).expect("dry run");
+    assert_eq!(report.action, "would_run");
+    assert_eq!(fixture.ledger_entries(&repo, 42), 0);
+
+    // Applying run: the same checks pass, one attempt is counted, and the
+    // run then stops at the missing model lease (no model is launched).
+    let _ = fixture.process(&record, true);
+    assert_eq!(fixture.ledger_entries(&repo, 42), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_live_read_defers_the_request_and_counts_no_attempt() {
+    let fixture = LiveFixture::new("#!/bin/sh\nexit 1\n");
+    let record = live_record(&fixture);
+    let repo = record.request.repo.clone();
+
+    let error = fixture
+        .process(&record, true)
+        .expect_err("a failed read must not proceed");
+    assert!(!error.message().is_empty());
+    let after = fixture
+        .inner
+        .store
+        .get(&record.request.id)
+        .expect("get")
+        .expect("record");
+    assert_eq!(after.receipt.status, RecoveryStatus::Pending);
+    assert_eq!(after.receipt.attempt, 0);
+    assert!(after.receipt.deferred_at.is_some());
+    assert_eq!(fixture.ledger_entries(&repo, 42), 0);
 }

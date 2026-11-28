@@ -453,7 +453,9 @@ when another request already holds a claim on the same pull request
 (`skipped_active_claim`), and, as before, when a live read shows the pull
 request closed, merged, draft, retargeted or on another head. A failed live
 read defers the request. The caps live in a durable `attempt-ledger` in the
-recovery store.
+recovery store. A missing ledger starts the counts at zero (deleting it resets the
+caps); a corrupt one defers every request until it is repaired. The claim fence
+is defense in depth: the machine-global model lease already serializes workers.
 
 Pulp dependency channels require an explicit tracked `[dependencies.pulp]`
 declaration; there is no floating-ref or unrelated-repository default. See

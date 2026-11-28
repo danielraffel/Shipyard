@@ -17,6 +17,12 @@ use super::{
     run_worker_process, verify_recovery_witness, worker_generation,
 };
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static GH_OVERRIDE: std::cell::RefCell<Option<(std::path::PathBuf, std::path::PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct RecordContext<'a> {
     store: RecoveryStore,
     record: &'a RecoveryRecord,
@@ -155,8 +161,7 @@ fn prepare_record(context: &RecordContext<'_>) -> Result<PreClaimOutcome, CliFai
     }
 
     let repo_path = checked_repo_path(context.startup_policy, request)?;
-    let actions = GitHubActions::from_loaded_config(repo_path, context.trusted_config)
-        .with_repo_override(&request.repo);
+    let actions = live_actions(repo_path, context.trusted_config, request);
     if let RequestDisposition::Superseded(reason) =
         inspect_request(&actions, request, context.deadline)?
     {
@@ -318,6 +323,24 @@ impl RecordContext<'_> {
             reason,
         )))
     }
+}
+
+fn live_actions(
+    repo_path: &Path,
+    config: &LoadedConfig,
+    request: &RecoveryRequest,
+) -> GitHubActions {
+    let actions =
+        GitHubActions::from_loaded_config(repo_path, config).with_repo_override(&request.repo);
+    // Tests answer the live reads with a fake `gh`, never the account's own.
+    #[cfg(test)]
+    let actions =
+        GH_OVERRIDE
+            .with(|cell| cell.borrow().clone())
+            .map_or(actions, |(dir, binary)| {
+                GitHubActions::hermetic_for_tests(&dir, binary).with_repo_override(&request.repo)
+            });
+    actions
 }
 
 fn checked_repo_path<'a>(

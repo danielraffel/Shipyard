@@ -87,3 +87,35 @@ fn a_running_request_fences_every_other_request_on_its_pull_request() {
         None
     );
 }
+
+#[test]
+fn the_fence_matches_the_pull_request_number_and_repository() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = RecoveryStore::new(temp.path()).expect("store");
+    let claimed = request(HEAD_A, "config-v1");
+    store.enqueue(claimed.clone()).expect("enqueue");
+    store
+        .begin(&claimed.id, "config-v1", "generation-a")
+        .expect("claim");
+    // Another pull request in the same repository is not fenced.
+    assert_eq!(
+        store
+            .active_claim_on_pull(&claimed.repo, claimed.pr + 1, "other-id")
+            .expect("fence"),
+        None
+    );
+    // The same number in another repository is not fenced either.
+    assert_eq!(
+        store
+            .active_claim_on_pull("Generous-Corp/forge", claimed.pr, "other-id")
+            .expect("fence"),
+        None
+    );
+    // Control: the claimed pull request itself is fenced, case-insensitively.
+    assert_eq!(
+        store
+            .active_claim_on_pull("GENEROUS-CORP/PULP", claimed.pr, "other-id")
+            .expect("fence"),
+        Some(claimed.id)
+    );
+}

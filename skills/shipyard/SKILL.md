@@ -4180,7 +4180,8 @@ The worker also defers a request, leaving it pending with no attempt spent, when
 `max_attempts_per_hour` (default 4) or `max_attempts_per_pr_per_day` (default 2) is
 spent (`deferred_attempt_cap`) or another request holds an active claim on the same
 pull request (`skipped_active_claim`); a closed, merged, draft, retargeted or moved
-pull request is superseded, and a failed live read defers.
+pull request is superseded, and a failed live read defers. A missing attempt ledger
+resets the caps; a corrupt one defers.
 Outputs are strict JSON and remain advisory. Phase 1 rejects repair and
 `no_change` verdicts, evidence, paths, and test suggestions; every accepted
 result explicitly escalates, with classification used only for routing. A
