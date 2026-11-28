@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use crate::cloud::GitHubActions;
 use crate::config::LoadedConfig;
 use crate::recovery_worker::{
-    RecoveryOutput, RecoveryRecord, RecoveryRequest, RecoveryStatus, RecoveryStore,
+    AttemptAdmission, AttemptCaps, RecoveryOutput, RecoveryRecord, RecoveryRequest, RecoveryStatus,
+    RecoveryStore,
 };
 
 use super::terminal::ClaimedRecovery;
@@ -15,6 +16,12 @@ use super::{
     acquire_recovery_enqueue_read_lease, bounded_detail, inspect_request, recovery_prompt, report,
     run_worker_process, verify_recovery_witness, worker_generation,
 };
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static GH_OVERRIDE: std::cell::RefCell<Option<(std::path::PathBuf, std::path::PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 struct RecordContext<'a> {
     store: RecoveryStore,
@@ -134,9 +141,27 @@ fn prepare_record(context: &RecordContext<'_>) -> Result<PreClaimOutcome, CliFai
     }
     drop(initial_enqueue_lease);
 
+    // The claim fence: a pull request with an active claim is never touched
+    // by a second request. Local reads only, so it runs before any GitHub read.
+    let fenced = context
+        .store
+        .active_claim_on_pull(&request.repo, request.pr, &request.id)
+        .map_err(|error| CliFailure::new(1, format!("claim fence unreadable: {error}")))?;
+    if let Some(holder) = fenced {
+        return context.deferred(
+            "skipped_active_claim",
+            &format!("PR #{} has an active claim by {holder}", request.pr),
+        );
+    }
+    // The attempt caps, checked without spending: a capped pull request burns
+    // no GitHub reads. The attempt is counted below, once every live check
+    // has passed.
+    if let Some(reason) = context.cap_reached(context.startup_policy, false)? {
+        return context.deferred("deferred_attempt_cap", &reason);
+    }
+
     let repo_path = checked_repo_path(context.startup_policy, request)?;
-    let actions = GitHubActions::from_loaded_config(repo_path, context.trusted_config)
-        .with_repo_override(&request.repo);
+    let actions = live_actions(repo_path, context.trusted_config, request);
     if let RequestDisposition::Superseded(reason) =
         inspect_request(&actions, request, context.deadline)?
     {
@@ -182,6 +207,11 @@ fn prepare_record(context: &RecordContext<'_>) -> Result<PreClaimOutcome, CliFai
         }
     };
     checked_repo_path(&snapshot.policy, request)?;
+    // Count the attempt only now that the live checks passed, so a dead or
+    // superseded request never spends the hour's budget.
+    if let Some(reason) = context.cap_reached(&snapshot.policy, true)? {
+        return context.deferred("deferred_attempt_cap", &reason);
+    }
     Ok(PreClaimOutcome::Ready(ReadyToClaim {
         policy_signature: snapshot.signature,
         config: snapshot.config,
@@ -190,6 +220,57 @@ fn prepare_record(context: &RecordContext<'_>) -> Result<PreClaimOutcome, CliFai
 }
 
 impl RecordContext<'_> {
+    /// Why the attempt caps refuse another model run, or `None`. `record`
+    /// counts an admitted attempt in the same locked step.
+    fn cap_reached(
+        &self,
+        policy: &RecoveryWorkerPolicy,
+        record: bool,
+    ) -> Result<Option<String>, CliFailure> {
+        let request = &self.record.request;
+        let admission = self
+            .store
+            .admit_attempt(
+                &request.repo,
+                request.pr,
+                chrono::Utc::now(),
+                AttemptCaps {
+                    per_hour: policy.max_attempts_per_hour,
+                    per_pr_per_day: policy.max_attempts_per_pr_per_day,
+                },
+                record && self.apply,
+            )
+            .map_err(|error| CliFailure::new(1, format!("attempt ledger unreadable: {error}")))?;
+        Ok(match admission {
+            AttemptAdmission::Admitted => None,
+            AttemptAdmission::HourCapReached { used, cap } => Some(format!(
+                "hourly recovery attempt cap reached ({used} of {cap})"
+            )),
+            AttemptAdmission::PrCapReached { used, cap } => Some(format!(
+                "PR #{} daily recovery attempt cap reached ({used} of {cap})",
+                request.pr
+            )),
+        })
+    }
+
+    /// Leave the request pending, behind untouched work, without spending an
+    /// attempt, and report why.
+    fn deferred(&self, action: &'static str, reason: &str) -> Result<PreClaimOutcome, CliFailure> {
+        let request = &self.record.request;
+        let reason = bounded_detail(reason, MAX_RECEIPT_DETAIL_BYTES);
+        if self.apply {
+            let store = self.store.clone().with_lock_deadline(
+                Instant::now() + Duration::from_secs(TERMINAL_PERSIST_TIMEOUT_SECONDS),
+            );
+            store
+                .defer_pending(&request.id, &request.config_signature, reason.clone())
+                .map_err(|error| {
+                    CliFailure::new(1, format!("failed to defer {}: {error}", request.id))
+                })?;
+        }
+        Ok(PreClaimOutcome::Report(report(request, action, reason)))
+    }
+
     fn defer_preclaim_error(&self, error: CliFailure) -> CliFailure {
         let detail = bounded_detail(
             &format!("pre-claim validation deferred: {}", error.message()),
@@ -242,6 +323,24 @@ impl RecordContext<'_> {
             reason,
         )))
     }
+}
+
+fn live_actions(
+    repo_path: &Path,
+    config: &LoadedConfig,
+    request: &RecoveryRequest,
+) -> GitHubActions {
+    let actions =
+        GitHubActions::from_loaded_config(repo_path, config).with_repo_override(&request.repo);
+    // Tests answer the live reads with a fake `gh`, never the account's own.
+    #[cfg(test)]
+    let actions =
+        GH_OVERRIDE
+            .with(|cell| cell.borrow().clone())
+            .map_or(actions, |(dir, binary)| {
+                GitHubActions::hermetic_for_tests(&dir, binary).with_repo_override(&request.repo)
+            });
+    actions
 }
 
 fn checked_repo_path<'a>(
