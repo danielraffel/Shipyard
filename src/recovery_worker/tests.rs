@@ -58,6 +58,8 @@ fn escalation_output() -> RecoveryOutput {
 mod archive;
 #[path = "tests/claim.rs"]
 mod claim;
+#[path = "tests/consumer.rs"]
+mod consumer;
 #[path = "tests/enqueue.rs"]
 mod enqueue;
 #[path = "tests/identity.rs"]
@@ -66,3 +68,5 @@ mod identity;
 mod output;
 #[path = "tests/pending.rs"]
 mod pending;
+#[path = "tests/prune.rs"]
+mod prune;

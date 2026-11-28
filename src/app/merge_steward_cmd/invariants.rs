@@ -51,6 +51,8 @@ use crate::merge_steward::RequiredCheck;
 
 /// Every required context has a producer.
 pub(crate) const PRODUCER: &str = "required_context_producer";
+/// Old recovery requests are being drained.
+pub(crate) const RECOVERY_CONSUMER: &str = "recovery_consumer";
 /// A base that needs exact-head approval can admit.
 pub(crate) const ADMISSION: &str = "approval_admission_config";
 /// No required context has gone unrun on every open head for too long.
@@ -353,18 +355,73 @@ pub(super) struct Facts<'a> {
     pub base_config: &'a Result<Option<toml::Table>, String>,
     /// The text of every workflow file on the base.
     pub workflows: &'a Result<Vec<String>, String>,
+    /// The recovery store's age and last worker run; `None` when recovery
+    /// publication is off, which leaves the invariant out.
+    pub recovery_consumer: Option<RecoveryConsumerFacts>,
     pub now: DateTime<Utc>,
 }
 
-/// The four repository invariants, in a fixed order.
+/// What `recovery_consumer` reads from the recovery store.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RecoveryConsumerFacts {
+    /// Creation time of the oldest unattempted pending request.
+    pub oldest_unattempted: Option<DateTime<Utc>>,
+    /// The backlog could not be read (a corrupt record, a lock timeout).
+    pub backlog_unknown: bool,
+    /// When a worker last ran `--apply`.
+    pub last_worker_run: Option<DateTime<Utc>>,
+}
+
+/// The repository invariants, in a fixed order (the recovery consumer last,
+/// and only when recovery publication is on).
 #[must_use]
 pub(super) fn evaluate(facts: &Facts<'_>) -> Vec<Invariant> {
-    vec![
+    let mut invariants = vec![
         producer(facts),
         admission(facts),
         never_ran(facts),
         verdicts(facts),
-    ]
+    ];
+    if let Some(consumer) = facts.recovery_consumer {
+        invariants.push(recovery_consumer(&consumer, facts.now));
+    }
+    invariants
+}
+
+/// Recovery publication is on but no worker has run recently, so the steward
+/// refuses every request. Fails whatever the backlog: a pruned or empty store
+/// is the gate working, not the consumer returning.
+fn recovery_consumer(consumer: &RecoveryConsumerFacts, now: DateTime<Utc>) -> Invariant {
+    let limit = crate::recovery_worker::WORKER_STALE_AFTER_MINUTES;
+    let backlog = if consumer.backlog_unknown {
+        "backlog unreadable".to_owned()
+    } else if let Some(oldest) = consumer.oldest_unattempted {
+        format!(
+            "oldest unattempted request {} min old",
+            (now - oldest).num_minutes()
+        )
+    } else {
+        "no unattempted request waiting".to_owned()
+    };
+    if !crate::recovery_worker::worker_is_stale(consumer.last_worker_run, now) {
+        return Invariant::holds(
+            RECOVERY_CONSUMER,
+            format!("a recovery worker ran within {limit} min; {backlog}"),
+        );
+    }
+    let last = consumer.last_worker_run.map_or_else(
+        || "never".to_owned(),
+        |at| format!("{} min ago", (now - at).num_minutes()),
+    );
+    Invariant::fails(
+        RECOVERY_CONSUMER,
+        format!(
+            "recovery publication is on but no worker has run in {limit} min (last run: \
+             {last}; {backlog}); the steward is refusing every recovery request"
+        ),
+        "schedule `shipyard runner recovery-worker --drain --apply` on an interval, or set \
+         `[merge_steward.recovery_worker] enabled = false` until the worker is rolled out",
+    )
 }
 
 fn external_producers(config: &Result<Option<toml::Table>, String>) -> BTreeSet<String> {
@@ -819,6 +876,7 @@ pub(super) fn run(
     approval_context: &str,
     state_path: &Path,
     apply: bool,
+    recovery_consumer: Option<RecoveryConsumerFacts>,
     now: DateTime<Utc>,
 ) -> Vec<Invariant> {
     let repo = observation.repo.as_str();
@@ -841,6 +899,7 @@ pub(super) fn run(
         rows,
         base_config: &base_config,
         workflows: &workflows,
+        recovery_consumer,
         now,
     };
     let mut invariants = evaluate(&facts);

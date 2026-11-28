@@ -44,6 +44,8 @@ pub(crate) struct HttpReply {
     pub(crate) status: u16,
     pub(crate) body: Vec<u8>,
     pub(crate) etag: Option<String>,
+    /// The `Link` header, which names the next page of a listing.
+    pub(crate) link: Option<String>,
     pub(crate) rate_limit: Option<RateLimitHeaders>,
 }
 
@@ -95,6 +97,14 @@ impl Transport {
     #[cfg(test)]
     pub(crate) fn https_only_for_tests(api_url: &str) -> Self {
         Self::build(api_url, true)
+    }
+
+    /// `url` as a path below the API root, when it names this API.
+    pub(crate) fn below_root(&self, url: &str) -> Option<String> {
+        url.strip_prefix(self.api_url.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_owned)
     }
 
     fn build(api_url: &str, https_only: bool) -> Self {
@@ -208,6 +218,7 @@ impl Transport {
                 .map(str::to_owned)
         };
         let etag = header("etag");
+        let link = header("link");
         let rate_limit = match (
             header("x-ratelimit-resource"),
             header("x-ratelimit-remaining").and_then(|value| value.parse().ok()),
@@ -234,6 +245,7 @@ impl Transport {
             status,
             body,
             etag,
+            link,
             rate_limit,
         })
     }

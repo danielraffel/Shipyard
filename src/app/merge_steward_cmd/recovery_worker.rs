@@ -329,6 +329,133 @@ pub(super) fn recovery_publication_is_enabled(
     Ok(true)
 }
 
+/// Proof of a consumer for the steward: an applying run opens the store and
+/// writes the marker whether or not it finds work; a dry run writes nothing.
+pub(super) fn note_worker_run(state_dir: &Path, apply: bool) -> Result<(), CliFailure> {
+    if !apply {
+        return Ok(());
+    }
+    RecoveryStore::new(recovery_store_root(state_dir))
+        .and_then(|store| store.record_worker_run(chrono::Utc::now()))
+        .map_err(|error| CliFailure::new(1, format!("failed to record worker run: {error}")))
+}
+
+#[cfg(test)]
+mod consumer_marker_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_applying_run_leaves_a_marker_the_steward_reads_as_fresh() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        note_worker_run(temp.path(), false).expect("dry run");
+        assert!(recovery_consumer_is_stale(temp.path()));
+        assert!(!recovery_store_root(temp.path()).exists());
+        note_worker_run(temp.path(), true).expect("applying run");
+        assert!(!recovery_consumer_is_stale(temp.path()));
+    }
+}
+
+/// Whether no worker has run recently enough to consume a new request. The
+/// steward stops accepting requests while this holds.
+pub(super) fn recovery_consumer_is_stale(state_dir: &Path) -> bool {
+    let root = recovery_store_root(state_dir);
+    if !root.exists() {
+        return true;
+    }
+    RecoveryStore::new(root).map_or(true, |store| {
+        crate::recovery_worker::worker_is_stale(store.last_worker_run(), chrono::Utc::now())
+    })
+}
+
+/// What the `recovery_consumer` invariant reads, or `None` when recovery
+/// publication is off or the store cannot be read (the invariant is then
+/// not evaluated). Read-only: it never creates the store.
+pub(super) fn recovery_consumer_facts(
+    control: Option<&super::MutationControl>,
+    repo: &str,
+) -> Option<super::invariants::RecoveryConsumerFacts> {
+    let control = control?;
+    let (global_dir, state_dir) = (&control.global_dir, &control.state_dir);
+    if !recovery_publication_is_enabled(global_dir, state_dir, repo).ok()? {
+        return None;
+    }
+    let root = recovery_store_root(state_dir);
+    if !root.exists() {
+        return Some(super::invariants::RecoveryConsumerFacts::default());
+    }
+    let store = RecoveryStore::new(root).ok()?;
+    // The marker is read whatever the backlog read does.
+    let backlog = store.oldest_unattempted_pending();
+    Some(super::invariants::RecoveryConsumerFacts {
+        backlog_unknown: backlog.is_err(),
+        oldest_unattempted: backlog.unwrap_or(None),
+        last_worker_run: store.last_worker_run(),
+    })
+}
+
+/// What the recovery store looked like after this pass's prune: its fill and
+/// what was retired, or why the prune could not run. Reported per repository
+/// so a full store is visible in the steward summary instead of silently
+/// skipping recovery.
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct RecoveryStoreStatus {
+    #[serde(flatten)]
+    pub(super) prune: Option<crate::recovery_worker::PruneOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error: Option<String>,
+}
+
+/// Retire pending recovery requests for `repo` whose pull request is no longer
+/// open on `base` at the recorded head, or that aged out. `None` when recovery
+/// publication is disabled for the repository.
+pub(super) fn prune_recovery_store(
+    global_dir: &Path,
+    state_dir: &Path,
+    repo: &str,
+    base: &str,
+    open_heads: &BTreeMap<u64, String>,
+) -> Option<RecoveryStoreStatus> {
+    match recovery_publication_is_enabled(global_dir, state_dir, repo) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            return Some(RecoveryStoreStatus {
+                prune: None,
+                error: Some(error.message().to_owned()),
+            });
+        }
+    }
+    let result = (|| {
+        let lease = acquire_recovery_publication_lease(state_dir)?;
+        let store = RecoveryStore::new(recovery_store_root(state_dir)).map_err(|error| {
+            CliFailure::new(1, format!("failed to open recovery store: {error}"))
+        })?;
+        let outcome = store
+            .prune_unattempted(
+                repo,
+                base,
+                open_heads,
+                chrono::Utc::now(),
+                chrono::Duration::days(crate::recovery_worker::MAX_PENDING_AGE_DAYS),
+            )
+            .map_err(|error| {
+                CliFailure::new(1, format!("failed to prune recovery store: {error}"))
+            })?;
+        drop(lease);
+        Ok::<_, CliFailure>(outcome)
+    })();
+    Some(match result {
+        Ok(outcome) => RecoveryStoreStatus {
+            prune: Some(outcome),
+            error: None,
+        },
+        Err(error) => RecoveryStoreStatus {
+            prune: None,
+            error: Some(error.message().to_owned()),
+        },
+    })
+}
+
 /// Persist one deterministic exact-head recovery request after the steward has
 /// already written and revalidated its needs-agent signal.
 ///
@@ -593,6 +720,7 @@ fn process_durable_requests<W: Write>(
     }
     let store = RecoveryStore::new(&store_root)
         .map_err(|error| CliFailure::new(1, format!("failed to open recovery store: {error}")))?;
+    note_worker_run(&runtime_paths.state_dir, apply)?;
     // Reconciliation is a terminal state transition. It must share the same
     // global lease as model execution so an active worker cannot be expired
     // while it is finishing bounded post-model validation or persistence.
@@ -721,7 +849,19 @@ fn reconcile_orphaned_requests(
         })
 }
 
+#[cfg(test)]
+thread_local! {
+    static LEASE_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn canonical_global_model_lease_path() -> Result<PathBuf, CliFailure> {
+    // Tests drive the real worker path with a temporary lease, never the
+    // account's own.
+    #[cfg(test)]
+    if let Some(path) = LEASE_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Ok(path);
+    }
     Ok(canonical_recovery_paths()?
         .state_dir
         .join("merge-steward")

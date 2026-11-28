@@ -515,6 +515,7 @@ So each pass checks its own preconditions first and reports them in
 | `approval_admission_config` | a repository that needs exact-head approval has `[auto_merge] reviewer_signers` and `reviewer_stamp_sessions`, has the approval rule apply (`REVIEW_REQUIRED_REPOS` or `arm_requires_head_approval`) wherever its ruleset requires the approval context, and has a path to automatic admission | fleet-ssh #18 and #19; the watchdog missing from `REVIEW_REQUIRED_REPOS` |
 | `required_never_ran` | no required context has waited unrun on every open head for an hour | watchdog #7 and #8 waiting 10+ hours |
 | `reviewer_verdicts_counted` | the approval gate counted at least one verdict, or none has been excluded for an hour | a pass-runner install made verdicts comment-only |
+| `recovery_consumer` (only when recovery publication is on) | a worker ran `--apply` in the last 3 hours (its `worker-last-run` marker in the recovery store; it proves a worker started, not that it drained anything). It fails whatever the backlog, since the steward refuses every request while no worker has run | m3's store held 1024 requests for weeks with no worker run. While no worker has run in 3 hours the steward stops accepting requests and reports `recovery_request_deferred:no_consumer`, without a live read of the failing PR after the first pass |
 
 The checks only read and report: a failing invariant never changes the exit
 code or what the pass admits. A standing incident is dated once (`since`) and
@@ -920,6 +921,7 @@ red_everywhere = "shadow"   # off | shadow (default) | enforce
 | row `next_action.action`, base tip green on the check | "Repair this PR: <check> (<test>) failed here and on N PRs with the same test, but the base tip is green on <check>, so each failure is its own. Fix the failing test in this PR." The failures are each PR's own, not a base-level cause |
 | row `next_action.action`, base tip unreadable | The cautious text: "Failing on N PRs with the same test: ... Likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green. Base health could not be read, so this is the cautious reading." |
 | `summary.log` | `red_everywhere=<episodes>` on each repository line |
+| `summary.log` | `recovery_store=<active>/<limit>` on each repository line: the recovery store's fill after the pass retired requests for pull requests that closed, merged or moved head (or aged past 7 days). `!FULL` means it cannot take another request; `ERROR` means the prune failed; `off` means recovery publication is disabled |
 | enqueue (enforce only) | a member whose head has not changed since the episode began is not enqueued: `held_red_everywhere:<check>`. Nothing is dequeued or closed |
 
 A member that pushes a new head leaves the episode; the episode ends (and is

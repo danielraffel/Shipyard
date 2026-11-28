@@ -164,6 +164,25 @@ pub(super) fn apply_repo_plan(
     } else {
         None
     };
+    // Retire recovery requests for pull requests that merged, closed or moved
+    // to a new head, before this pass enqueues new ones into the capped store.
+    let recovery_store = match mutation_control {
+        Some(control) if args.apply => {
+            let open_heads = observation
+                .prs
+                .iter()
+                .map(|pr| (pr.fact.number, pr.fact.head_sha.clone()))
+                .collect();
+            super::recovery_worker::prune_recovery_store(
+                &control.global_dir,
+                &control.state_dir,
+                &observation.repo,
+                &observation.base,
+                &open_heads,
+            )
+        }
+        _ => None,
+    };
     let recovery_witness_error = if args.apply && args.recover_hosted_setup_eviction_priority {
         record_queue_witnesses(actions, observation, args, ledger_path, ledger).err()
     } else {
@@ -777,6 +796,7 @@ pub(super) fn apply_repo_plan(
             flake_requeue: Some(flake_requeue_status),
             invariants: Vec::new(),
             solo_entry: solo_line,
+            recovery_store,
             repo: observation.repo.clone(),
             base: args.base.clone(),
             allow_auto_merge: observation.allow_auto_merge,

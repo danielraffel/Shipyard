@@ -286,6 +286,10 @@ struct RepoReport {
     /// repository with no setting.
     #[serde(skip_serializing_if = "Option::is_none")]
     solo_entry: Option<String>,
+    /// The recovery store's fill after this pass pruned dead requests.
+    /// Absent when recovery publication is off or the pass did not apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_store: Option<recovery_worker::RecoveryStoreStatus>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1871,6 +1875,7 @@ fn steward_repo_observed(
                     &args.approval_context,
                     &invariants::state_path(ledger_path),
                     args.apply,
+                    recovery_worker::recovery_consumer_facts(mutation_control, repo),
                     Utc::now(),
                 );
             }
@@ -1984,6 +1989,7 @@ fn deferred_rate_limit_repo_report(
         flake_requeue: None,
         invariants: Vec::new(),
         solo_entry: None,
+        recovery_store: None,
     }
 }
 
@@ -2020,6 +2026,7 @@ fn unreadable_repo_report(
         flake_requeue: None,
         invariants: Vec::new(),
         solo_entry: None,
+        recovery_store: None,
     }
 }
 
@@ -2106,6 +2113,7 @@ fn append_unmatched_recovery_errors(
             flake_requeue: None,
             invariants: Vec::new(),
             solo_entry: None,
+            recovery_store: None,
         });
     }
 }
@@ -2152,6 +2160,7 @@ fn persist_final_ledger(
             flake_requeue: None,
             invariants: Vec::new(),
             solo_entry: None,
+            recovery_store: None,
         });
     }
 }
