@@ -130,8 +130,16 @@ ancestry never excuses Q on its own: a Q that targets the base and contains P's
 whole head (built on P, or P merged back into Q) is judged at its listed head
 like any other Q, because ancestry cannot show which pull request introduced a
 shared commit. The shared commits clear P only while Q's head is approved with
-no HOLD, or once they are on the base, with one exception, the declared older
-parent: when Q declares the stack (Q is labelled `stacked:<P>`, or reaches P
+no HOLD, or once they are on the base, with two exceptions, both for a P opened
+before Q (a lower pull request number) and a shared commit on both P's and Q's
+first-parent chains. The first is the unreviewed child: when Q is refused only
+for want of an APPROVE (no HOLD, and its approval read), that commit is P's
+own, whether Q took P's current head or an older one and whether or not Q is
+labelled. P's exact-head approval reviewed it as P's diff and nobody has said
+no to it, so an approved parent never waits on a child that is still waiting
+for review; a parent with several such children, and a child built on several
+parents, are settled parent by parent. A held or unreadable Q gets only the
+second exception, the declared older parent: when Q declares the stack (Q is labelled `stacked:<P>`, or reaches P
 through a chain of open pull requests' `stacked:<n>` labels and base
 branches), P was opened before Q (a lower pull request number), and Q's own
 diff holds P's exact current head, a shared commit on P's own first-parent
@@ -142,14 +150,17 @@ wait on each other. The label never clears anything by itself: it only
 unlocks that graph proof, and its `labeled` event names who declared the
 stack. `Supersedes #n` and the clean-replacement marker never admit P: they
 say P is to be closed, not merged. Commits P merged in (off P's first-parent
-chain) are still refused, and so are the three misses, each with its fix in
+chain) are still refused, and so are, for a held Q, the three misses (a P
+opened after Q is refused whatever Q's verdict), each with its fix in
 the refusal detail: an undeclared Q (`#Q built on #P's head but is not
 labelled stacked:P: label it (shipyard pr --stacked-on P) or retarget #Q onto
 #P's branch`), a P opened after Q (`#Q built on #P's head but #P was opened
 after #Q: retarget #Q onto #P's branch`), and a Q that took an older head of
-P's (`#Q is on an older head of #P: merge #P into #Q`). Named residual: a Q
-labelled `stacked:P` whose author opened P first and reset it onto Q's held
-commits is cleared; those commits land under P's exact-head approval, and the
+P's (`#Q is on an older head of #P: merge #P into #Q`). Named residuals: a P
+opened first and reset onto a newer, unreviewed Q's commits is cleared, and
+those commits land under P's exact-head approval; and a Q labelled
+`stacked:P` whose author opened P first and reset it onto Q's held commits is
+cleared; those commits land under P's exact-head approval, and the
 label event names who declared the stack. Land or
 approve Q first, or drop its commits from P; a branch built on another pull
 request should target that pull request's branch. At most 250 commits are read

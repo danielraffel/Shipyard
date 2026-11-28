@@ -10,13 +10,14 @@
 //! history), so a guard that excused Q on ancestry would admit P in the held
 //! and unapproved cases.
 //!
-//! The one stack that is excused without Q's approval: Q declares the stack
-//! (a `stacked:<P>` label, or a chain of open pull requests' labels and base
+//! The one stack that is excused past a held Q: Q declares the stack (a
+//! `stacked:<P>` label, or a chain of open pull requests' labels and base
 //! branches reaching P), P is the older pull request, Q's head contains P's
-//! exact head, and the shared commits are on P's first-parent chain (the
-//! parent of a stack whose child targets the base and is held or
-//! unreviewed). Work P merged in, an undeclared Q, a Q built on an older head
-//! of P's, and a P newer than Q stay refused, and the refusal names the fix.
+//! exact head, and the shared commits are on P's first-parent chain. Work P
+//! merged in, an undeclared held Q, a held Q built on an older head of P's,
+//! and a P newer than Q stay refused, and the refusal names the fix. A Q that
+//! is only unreviewed needs neither the declaration nor P's exact head (see
+//! `parent_child_tests`).
 
 use std::cell::{Cell, RefCell};
 

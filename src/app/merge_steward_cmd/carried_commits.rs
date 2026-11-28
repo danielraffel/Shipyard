@@ -31,21 +31,32 @@
 //!   like any other Q. Head ancestry cannot say which pull request introduced
 //!   a shared commit, so the commits both ranges hold clear P only while Q's
 //!   listed head is approved, without a HOLD, or once they are on the base,
-//!   with one exception, the declared older parent: when Q declares the
-//!   stack (Q is labelled `stacked:<P>`, or reaches P through a chain of
-//!   open pull requests' `stacked:<n>` labels and base branches), P was
-//!   opened before Q, and Q's own diff holds P's exact head, a shared commit
-//!   on P's first-parent chain is P's own even though it is on Q's
-//!   first-parent chain too (Q branched off P's line). The label never clears
-//!   anything by itself; it only unlocks that graph proof, and its `labeled`
-//!   event names who declared the stack. `Supersedes #n` and the
-//!   clean-replacement marker are never read here: they say P is to be
-//!   closed, not merged. Commits P merged in (off P's first-parent chain), an
-//!   undeclared Q, a Q built on an older head of P's, and a P opened after Q
-//!   stay refused, and the refusal detail names which of the three it was
-//!   and the fix. Named residual: a Q labelled `stacked:P` whose author
-//!   opened P first and reset it onto Q's held commits is cleared; the label
-//!   event names who declared it.
+//!   with two exceptions, both for a P opened before Q and a shared commit on
+//!   both first-parent chains (Q branched off P's line, at P's current head
+//!   or an older one), where that commit is P's own:
+//!   * The unreviewed child: Q's head is refused only for want of an APPROVE
+//!     (no HOLD, and its approval read). P's exact-head approval reviewed the
+//!     commit as P's own diff, and nobody has said no to it, so a child
+//!     waiting for review never blocks its parent. A parent with several such
+//!     children, and a child built on several parents (each parent's commits
+//!     on the child's first-parent chain, or merged in off it), are settled
+//!     parent by parent.
+//!   * The declared older parent, for a held Q: Q declares the stack (Q is
+//!     labelled `stacked:<P>`, or reaches P through a chain of open pull
+//!     requests' `stacked:<n>` labels and base branches) and Q's own diff
+//!     holds P's exact head. The label never clears anything by itself; it
+//!     only unlocks that graph proof, and its `labeled` event names who
+//!     declared the stack.
+//!
+//!   `Supersedes #n` and the clean-replacement marker are never read here:
+//!   they say P is to be closed, not merged. Commits P merged in (off P's
+//!   first-parent chain), a P opened after Q (P built on Q), and, for a held
+//!   or unreadable Q, an undeclared Q or a Q built on an older head of P's
+//!   stay refused, and the refusal detail names which it was and the fix.
+//!   Named residuals: a P opened first and then reset onto a newer Q's
+//!   commits is cleared when Q is only unreviewed (P's reviewer reviews those
+//!   commits as P's diff), and when Q is held only if Q is labelled
+//!   `stacked:P` (the label event names who declared it).
 //! * Q merged P's branch without being stacked on it: a shared commit counts
 //!   against P only when it is on Q's first-parent chain (`Q.base..Q.head`
 //!   walked through first parents) or is not on P's own first-parent chain
@@ -56,7 +67,8 @@
 //!   carried".
 //!   The real catches remain: P merging held work in (the held commits are
 //!   P's second parent, so not on P's first-parent chain) and P built
-//!   straight on commits on Q's own first-parent chain (on both chains). A
+//!   straight on commits on Q's own first-parent chain (on both chains)
+//!   when P was opened after Q or Q is held (see the exceptions above). A
 //!   first-parent read that fails or is over the cap keeps the overlap.
 //!   Named residual: P built straight on commits that held Q itself took in
 //!   through a merge's second parent (Q = merge(Q.base, X) with P on X, or Q's
@@ -876,7 +888,7 @@ fn judgement_of(
 
 /// [`admission_refusal`] over any `gh` runner and approval judge, after the
 /// policy says approval is required.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn refusal_with(
     run_gh: RunGh<'_>,
     repo: &str,
@@ -943,7 +955,7 @@ pub(super) fn refusal_with(
             )
             .and_then(|graph| first_parent_chain(&graph, chain_base, chain_head))
         };
-        let mut older_parent = || {
+        let mut older_parent = |unreviewed: bool| {
             let graph = cached_graph(
                 run_gh,
                 repo,
@@ -951,7 +963,15 @@ pub(super) fn refusal_with(
                 &q.base_ref,
                 &q.head_sha,
             );
-            older_parent_of(number, head_sha, head_ref, q, others, graph.as_ref())
+            older_parent_of(
+                number,
+                head_sha,
+                head_ref,
+                q,
+                others,
+                unreviewed,
+                graph.as_ref(),
+            )
         };
         let mut miss = None;
         match without_own_commits(
@@ -1001,24 +1021,31 @@ type ChainReader<'a> = dyn FnMut(&str, &str) -> Result<BTreeSet<String>, String>
 ///
 /// This is the evidence the commit graph alone lacks. When P's and `q`'s
 /// first-parent chains share a run of commits, the graph cannot say whether
-/// `q` branched off P or P branched off `q`; `q`'s author declared that `q`
-/// builds on P, P proposed those commits first, and P's exact-head approval
-/// reviewed them as P's own diff. The declaration alone clears nothing: an
-/// undeclared `q`, a `q` older than P, and a `q` that does not contain P's
-/// current head (P moved on since `q` took it) are not older parents. Named
-/// residual: a `q` labelled `stacked:P` whose author opened P first and reset
-/// it onto `q`'s held commits is cleared; the label event names who declared
-/// it.
+/// `q` branched off P or P branched off `q`; P proposed those commits first,
+/// and P's exact-head approval reviewed them as P's own diff. For an
+/// `unreviewed` `q` (refused only for want of an APPROVE) that is enough:
+/// nobody has refused the commits, so P is judged on its own approval
+/// whether `q` sits on P's current head or an older one, declared or not.
+/// For a held `q` the declaration and the exact head are required too: an
+/// undeclared `q` and a `q` that does not contain P's current head (P moved
+/// on since `q` took it) are not older parents. A `q` older than P is never
+/// one. Named residual: a P opened first and reset onto a newer `q`'s commits
+/// is cleared when `q` is unreviewed, or held and labelled `stacked:P` (the
+/// label event names who declared it).
 fn older_parent_of(
     number: u64,
     p_head: &str,
     head_ref: &str,
     q: &OpenPr,
     others: &[OpenPr],
+    unreviewed: bool,
     graph: Result<&CommitGraph, &String>,
 ) -> Result<(), OlderParentMiss> {
     if number >= q.number {
         return Err(OlderParentMiss::NewerParent);
+    }
+    if unreviewed {
+        return Ok(());
     }
     if !declared_stack_reaches(q, number, head_ref, others) {
         return Err(OlderParentMiss::Undeclared);
@@ -1033,7 +1060,8 @@ fn older_parent_of(
 /// Drop from a refusing overlap with `q` the commits that are P's own: on P's
 /// first-parent chain (`base..p_head`) and either not on `q`'s
 /// (`q.base..q.head`), or on both chains while P is `q`'s older parent
-/// (`older_parent`, see [`older_parent_of`]). A commit of the first kind
+/// (`older_parent`, called with whether `q` is only unreviewed, see
+/// [`older_parent_of`]). A commit of the first kind
 /// reached `q` only through a merge's second parent, so `q` merged P's branch;
 /// one of the second kind is P's line that `q` built on. Either way P carries
 /// nothing of `q`'s through it. A shared commit off P's first-parent chain
@@ -1046,7 +1074,7 @@ fn without_own_commits(
     base: &str,
     p_head: &str,
     q: &OpenPr,
-    older_parent: &mut dyn FnMut() -> Result<(), OlderParentMiss>,
+    older_parent: &mut dyn FnMut(bool) -> Result<(), OlderParentMiss>,
     chain: &mut ChainReader<'_>,
     miss: &mut Option<OlderParentMiss>,
 ) -> Option<(Carried, Judgement)> {
@@ -1067,7 +1095,10 @@ fn without_own_commits(
     let (Ok(p_chain), Ok(q_chain)) = (chain(base, p_head), chain(&q.base_ref, &q.head_sha)) else {
         return Some(settled);
     };
-    let older_parent = older_parent();
+    // Only a Q the gate refuses for want of an APPROVE is unreviewed: a HOLD
+    // (or fleet-guard refusal) and an unreadable judgement keep the full
+    // proof.
+    let older_parent = older_parent(matches!(judgement, Judgement::Unapproved(_)));
     let kept: Vec<String> = shared
         .iter()
         .filter(|sha| !p_chain.contains(*sha) || (q_chain.contains(*sha) && older_parent.is_err()))
@@ -1625,6 +1656,9 @@ mod landed;
 
 #[cfg(test)]
 mod stacked_verdict_tests;
+
+#[cfg(test)]
+mod parent_child_tests;
 
 #[cfg(test)]
 mod tests;
