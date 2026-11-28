@@ -788,3 +788,53 @@ json.dump({
     let parsed: RecoveryOutput = serde_json::from_slice(&output.stdout).expect("output JSON");
     parsed.validate().expect("valid output");
 }
+
+/// Drive the real worker loop (`process_durable_requests`) over an empty
+/// queue with a temporary state directory and lease.
+fn run_empty_worker_loop(apply: bool, state_dir: &Path) -> ExitCode {
+    let trusted_config = valid_policy();
+    let policy = RecoveryWorkerPolicy::from_config(&trusted_config).expect("policy");
+    let signature = policy.signature().expect("signature");
+    let runtime_paths = RuntimePaths::for_platform(
+        Platform::current(),
+        &state_dir.join("home"),
+        RuntimeMode::Isolated,
+    );
+    let mut runtime_paths = runtime_paths;
+    runtime_paths.state_dir = state_dir.to_path_buf();
+    let lease = state_dir
+        .join("merge-steward")
+        .join("recovery")
+        .join("global-model.lock");
+    LEASE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(lease));
+    let mut stdout = Vec::new();
+    let result = process_durable_requests(
+        apply,
+        &policy,
+        &signature,
+        &trusted_config,
+        &runtime_paths,
+        true,
+        &mut stdout,
+        1,
+    );
+    LEASE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    result.expect("worker loop")
+}
+
+#[test]
+fn an_applying_worker_run_over_an_empty_queue_refreshes_the_consumer_marker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    assert!(recovery_consumer_is_stale(temp.path()));
+    assert_eq!(run_empty_worker_loop(true, temp.path()), ExitCode::SUCCESS);
+    assert!(!recovery_consumer_is_stale(temp.path()));
+}
+
+#[test]
+fn a_dry_worker_run_leaves_no_consumer_marker() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    // A store with no marker, as after the steward's first enqueue attempt.
+    drop(RecoveryStore::new(recovery_store_root(temp.path())).expect("store"));
+    assert_eq!(run_empty_worker_loop(false, temp.path()), ExitCode::SUCCESS);
+    assert!(recovery_consumer_is_stale(temp.path()));
+}
