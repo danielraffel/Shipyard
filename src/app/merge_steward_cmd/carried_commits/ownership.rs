@@ -29,7 +29,11 @@
 //! is incomplete and nothing is settled.
 //!
 //! P's log must be unbroken as well, and its last deletion must be followed
-//! by a creation, so a missing entry cannot credit an earlier life. Each log
+//! by a creation, so a missing entry cannot credit an earlier life. Entries
+//! are compared in the log's own order, deletions kept, never re-sorted by
+//! time; a log whose times run backwards is refused, and any other entry in
+//! the same second as the creation that starts P's current life makes the
+//! boundary between lives ambiguous, so nothing is settled. Each log
 //! is read as one page, newest first, with one entry more than
 //! [`MAX_PUSHES_READ`]: a full page is refused after a single read. An
 //! over-cap Q (its own diff over the cap) is never judged here; it clears
@@ -51,22 +55,48 @@ use crate::head_approval::RunGh;
 /// Most log entries read per branch.
 pub(super) const MAX_PUSHES_READ: usize = 60;
 
+/// What an activity-log entry did to the branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Kind {
+    Creation,
+    Deletion,
+    /// A push, force-push or merge that moved the branch.
+    Push,
+}
+
 /// One entry of a branch's activity log.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Push {
     pub at: DateTime<Utc>,
     pub after: String,
-    pub creation: bool,
+    pub kind: Kind,
 }
 
-/// One branch's activity log: its entries (deletions dropped), oldest first,
-/// and the first break in its chain of `before` and `after` shas, if any.
+impl Push {
+    fn creation(&self) -> bool {
+        self.kind == Kind::Creation
+    }
+}
+
+/// One branch's activity log: every entry, deletions included, in the log's
+/// own order, oldest first, and the first break in its chain of `before` and
+/// `after` shas, if any. Order between entries is the log's, never re-sorted
+/// by time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Activity {
-    pub pushes: Vec<Push>,
+    pub entries: Vec<Push>,
     pub gap: Option<String>,
-    /// When the branch was last deleted, if the log shows a deletion.
-    pub last_deletion: Option<DateTime<Utc>>,
+}
+
+impl Activity {
+    /// The entries that leave the branch at a commit (no deletions).
+    fn pushes(&self) -> Vec<Push> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind != Kind::Deletion)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Activity logs read this pass, by branch.
@@ -86,10 +116,11 @@ fn encode(branch: &str) -> String {
         .collect()
 }
 
-/// `branch`'s activity log, oldest first, with deletions dropped. Every
-/// entry but a creation must start where the previous entry left the branch
-/// (`before` equals the previous `after`); the first entry that does not is
-/// recorded as the log's gap.
+/// `branch`'s activity log, oldest first in the log's own order, deletions
+/// kept. Every entry but a creation must start where the previous entry left
+/// the branch (`before` equals the previous `after`); the first entry that
+/// does not is recorded as the log's gap. Times must not run backwards in
+/// log order; a log whose times do is refused.
 fn read_activity(run_gh: RunGh<'_>, repo: &str, branch: &str) -> Result<Activity, String> {
     let raw = run_gh(&[
         "api".to_owned(),
@@ -112,8 +143,7 @@ fn read_activity(run_gh: RunGh<'_>, repo: &str, branch: &str) -> Result<Activity
     }
     // The page is newest first; walk it oldest first.
     entries.reverse();
-    let mut last_deletion = None;
-    let mut pushes = Vec::new();
+    let mut pushes: Vec<Push> = Vec::new();
     let mut gap = None;
     let mut previous: Option<String> = None;
     for line in entries {
@@ -147,25 +177,24 @@ fn read_activity(run_gh: RunGh<'_>, repo: &str, branch: &str) -> Result<Activity
         let at = field("at")?
             .parse::<DateTime<Utc>>()
             .map_err(|error| format!("activity of {branch}: bad time: {error}"))?;
-        if kind == "branch_deletion" {
-            last_deletion = Some(at);
+        if pushes.last().is_some_and(|last| last.at > at) {
+            return Err(format!(
+                "the activity log of {branch} runs backwards in time at {at}"
+            ));
+        }
+        let kind = match kind {
+            "branch_creation" => Kind::Creation,
+            "branch_deletion" => Kind::Deletion,
+            _ => Kind::Push,
+        };
+        if kind != Kind::Deletion && after.bytes().all(|byte| byte == b'0') {
             continue;
         }
-        if after.bytes().all(|byte| byte == b'0') {
-            continue;
-        }
-        pushes.push(Push {
-            at,
-            after,
-            creation: kind == "branch_creation",
-        });
+        pushes.push(Push { at, after, kind });
     }
-    // A stable sort: entries in the same second keep the log's order.
-    pushes.sort_by_key(|push| push.at);
     Ok(Activity {
-        pushes,
+        entries: pushes,
         gap,
-        last_deletion,
     })
 }
 
@@ -204,6 +233,46 @@ fn first_reached(
     Ok(reached)
 }
 
+/// P's branch in its current life, from its activity log `p_entries`.
+fn current_life(p_branch: &str, p_entries: &[Push]) -> Result<Vec<Push>, String> {
+    // P's branch in its current life: from its last creation in log order,
+    // with no deletion after it (an open pull request's branch exists). Any
+    // other entry in the same second as that creation leaves the boundary
+    // between lives to an ordering the timestamps cannot confirm: refused.
+    let start = p_entries.iter().rposition(Push::creation);
+    if let Some(deleted) = p_entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == Kind::Deletion)
+        .map(|(index, entry)| (index, entry.at))
+        .next_back()
+        && start.is_none_or(|start| start < deleted.0)
+    {
+        return Err(format!(
+            "the activity log of {p_branch} shows a deletion at {} with no creation after it",
+            deleted.1
+        ));
+    }
+    if let Some(start) = start {
+        let created = p_entries[start].at;
+        if p_entries
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| index != start && entry.at == created)
+        {
+            return Err(format!(
+                "the activity log of {p_branch} has another entry in the same second as its \
+                 creation at {created}: which life it belongs to is ambiguous"
+            ));
+        }
+    }
+    Ok(p_entries[start.unwrap_or(0)..]
+        .iter()
+        .filter(|entry| entry.kind != Kind::Deletion)
+        .cloned()
+        .collect())
+}
+
 /// The commits of `shared` that are P's own: P's branch (`p_branch`, current
 /// life only) held each strictly before `q`'s branch did. `Err` when that
 /// cannot be settled, which the caller treats as "none are P's".
@@ -236,7 +305,7 @@ pub(super) fn p_owned(
     if let Some(gap) = p_activity.gap {
         return Err(gap);
     }
-    let p_log = p_activity.pushes;
+    let p_entries = p_activity.entries.clone();
     let q_activity = log(&q.head_ref)?;
     // Q's whole history must be in view and unbroken: a log that does not
     // start at a branch creation, skips an entry, or has not caught up with
@@ -244,8 +313,8 @@ pub(super) fn p_owned(
     if let Some(gap) = q_activity.gap {
         return Err(gap);
     }
-    let q_log = q_activity.pushes;
-    let Some(q_created) = q_log.first().filter(|push| push.creation) else {
+    let q_log = q_activity.pushes();
+    let Some(q_created) = q_activity.entries.first().filter(|push| push.creation()) else {
         return Err(format!(
             "the activity log of {} does not reach back to its creation",
             q.head_ref
@@ -272,23 +341,9 @@ pub(super) fn p_owned(
         }
         None => return Err(format!("#{} has no listed opening time", q.number)),
     }
-    // P's branch in its current life: from its last creation, which must
-    // follow its last deletion (an open pull request's branch exists).
-    let p_life = p_log
-        .iter()
-        .rposition(|push| push.creation)
-        .map_or(&p_log[..], |start| &p_log[start..]);
-    if let Some(deleted) = p_activity.last_deletion
-        && !p_life
-            .first()
-            .is_some_and(|push| push.creation && push.at >= deleted)
-    {
-        return Err(format!(
-            "the activity log of {p_branch} shows a deletion at {deleted} with no creation after it"
-        ));
-    }
+    let p_life = current_life(p_branch, &p_entries)?;
     let shas: BTreeSet<String> = shared.iter().cloned().collect();
-    let on_p = first_reached(run_gh, repo, base, p_life, &shas, None, graphs)?;
+    let on_p = first_reached(run_gh, repo, base, &p_life, &shas, None, graphs)?;
     let latest = on_p.values().max().copied();
     let on_q = first_reached(run_gh, repo, base, &q_log, &shas, latest, graphs)?;
     // Q's head holds every shared commit (they are in Q's own diff), so a

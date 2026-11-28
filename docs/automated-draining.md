@@ -126,8 +126,10 @@ is not approved, however recent P's approval or however old Q's HOLD. An
 unreadable log, a log of Q's branch that is not whole and current (it must
 start at a creation no later than Q was opened, chain each entry's `before`
 to the previous `after`, end at Q's listed head, and show every shared
-commit Q holds), a log of P's branch with a gap or a deletion not followed
-by a creation, a compare over the cap, more than 60 logged entries (each log
+commit Q holds), a log of P's branch with a gap, a deletion not followed by
+a creation (in the log's own order, not by timestamp), or another entry in
+the same second as the creation that starts its current life, a log whose
+times run backwards, a compare over the cap, more than 60 logged entries (each log
 is one read of at most 61 entries, newest first, never paged), a
 cross-repository branch, or equal times leave the commit Q's. Ownership
 follows push order, not intent: a child pushed before its parent, or in the

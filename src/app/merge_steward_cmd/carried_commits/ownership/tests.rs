@@ -332,3 +332,108 @@ fn the_activity_read_is_one_bounded_page() {
         argvs[0]
     );
 }
+
+#[test]
+fn a_deletion_in_the_same_second_as_ps_creation_fails_closed() {
+    // Review 1754-r3-f1 again: P created at C and deleted in the same second
+    // (hour 1); its later re-creation on C is missing from the log. Q's
+    // complete log first holds C at hour 3. A timestamp comparison let the
+    // old creation stand; log order does not.
+    let mut world = World::parent_first();
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (1, "branch_creation", ZERO, C),
+            (1, "branch_deletion", C, ZERO),
+        ],
+    );
+    world
+        .logs
+        .insert(Q_BRANCH, vec![(3, "branch_creation", ZERO, Q_HEAD)]);
+    let error = world.settle(&q(OPENED, false), false).expect_err("deleted");
+    assert!(error.contains("no creation after it"), "{error}");
+}
+
+#[test]
+fn a_deletion_and_re_creation_in_one_second_is_ambiguous() {
+    // Deleted and created again in the same second: which life the creation
+    // starts cannot be confirmed by time, so nothing is settled.
+    let mut world = World::parent_first();
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (0, "branch_creation", ZERO, BASE_TIP),
+            (1, "branch_deletion", BASE_TIP, ZERO),
+            (1, "branch_creation", ZERO, C),
+        ],
+    );
+    world.compares.insert(BASE_TIP, Some(Vec::new()));
+    let error = world
+        .settle(&q(OPENED, false), false)
+        .expect_err("ambiguous");
+    assert!(error.contains("same second"), "{error}");
+
+    // Control: the re-creation a second later settles C as P's.
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (0, "branch_creation", ZERO, BASE_TIP),
+            (1, "branch_deletion", BASE_TIP, ZERO),
+            (2, "branch_creation", ZERO, C),
+        ],
+    );
+    world
+        .logs
+        .insert(Q_BRANCH, vec![(3, "branch_creation", ZERO, Q_HEAD)]);
+    assert_eq!(
+        world.settle(&q(OPENED, false), false),
+        Ok(vec![C.to_owned()])
+    );
+}
+
+#[test]
+fn a_push_in_the_same_second_as_ps_creation_is_ambiguous() {
+    let mut world = World::parent_first();
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (1, "branch_creation", ZERO, BASE_TIP),
+            (1, "push", BASE_TIP, C),
+        ],
+    );
+    world.compares.insert(BASE_TIP, Some(Vec::new()));
+    let error = world
+        .settle(&q(OPENED, false), false)
+        .expect_err("ambiguous");
+    assert!(error.contains("same second"), "{error}");
+
+    // Control: the push a second later settles.
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (0, "branch_creation", ZERO, BASE_TIP),
+            (1, "push", BASE_TIP, C),
+        ],
+    );
+    assert_eq!(
+        world.settle(&q(OPENED, false), false),
+        Ok(vec![C.to_owned()])
+    );
+}
+
+#[test]
+fn a_log_that_runs_backwards_in_time_fails_closed() {
+    let mut world = World::parent_first();
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (1, "branch_creation", ZERO, BASE_TIP),
+            (0, "push", BASE_TIP, C),
+        ],
+    );
+    world.compares.insert(BASE_TIP, Some(Vec::new()));
+    let error = world
+        .settle(&q(OPENED, false), false)
+        .expect_err("backwards");
+    assert!(error.contains("backwards"), "{error}");
+}
