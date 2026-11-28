@@ -4855,6 +4855,21 @@ and stop landings that never pass through `ghapp`
 reviewer (the steward reads that as waiting, not `required_failed`; nothing for
 the author to do) and `failure` only for a counted HOLD or an unreadable review.
 
+A base can make review items part of that decision: `[auto_merge]
+review_items_check = "<job name>"` with `review_items_workflow =
+".github/workflows/<file>.yml"` (both or neither; half a setting refuses every
+head). The items come only from the newest `pull_request_target` run of that
+file on the exact head, from its job of that name in the run's own job
+listing, in that job check run's one `review-items` annotation (`review-item:
+<id>` lines and one `review-items-count: <n>`). The counting exact-head APPROVE
+comment must carry `accept-review-item: <id>` for every id, outside fenced code
+and quotes; a carried approval, a rollup, an admission, an `APPROVED` review or
+a `reviewed:` marker accepts none. A missing or running items run is
+`pending`; a failed, ambiguous, malformed or unreadable one, or an unaccepted
+id (named in the description), is `failure`. The status and the queue-arm
+guard apply it to every pull request on the head; `shipyard review-verdict`
+does not read items yet (docs/review-verdict-status.md, Review items).
+
 A HOLD makes its head un-approvable, so posting an APPROVE of a held head
 only makes the pull request look approved. The managed
 `verdict-contradiction-guard` refuses that APPROVE before it posts (same

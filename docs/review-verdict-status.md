@@ -46,7 +46,9 @@ rebase only when the diff keeps its `git patch-id --stable`, the files and
 their statuses are the same, the base touched none of them and each keeps its
 approved blob and mode, and no required check on the new head was skipped,
 neutral or reused a receipt. `shipyard review-verdict --pr N --json` gives the
-same answer from the command line (Rust, `crate::review_verdict`).
+same answer from the command line (Rust, `crate::review_verdict`), except
+for review items, which only this status and the queue-arm guard read (see
+Review items).
 
 Signers come only from the base: the status reads no host's
 `reviewer-signers.json`. An App APPROVE counts only with a `reviewer: <name>`
@@ -329,6 +331,113 @@ The `check_run` trigger re-judges a head when its admission run completes,
 so the status follows admission without a new push. Only runs named
 `fleet-guard/admission` start the job; a base that renames the check also
 edits that `if:`.
+
+## Review items
+
+A base's own guards can leave exceptions for the reviewer instead of the
+author: a regenerated serialized hotspot, a header whose compile fan-out grew
+past its ceiling. Each is a review item with a stable id, such as
+`hotspot:docs/status/consumption-profiles.json` or
+`fanout:core/audio/include/pulp/audio/buffer.hpp:+12`. With two keys on the
+default branch's `.shipyard/config.toml`, this status, and the `ghapp`
+queue-arm guard, require the reviewer to accept every item:
+
+```toml
+[auto_merge]
+review_items_check = "review-items"                       # the items job's name
+review_items_workflow = ".github/workflows/review-items.yml"
+```
+
+Both unset is off, and nothing below is read. Setting one without the other,
+an empty name, or a workflow path outside `.github/workflows/` refuses every
+head.
+
+**Where the items come from.** Only the newest `pull_request_target` run of
+exactly `review_items_workflow` on the exact head counts. Its job named
+`review_items_check`, taken from that run's own job listing, must have
+completed `success`. Its job check run must carry exactly one annotation
+titled `review-items`, whose message is one `review-item: <id>` line per item
+and one `review-items-count: <n>` line:
+
+```
+review-item: hotspot:docs/status/consumption-profiles.json
+review-item: fanout:core/audio/include/pulp/audio/buffer.hpp:+12
+review-items-count: 2
+```
+
+A job prints it with one workflow command, newlines encoded as `%0A`:
+`::notice title=review-items::review-item: hotspot:docs/x.json%0Areview-items-count: 1`.
+An id is a lowercase kind, a colon, and up to 240 non-space characters.
+
+Why this chain and not a check run found by name:
+
+- `pull_request_target` always runs the default branch's definition of the
+  workflow. A `pull_request` run runs the head's copy, which the pull request
+  can rewrite to list no items.
+- Every Actions check run has the app `github-actions`, so the app alone
+  distinguishes nothing. A check run created through the API with a
+  workflow's token can carry any name, output and details URL, and GitHub
+  may file it in any Actions check suite on the head. Only the run's job
+  listing says which check run is that run's job.
+- An Actions job's own check run has no `output.title`, `summary` or `text`,
+  so the list rides on an annotation. Annotations can only be added to a
+  check run, never removed, so another workflow writing to it can add an
+  item or a second list, both of which refuse, but cannot shorten the list.
+
+| Items run on the head | Result |
+|---|---|
+| none from that file and event, or the newest is queued or in progress | `pending` (`awaiting the review items check for head <sha>`) |
+| newest completed with any conclusion but `success` | `failure` |
+| not exactly one job of that name, or the job did not succeed | `failure` |
+| not exactly one `review-items` annotation, or a malformed one (a stray line, a duplicate id, no count or a wrong count) | `failure` |
+| any listing unreadable or short of its `total_count` | `failure` |
+| a well-formed list | judged against the verdict, below |
+
+**Accepting an item.** The exact-head APPROVE comment that allows the head
+under every other rule here (signers, stamp sessions, never edited, newest
+wins, no HOLD) must carry one line per id above its marker line:
+
+```
+accept-review-item: hotspot:docs/status/consumption-profiles.json
+accept-review-item: fanout:core/audio/include/pulp/audio/buffer.hpp:+12
+reviewer: pulp-review
+<!-- session: ... -->   (written by ghapp)
+verdict: APPROVE head:<sha>
+```
+
+Lines inside a fenced code block, and `>` quotes, do not count. Extra accepts
+are ignored. A missing one is `failure`, and the description names what is
+unaccepted (`unaccepted review items: <id>, ...`). Nothing else accepts an
+item: an approval carried from an earlier head (merge-only or rebase), a
+rollup, a guard-mode admission, an `APPROVED` review and a `reviewed: <sha>`
+marker all accept none, so a head with items needs its own new verdict. A
+head with no items needs no accept lines.
+
+The items are read once per head and judged for every open pull request
+whose head it is, against that pull request's own deciding APPROVE, on every
+path that posts this status, including a backfill that runs the script once
+per pull request. A status that is `success` therefore already includes the
+items; no later step has to correct it.
+
+**Re-judging.** The items run finishes after the head is pushed, so the
+repository's `review-verdict.yml` lists the items workflow under
+`workflow_run` (the job's `if:` lets that event through):
+
+```yaml
+  workflow_run:
+    workflows: [Review verdict trigger, Review items]
+    types: [completed]
+```
+
+`workflows:` takes the workflow's `name:`, not its file.
+
+**Limits.** The items are computed when the items run ran (the head's push,
+or a re-run), against the default branch at that moment. A base change after
+that, such as a newly registered hotspot, is not seen until the items run is
+re-run. `shipyard review-verdict` (Rust, `crate::review_verdict`) and the
+steward's own gate do not read review items yet, so on such a base they can
+report a head allowed that this status refuses; the status is the required
+check and decides the landing.
 
 ## Rollout
 

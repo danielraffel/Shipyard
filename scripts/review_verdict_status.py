@@ -26,6 +26,12 @@ pull request's code, and it reads
 every comment and review from the API rather than trusting the event, so a
 comment from an untrusted account counts only as the guard's rules allow.
 
+A base that sets ``[auto_merge] review_items_check`` and
+``review_items_workflow`` adds its review items to that same decision (the
+guard's ``_review_items_checked``): the APPROVE that allows the head must
+accept every item its trusted items run lists, so a ``success`` this script
+posts already includes them (docs/review-verdict-status.md, Review items).
+
 A status belongs to a commit, but a decision belongs to a pull request, and
 two open pull requests can share a head. The status is ``success`` only when
 the guard allows the head for every open pull request whose head it is.
@@ -78,7 +84,11 @@ HEAD_CHECK_EVENTS = frozenset({"pull_request_target"})
 # The guard's refusal causes that mean "no counted verdict yet": the head has
 # no verdict, or only an earlier head's approval that does not carry. Every
 # other refusal (a HOLD, an unreadable review, a self-approval) is a failure.
-AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry", "admission_missing"})
+# ``review_items_pending``: the base's review-items run on the head has not
+# finished (or not started); its completion re-judges the head through
+# ``workflow_run``. An unaccepted, unreadable or malformed item list fails.
+AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry", "admission_missing",
+                             "review_items_pending"})
 # A base whose `[auto_merge] approval_source = "guard"` takes authorization
 # from the fleet admission check run instead of comments; its completion
 # reaches this workflow as a ``check_run`` event (see event_target).
@@ -378,10 +388,13 @@ def decide(guard: ModuleType, repo: str, number: int, head: str) -> Decision:
     return Decision(allowed, message, cause, tuple(excluded), carried_from)
 
 
-def awaiting_description(head: str, excluded: list[str], admission: bool = False) -> str:
+def awaiting_description(head: str, excluded: list[str], admission: bool = False,
+                         items: bool = False) -> str:
     """The ``pending`` description: waiting, and why any approval did not count."""
     if admission:
         return f"awaiting fleet-guard admission for head {head[:12]}"
+    if items:
+        return f"awaiting the review items check for head {head[:12]}"
     if not excluded:
         return f"awaiting reviewer verdict for head {head[:12]}"
     codes = sorted(set(excluded))
@@ -657,7 +670,8 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
         state = "pending"
         text = awaiting_description(
             head, [code for _, d in refused for code in d.excluded],
-            admission=all(d.cause == "admission_missing" for _, d in refused))
+            admission=all(d.cause == "admission_missing" for _, d in refused),
+            items=all(d.cause == "review_items_pending" for _, d in refused))
     else:
         hard = next(d for _, d in refused if not d.awaiting)
         state, text = "failure", describe(False, hard.message + shared)
