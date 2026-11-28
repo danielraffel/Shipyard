@@ -16,6 +16,9 @@ fn a_missing_or_old_run_is_stale_and_a_recent_one_is_not() {
         Some(now - minutes(WORKER_STALE_AFTER_MINUTES - 1)),
         now
     ));
+    // A marker from the future is stale beyond a few minutes of skew.
+    assert!(!worker_is_stale(Some(now + minutes(4)), now));
+    assert!(worker_is_stale(Some(now + minutes(6)), now));
 }
 
 #[test]

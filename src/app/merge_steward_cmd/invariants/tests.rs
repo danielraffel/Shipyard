@@ -1059,20 +1059,28 @@ fn consumer(oldest_min_ago: Option<i64>, ran_min_ago: Option<i64>) -> Fixture {
     let mut fixture = Fixture::clean();
     fixture.recovery_consumer = Some(RecoveryConsumerFacts {
         oldest_unattempted: oldest_min_ago.map(|m| now() - chrono::Duration::minutes(m)),
+        backlog_unknown: false,
         last_worker_run: ran_min_ago.map(|m| now() - chrono::Duration::minutes(m)),
     });
     fixture
 }
 
-/// The m3 incident: requests sat unattempted for weeks and no worker ran.
+/// The m3 incident, and the state after the prune empties the backlog: the
+/// steward refuses every request, so the invariant fails whatever is waiting.
 #[test]
-fn old_unattempted_recovery_requests_with_no_worker_run_fail() {
-    for ran in [None, Some(60 * 24)] {
-        let invariants = consumer(Some(60 * 24 * 7), ran).evaluate();
-        let consumer = find(&invariants, RECOVERY_CONSUMER);
-        assert!(consumer.incident(), "{consumer:?}");
+fn a_stale_worker_fails_the_invariant_whatever_the_backlog() {
+    for (oldest, ran) in [
+        (Some(60 * 24 * 7), None),
+        (Some(60 * 24 * 7), Some(60 * 24)),
+        (None, None),
+        (None, Some(60 * 24)),
+        (Some(5), None),
+    ] {
+        let invariants = consumer(oldest, ran).evaluate();
+        let found = find(&invariants, RECOVERY_CONSUMER);
+        assert!(found.incident(), "{oldest:?} {ran:?}: {found:?}");
         assert!(
-            consumer
+            found
                 .fix
                 .as_deref()
                 .is_some_and(|fix| fix.contains("recovery-worker"))
@@ -1082,16 +1090,27 @@ fn old_unattempted_recovery_requests_with_no_worker_run_fail() {
 }
 
 #[test]
-fn a_recent_worker_run_a_young_backlog_or_no_backlog_holds() {
+fn a_recent_worker_run_holds_whatever_the_backlog() {
+    for oldest in [None, Some(30), Some(60 * 24)] {
+        assert!(find(&consumer(oldest, Some(30)).evaluate(), RECOVERY_CONSUMER).ok);
+    }
+}
+
+#[test]
+fn an_unreadable_backlog_does_not_hide_a_stale_worker() {
+    let mut fixture = consumer(None, None);
+    fixture.recovery_consumer = fixture
+        .recovery_consumer
+        .map(|facts| RecoveryConsumerFacts {
+            backlog_unknown: true,
+            ..facts
+        });
+    let invariants = fixture.evaluate();
+    let found = find(&invariants, RECOVERY_CONSUMER);
     assert!(
-        find(
-            &consumer(Some(60 * 24), Some(30)).evaluate(),
-            RECOVERY_CONSUMER
-        )
-        .ok
+        found.incident() && found.detail.contains("backlog unreadable"),
+        "{found:?}"
     );
-    assert!(find(&consumer(Some(30), None).evaluate(), RECOVERY_CONSUMER).ok);
-    assert!(find(&consumer(None, None).evaluate(), RECOVERY_CONSUMER).ok);
 }
 
 #[test]

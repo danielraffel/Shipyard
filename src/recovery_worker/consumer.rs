@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// A worker run older than this (or none) means no consumer.
 pub const WORKER_STALE_AFTER_MINUTES: i64 = 180;
+const MAX_MARKER_SKEW_MINUTES: i64 = 5;
 const LAST_RUN_FILE: &str = "worker-last-run";
 const LAST_RUN_SCHEMA: u32 = 1;
 
@@ -24,8 +25,11 @@ struct WorkerRun {
 /// considered consumed.
 #[must_use]
 pub fn worker_is_stale(last_run: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    last_run
-        .is_none_or(|at| now.signed_duration_since(at).num_minutes() >= WORKER_STALE_AFTER_MINUTES)
+    // A marker from the future (a clock step) proves nothing.
+    last_run.is_none_or(|at| {
+        let age = now.signed_duration_since(at).num_minutes();
+        !(-MAX_MARKER_SKEW_MINUTES..WORKER_STALE_AFTER_MINUTES).contains(&age)
+    })
 }
 
 impl RecoveryStore {

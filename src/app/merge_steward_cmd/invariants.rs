@@ -366,11 +366,14 @@ pub(super) struct Facts<'a> {
 pub(super) struct RecoveryConsumerFacts {
     /// Creation time of the oldest unattempted pending request.
     pub oldest_unattempted: Option<DateTime<Utc>>,
+    /// The backlog could not be read (a corrupt record, a lock timeout).
+    pub backlog_unknown: bool,
     /// When a worker last ran `--apply`.
     pub last_worker_run: Option<DateTime<Utc>>,
 }
 
-/// The four repository invariants, in a fixed order.
+/// The repository invariants, in a fixed order (the recovery consumer last,
+/// and only when recovery publication is on).
 #[must_use]
 pub(super) fn evaluate(facts: &Facts<'_>) -> Vec<Invariant> {
     let mut invariants = vec![
@@ -385,27 +388,25 @@ pub(super) fn evaluate(facts: &Facts<'_>) -> Vec<Invariant> {
     invariants
 }
 
-/// Recovery requests are published but nothing drains them: the oldest
-/// unattempted request is hours old and no worker has run in that window.
+/// Recovery publication is on but no worker has run recently, so the steward
+/// refuses every request. Fails whatever the backlog: a pruned or empty store
+/// is the gate working, not the consumer returning.
 fn recovery_consumer(consumer: &RecoveryConsumerFacts, now: DateTime<Utc>) -> Invariant {
     let limit = crate::recovery_worker::WORKER_STALE_AFTER_MINUTES;
-    let Some(oldest) = consumer.oldest_unattempted else {
-        return Invariant::holds(
-            RECOVERY_CONSUMER,
-            "no unattempted recovery request is waiting",
-        );
+    let backlog = if consumer.backlog_unknown {
+        "backlog unreadable".to_owned()
+    } else if let Some(oldest) = consumer.oldest_unattempted {
+        format!(
+            "oldest unattempted request {} min old",
+            (now - oldest).num_minutes()
+        )
+    } else {
+        "no unattempted request waiting".to_owned()
     };
-    let waiting = (now - oldest).num_minutes();
-    if waiting < limit {
-        return Invariant::holds(
-            RECOVERY_CONSUMER,
-            format!("oldest unattempted recovery request is {waiting} min old (limit {limit})"),
-        );
-    }
     if !crate::recovery_worker::worker_is_stale(consumer.last_worker_run, now) {
         return Invariant::holds(
             RECOVERY_CONSUMER,
-            format!("a recovery worker ran within {limit} min; {waiting} min backlog is draining"),
+            format!("a recovery worker ran within {limit} min; {backlog}"),
         );
     }
     let last = consumer.last_worker_run.map_or_else(
@@ -415,9 +416,8 @@ fn recovery_consumer(consumer: &RecoveryConsumerFacts, now: DateTime<Utc>) -> In
     Invariant::fails(
         RECOVERY_CONSUMER,
         format!(
-            "the oldest unattempted recovery request has waited {waiting} min and no worker \
-             has run in {limit} min (last run: {last}); the steward has stopped accepting \
-             requests"
+            "recovery publication is on but no worker has run in {limit} min (last run: \
+             {last}; {backlog}); the steward is refusing every recovery request"
         ),
         "schedule `shipyard runner recovery-worker --drain --apply` on an interval, or set \
          `[merge_steward.recovery_worker] enabled = false` until the worker is rolled out",

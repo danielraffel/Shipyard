@@ -329,14 +329,14 @@ pub(super) fn recovery_publication_is_enabled(
     Ok(true)
 }
 
-/// Proof of a consumer for the steward: an applying run writes the marker
-/// whether or not it finds work; a dry run writes nothing.
-fn note_worker_run(store: &RecoveryStore, apply: bool) -> Result<(), CliFailure> {
+/// Proof of a consumer for the steward: an applying run opens the store and
+/// writes the marker whether or not it finds work; a dry run writes nothing.
+pub(super) fn note_worker_run(state_dir: &Path, apply: bool) -> Result<(), CliFailure> {
     if !apply {
         return Ok(());
     }
-    store
-        .record_worker_run(chrono::Utc::now())
+    RecoveryStore::new(recovery_store_root(state_dir))
+        .and_then(|store| store.record_worker_run(chrono::Utc::now()))
         .map_err(|error| CliFailure::new(1, format!("failed to record worker run: {error}")))
 }
 
@@ -345,20 +345,24 @@ mod consumer_marker_tests {
     use super::*;
 
     #[test]
-    fn only_an_applying_run_writes_the_marker() {
+    fn only_an_applying_run_leaves_a_marker_the_steward_reads_as_fresh() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let store = RecoveryStore::new(temp.path()).expect("store");
-        note_worker_run(&store, false).expect("dry run");
-        assert!(store.last_worker_run().is_none());
-        note_worker_run(&store, true).expect("applying run");
-        assert!(store.last_worker_run().is_some());
+        note_worker_run(temp.path(), false).expect("dry run");
+        assert!(recovery_consumer_is_stale(temp.path()));
+        assert!(!recovery_store_root(temp.path()).exists());
+        note_worker_run(temp.path(), true).expect("applying run");
+        assert!(!recovery_consumer_is_stale(temp.path()));
     }
 }
 
 /// Whether no worker has run recently enough to consume a new request. The
 /// steward stops accepting requests while this holds.
 pub(super) fn recovery_consumer_is_stale(state_dir: &Path) -> bool {
-    RecoveryStore::new(recovery_store_root(state_dir)).map_or(true, |store| {
+    let root = recovery_store_root(state_dir);
+    if !root.exists() {
+        return true;
+    }
+    RecoveryStore::new(root).map_or(true, |store| {
         crate::recovery_worker::worker_is_stale(store.last_worker_run(), chrono::Utc::now())
     })
 }
@@ -380,8 +384,11 @@ pub(super) fn recovery_consumer_facts(
         return Some(super::invariants::RecoveryConsumerFacts::default());
     }
     let store = RecoveryStore::new(root).ok()?;
+    // The marker is read whatever the backlog read does.
+    let backlog = store.oldest_unattempted_pending();
     Some(super::invariants::RecoveryConsumerFacts {
-        oldest_unattempted: store.oldest_unattempted_pending().ok()?,
+        backlog_unknown: backlog.is_err(),
+        oldest_unattempted: backlog.unwrap_or(None),
         last_worker_run: store.last_worker_run(),
     })
 }
@@ -650,7 +657,7 @@ fn process_durable_requests<W: Write>(
     }
     let store = RecoveryStore::new(&store_root)
         .map_err(|error| CliFailure::new(1, format!("failed to open recovery store: {error}")))?;
-    note_worker_run(&store, apply)?;
+    note_worker_run(&runtime_paths.state_dir, apply)?;
     // Reconciliation is a terminal state transition. It must share the same
     // global lease as model execution so an active worker cannot be expired
     // while it is finishing bounded post-model validation or persistence.

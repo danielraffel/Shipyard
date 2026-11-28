@@ -531,7 +531,19 @@ fn settled_recovery_outcome(
                 policy_signature: &publication.policy_signature,
             },
         )
-        .then_some((None, None)),
+        .then_some((None, None))
+        .or_else(|| {
+            // Nothing is stored while no worker consumes the queue, so this
+            // would otherwise never settle and every pass would revalidate
+            // the pull request live. The ledger record is already proven.
+            super::recovery_worker::recovery_consumer_is_stale(&context.mutation_control.state_dir)
+                .then(|| {
+                    (
+                        Some("recovery_request_deferred:no_consumer".to_owned()),
+                        None,
+                    )
+                })
+        }),
         Err(_) => None,
     }
 }
