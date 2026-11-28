@@ -33,6 +33,7 @@ fn stacked_q(base_ref: &str, stacked_on: Option<u64>) -> OpenPr {
         author: None,
         commits: CommitList::Complete(set(&[SHARED, Q_HEAD])),
         stacked_on,
+        created_at: None,
     }
 }
 
@@ -46,6 +47,7 @@ fn parent(head_ref: &str) -> OpenPr {
         author: None,
         commits: CommitList::Complete(set(&[PARENT_HEAD])),
         stacked_on: None,
+        created_at: None,
     }
 }
 

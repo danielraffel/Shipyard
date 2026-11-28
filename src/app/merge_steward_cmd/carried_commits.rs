@@ -26,43 +26,32 @@
 //!   keeps P admissible when P's own commit reached Q through a chain. A pull
 //!   request that merges another pull request's branch still has those
 //!   commits in its own diff and is still caught.
-//! * Never excused by ancestry alone: a Q that contains P's whole head (Q
-//!   built on P while targeting the base, or Q merged P back in) is judged
-//!   like any other Q. Head ancestry cannot say which pull request introduced
-//!   a shared commit, so the commits both ranges hold clear P only while Q's
-//!   listed head is approved, without a HOLD, or once they are on the base,
-//!   with one exception, the declared older parent: when Q declares the
-//!   stack (Q is labelled `stacked:<P>`, or reaches P through a chain of
-//!   open pull requests' `stacked:<n>` labels and base branches), P was
-//!   opened before Q, and Q's own diff holds P's exact head, a shared commit
-//!   on P's first-parent chain is P's own even though it is on Q's
-//!   first-parent chain too (Q branched off P's line). The label never clears
-//!   anything by itself; it only unlocks that graph proof, and its `labeled`
-//!   event names who declared the stack. `Supersedes #n` and the
-//!   clean-replacement marker are never read here: they say P is to be
-//!   closed, not merged. Commits P merged in (off P's first-parent chain), an
-//!   undeclared Q, a Q built on an older head of P's, and a P opened after Q
-//!   stay refused, and the refusal detail names which of the three it was
-//!   and the fix. Named residual: a Q labelled `stacked:P` whose author
-//!   opened P first and reset it onto Q's held commits is cleared; the label
-//!   event names who declared it.
-//! * Q merged P's branch without being stacked on it: a shared commit counts
-//!   against P only when it is on Q's first-parent chain (`Q.base..Q.head`
-//!   walked through first parents) or is not on P's own first-parent chain
-//!   (`base..P.head`). A commit on P's first-parent chain that reached Q only
-//!   through a merge's second parent is P's own, so it does not hold P; when
-//!   every shared commit is P's own, Q is cleared, and a refusal P still gets
-//!   from another pull request says "#Q merged or built on #P's branch; not
-//!   carried".
-//!   The real catches remain: P merging held work in (the held commits are
-//!   P's second parent, so not on P's first-parent chain) and P built
-//!   straight on commits on Q's own first-parent chain (on both chains). A
-//!   first-parent read that fails or is over the cap keeps the overlap.
-//!   Named residual: P built straight on commits that held Q itself took in
-//!   through a merge's second parent (Q = merge(Q.base, X) with P on X, or Q's
-//!   tip re-hung as merge(Q.base, old tip)) is cleared. The commit graph
-//!   cannot tell that from Q having merged P's branch, so X lands under P's
-//!   own approval; P's reviewer reviews X as P's diff.
+//! * Q introduced the commit, but P's branch held it first: P owns it (see
+//!   [`ownership`]). Head ancestry, labels (`stacked:<n>`), opening order,
+//!   `Supersedes #n`, the clean-replacement marker and verdict times never
+//!   decide whose a shared commit is: the commit graph is the same whether Q
+//!   branched off P or P took Q's commits. GitHub's repository activity log
+//!   records, with the server's timestamp, every sha each branch moved to,
+//!   so a shared commit is P's exactly when P's branch (in its current life)
+//!   held it strictly before Q's branch did. A child stacked on P that
+//!   targets the base, held or unreviewed, therefore never blocks P, a
+//!   parent with several children or a child built on several parents is
+//!   settled pair by pair, and a commit that came to P from Q (P merged Q,
+//!   was reset or fast-forwarded onto Q, or cherry-picked the same sha)
+//!   stays Q's: while Q's current head is not approved it refuses P, however
+//!   recent P's approval or however old Q's HOLD. An unreadable log, a log of
+//!   Q's branch that is not whole and current (see [`ownership`]), a compare
+//!   over the cap, more logged entries than the read limit, a
+//!   cross-repository branch, or equal times leave the commit Q's, and the
+//!   refusal says so. Ownership follows push order, not intent: a child
+//!   pushed before its parent, or in the same second, owns the shared
+//!   commits.
+//!   Ownership is read only for an overlap whose shared commits are listed:
+//!   an over-cap Q, and every overlap of an over-cap P, clear only by Q's
+//!   approval. Named residuals: the log's retention bounds what can be
+//!   proved (an expired entry can only make a commit Q's); and a commit that
+//!   reached P's branch first through some third branch is P's, though P's
+//!   reviewer approved a diff containing it.
 //! * A carried commit whose change is already on the base under other shas
 //!   (a merge that only re-applies landed content, a cherry-pick with the
 //!   base's patch-id and matching changed entries): see [`landed`]. The
@@ -149,7 +138,7 @@ const SHAS_NAMED: usize = 10;
 const OPEN_PULL_COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){\
      repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:50,after:$cursor){\
      pageInfo{hasNextPage endCursor} nodes{number headRefName headRefOid baseRefName \
-     isCrossRepository author{login} labels(first:50){nodes{name}} \
+     isCrossRepository createdAt author{login} labels(first:50){nodes{name}} \
      carriedCommits:commits(first:100){totalCount nodes{commit{oid}}}}}}}";
 
 /// The commits a pull request carries, as far as the steward read them.
@@ -177,6 +166,8 @@ pub(super) struct OpenPr {
     /// The parent pull request a `stacked:<n>` label names, the label
     /// `shipyard pr --stacked-on <n>` applies.
     pub stacked_on: Option<u64>,
+    /// When the pull request was opened (GitHub's `createdAt`), when listed.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The candidate under admission.
@@ -311,66 +302,6 @@ fn stacked_on(q: &OpenPr, head_ref: &str, others: &[OpenPr]) -> bool {
     false
 }
 
-/// Whether `q` declares a stack on P (`p_number`, head branch `p_head_ref`):
-/// walking from `q`, some pull request on the walk is labelled
-/// `stacked:<P>` or (same repository) targets P's head branch. Each step
-/// follows the `stacked:<n>` label to that open pull request, or else the
-/// base branch to the open same-repository pull request whose head branch it
-/// is. Pure; a cycle or a walk off the open pull requests ends it.
-fn declared_stack_reaches(q: &OpenPr, p_number: u64, p_head_ref: &str, others: &[OpenPr]) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut at = q;
-    while seen.insert(at.number) {
-        if at.stacked_on == Some(p_number) || (!at.cross_repository && at.base_ref == p_head_ref) {
-            return true;
-        }
-        let next = others
-            .iter()
-            .find(|s| Some(s.number) == at.stacked_on)
-            .or_else(|| {
-                others
-                    .iter()
-                    .find(|s| !s.cross_repository && s.head_ref == at.base_ref)
-            });
-        match next {
-            Some(next) => at = next,
-            None => return false,
-        }
-    }
-    false
-}
-
-/// Why P is not `q`'s older parent, when the shared commits sit on both
-/// first-parent chains. Each names the fix in the refusal detail.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OlderParentMiss {
-    /// P was opened after `q`.
-    NewerParent,
-    /// `q` does not declare a stack on P.
-    Undeclared,
-    /// `q`'s own diff does not hold P's current head.
-    HeadNotContained,
-}
-
-impl OlderParentMiss {
-    /// The refusal-detail suffix naming the fix.
-    fn detail(self, p: u64, q: u64) -> String {
-        match self {
-            Self::Undeclared => format!(
-                "; #{q} built on #{p}'s head but is not labelled stacked:{p}: label it \
-                 (shipyard pr --stacked-on {p}) or retarget #{q} onto #{p}'s branch"
-            ),
-            Self::NewerParent => format!(
-                "; #{q} built on #{p}'s head but #{p} was opened after #{q}: retarget #{q} \
-                 onto #{p}'s branch"
-            ),
-            Self::HeadNotContained => {
-                format!("; #{q} is on an older head of #{p}: merge #{p} into #{q}")
-            }
-        }
-    }
-}
-
 /// What an overlap with `q` narrows to once `q`'s own diff is read.
 #[derive(Debug)]
 enum Narrowed {
@@ -419,8 +350,7 @@ fn introduced_overlap(
         }
         Carried::Unbounded { .. } => (own.clone(), false),
     };
-    // The same read later gives `q`'s first-parent chain, so `q`'s own diff
-    // and its chain describe one comparison even if `q`'s base moves.
+    // One cached read per `(base, head)` for the pass.
     match cached_graph(run_gh, repo, graphs, &q.base_ref, &q.head_sha)? {
         CommitGraph::Complete(introduced) => {
             let shared: Vec<String> = candidates
@@ -706,9 +636,11 @@ pub(super) struct PassCache {
     /// Each open pull request's own roots, by number and listed head, for
     /// every over-cap candidate and admission path in the pass.
     roots: BTreeMap<(u64, String), Result<Roots, String>>,
-    /// Commit graphs (`base...head` with parents), by `(base, head)`: a
-    /// pull request's own diff and its first-parent chain come from one read.
+    /// Commit graphs (`base...head` with parents), by `(base, head)`, read
+    /// once per pass: own diffs, and each logged head for [`ownership`].
     graphs: GraphCache,
+    /// Branch activity logs, by branch, for [`ownership`].
+    activity: ownership::ActivityCache,
 }
 
 impl PassCache {
@@ -911,9 +843,13 @@ pub(super) fn refusal_with(
         commits: &own,
     };
     let overlaps = carried(&candidate, others);
+    // P's own row: whether its branch is in this repository's activity log.
+    let p_cross_repository = others
+        .iter()
+        .find(|row| row.number == number)
+        .is_none_or(|row| row.cross_repository);
     let mut judged = Vec::with_capacity(overlaps.len());
-    let mut merged_own = Vec::new();
-    let mut stack_misses = Vec::new();
+    let mut notes = Vec::new();
     for overlap in overlaps {
         let q = others
             .iter()
@@ -932,195 +868,124 @@ pub(super) fn refusal_with(
         ) else {
             continue;
         };
-        let graphs = std::cell::RefCell::new(&mut cache.graphs);
-        let mut chain = |chain_base: &str, chain_head: &str| {
-            cached_graph(
-                run_gh,
-                repo,
-                &mut graphs.borrow_mut(),
-                chain_base,
-                chain_head,
-            )
-            .and_then(|graph| first_parent_chain(&graph, chain_base, chain_head))
-        };
-        let mut older_parent = || {
-            let graph = cached_graph(
-                run_gh,
-                repo,
-                &mut graphs.borrow_mut(),
-                &q.base_ref,
-                &q.head_sha,
-            );
-            older_parent_of(number, head_sha, head_ref, q, others, graph.as_ref())
-        };
-        let mut miss = None;
-        match without_own_commits(
+        let Some(settled) = without_p_owned(
             settled,
+            run_gh,
+            repo,
             base,
-            head_sha,
+            (number, head_ref, p_cross_repository),
             q,
-            &mut older_parent,
-            &mut chain,
-            &mut miss,
-        ) {
-            Some(settled) => {
-                if let Some(settled) = landed::without_landed_commits(run_gh, repo, base, settled) {
-                    judged.push(settled);
-                    if let Some(miss) = miss {
-                        stack_misses.push((q.number, miss));
-                    }
-                }
-            }
-            None => merged_own.push(q.number),
+            (&mut cache.activity, &mut cache.graphs),
+            &mut notes,
+        ) else {
+            continue;
+        };
+        if let Some(settled) = landed::without_landed_commits(run_gh, repo, base, settled) {
+            judged.push(settled);
         }
     }
     decide(base, &judged).map(|mut refusal| {
-        for (q, miss) in stack_misses {
-            refusal.detail.push_str(&miss.detail(number, q));
-        }
-        for q in merged_own {
-            use std::fmt::Write as _;
-            let _ = write!(
-                refusal.detail,
-                "; #{q} merged or built on #{number}'s branch; not carried"
-            );
+        // Only notes for a pull request the refusal still names.
+        for (q, note) in notes {
+            if judged.iter().any(|(carried, _)| carried.number() == q) {
+                refusal.detail.push_str(&note);
+            }
         }
         refusal
     })
 }
 
-/// Reads a `(base, head)` first-parent chain.
-type ChainReader<'a> = dyn FnMut(&str, &str) -> Result<BTreeSet<String>, String> + 'a;
-
-/// Whether `q` builds on P as a declared older parent: P (`number`, head
-/// branch `head_ref`) was opened before `q`, `q` declares the stack (see
-/// [`declared_stack_reaches`]), and `q`'s own diff (`graph`,
-/// `q.base...q.head`) holds P's exact head, so `q`'s head contains every
-/// commit P has. Pure. The miss says which condition failed, checked in that
-/// order.
-///
-/// This is the evidence the commit graph alone lacks. When P's and `q`'s
-/// first-parent chains share a run of commits, the graph cannot say whether
-/// `q` branched off P or P branched off `q`; `q`'s author declared that `q`
-/// builds on P, P proposed those commits first, and P's exact-head approval
-/// reviewed them as P's own diff. The declaration alone clears nothing: an
-/// undeclared `q`, a `q` older than P, and a `q` that does not contain P's
-/// current head (P moved on since `q` took it) are not older parents. Named
-/// residual: a `q` labelled `stacked:P` whose author opened P first and reset
-/// it onto `q`'s held commits is cleared; the label event names who declared
-/// it.
-fn older_parent_of(
-    number: u64,
-    p_head: &str,
-    head_ref: &str,
-    q: &OpenPr,
-    others: &[OpenPr],
-    graph: Result<&CommitGraph, &String>,
-) -> Result<(), OlderParentMiss> {
-    if number >= q.number {
-        return Err(OlderParentMiss::NewerParent);
-    }
-    if !declared_stack_reaches(q, number, head_ref, others) {
-        return Err(OlderParentMiss::Undeclared);
-    }
-    if matches!(graph, Ok(CommitGraph::Complete(introduced)) if introduced.contains_key(p_head)) {
-        Ok(())
-    } else {
-        Err(OlderParentMiss::HeadNotContained)
-    }
-}
-
-/// Drop from a refusing overlap with `q` the commits that are P's own: on P's
-/// first-parent chain (`base..p_head`) and either not on `q`'s
-/// (`q.base..q.head`), or on both chains while P is `q`'s older parent
-/// (`older_parent`, see [`older_parent_of`]). A commit of the first kind
-/// reached `q` only through a merge's second parent, so `q` merged P's branch;
-/// one of the second kind is P's line that `q` built on. Either way P carries
-/// nothing of `q`'s through it. A shared commit off P's first-parent chain
-/// (work P merged in) is never P's own. `None` when every shared commit is
-/// P's own. An approved `q`, an unbounded overlap, and any chain that cannot
-/// be read keep the overlap as it is. When a kept commit is on both chains,
-/// `miss` is set to why P is not `q`'s older parent.
-fn without_own_commits(
+/// Drop from a refusing overlap with `q` the shared commits P owns: those
+/// P's branch held strictly before `q`'s did ([`ownership`]). `None` when
+/// every shared commit is P's. An approved `q` and an unbounded overlap are
+/// returned as they are. When ownership cannot be settled the overlap is kept
+/// whole, and `notes` says why; when commits stay `q`'s, `notes` says that.
+#[allow(clippy::too_many_arguments)]
+fn without_p_owned(
     settled: (Carried, Judgement),
+    run_gh: RunGh<'_>,
+    repo: &str,
     base: &str,
-    p_head: &str,
+    (number, head_ref, p_cross_repository): (u64, &str, bool),
     q: &OpenPr,
-    older_parent: &mut dyn FnMut() -> Result<(), OlderParentMiss>,
-    chain: &mut ChainReader<'_>,
-    miss: &mut Option<OlderParentMiss>,
+    (activity, graphs): (&mut ownership::ActivityCache, &mut GraphCache),
+    notes: &mut Vec<(u64, String)>,
 ) -> Option<(Carried, Judgement)> {
-    let (
-        Carried::Shares {
-            number,
-            head_sha,
-            shared,
-        },
-        judgement,
-    ) = &settled
-    else {
-        return Some(settled);
-    };
-    if *judgement == Judgement::Approved {
-        return Some(settled);
-    }
-    let (Ok(p_chain), Ok(q_chain)) = (chain(base, p_head), chain(&q.base_ref, &q.head_sha)) else {
-        return Some(settled);
-    };
-    let older_parent = older_parent();
-    let kept: Vec<String> = shared
-        .iter()
-        .filter(|sha| !p_chain.contains(*sha) || (q_chain.contains(*sha) && older_parent.is_err()))
-        .cloned()
-        .collect();
-    if kept.is_empty() {
-        return None;
-    }
-    if kept
-        .iter()
-        .any(|sha| p_chain.contains(sha) && q_chain.contains(sha))
-    {
-        *miss = older_parent.err();
-    }
-    Some((
-        Carried::Shares {
-            number: *number,
-            head_sha: head_sha.clone(),
-            shared: kept,
-        },
-        judgement.clone(),
-    ))
-}
-
-/// `head`'s first-parent chain not on `base` (`git log --first-parent
-/// base..head`): from `head`, follow each commit's first parent while it is
-/// one of `head`'s commits not on `base`. An over-cap compare is an error, so
-/// the caller keeps the overlap.
-fn first_parent_chain(
-    graph: &CommitGraph,
-    base: &str,
-    head: &str,
-) -> Result<BTreeSet<String>, String> {
-    let graph = match graph {
-        CommitGraph::Complete(graph) => graph,
-        CommitGraph::OverCap { total } => {
-            return Err(format!(
-                "compare {base}...{head} has {total} commits, over the first-parent read cap"
-            ));
+    Some(match settled {
+        (
+            Carried::Shares {
+                number: q_number,
+                head_sha: q_head,
+                shared,
+            },
+            judgement,
+        ) if judgement != Judgement::Approved
+            // An over-cap Q (its own diff over the cap, narrowed by probing)
+            // clears only through its approval: ownership is never read for
+            // it, since the walk cannot see all of Q's commits.
+            && !matches!(
+                graphs.get(&(q.base_ref.clone(), q.head_sha.clone())),
+                Some(Ok(CommitGraph::OverCap { .. }))
+            ) =>
+        {
+            match ownership::p_owned(
+                run_gh,
+                repo,
+                base,
+                head_ref,
+                p_cross_repository,
+                q,
+                &shared,
+                activity,
+                graphs,
+            ) {
+                Ok(owned) => {
+                    let kept: Vec<String> = shared
+                        .iter()
+                        .filter(|sha| !owned.contains(*sha))
+                        .cloned()
+                        .collect();
+                    if kept.is_empty() {
+                        return None;
+                    }
+                    notes.push((
+                        q_number,
+                        format!(
+                            "; #{q_number}'s branch held {} of them before #{number}'s did \
+                             (repository activity log), so they are #{q_number}'s",
+                            kept.len()
+                        ),
+                    ));
+                    (
+                        Carried::Shares {
+                            number: q_number,
+                            head_sha: q_head,
+                            shared: kept,
+                        },
+                        judgement,
+                    )
+                }
+                Err(error) => {
+                    notes.push((
+                        q_number,
+                        format!(
+                            "; which branch held #{q_number}'s shared commits first could not \
+                             be settled ({error}), so they count as #{q_number}'s"
+                        ),
+                    ));
+                    (
+                        Carried::Shares {
+                            number: q_number,
+                            head_sha: q_head,
+                            shared,
+                        },
+                        judgement,
+                    )
+                }
+            }
         }
-    };
-    let mut chain = BTreeSet::new();
-    let mut at = head.to_owned();
-    while let Some(parents) = graph.get(&at) {
-        if !chain.insert(at.clone()) {
-            break;
-        }
-        match parents.first() {
-            Some(first) => at = first.clone(),
-            None => break,
-        }
-    }
-    Ok(chain)
+        settled => settled,
+    })
 }
 
 /// Q's approval is judged only at the head the listing saw, so the live
@@ -1600,6 +1465,10 @@ fn parse_open_pr(run_gh: RunGh<'_>, repo: &str, node: &Value) -> Result<OpenPr, 
             .flatten()
             .filter_map(|label| label.get("name").and_then(Value::as_str))
             .find_map(stacked_label_parent),
+        created_at: node
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(|at| at.parse().ok()),
     })
 }
 
@@ -1623,8 +1492,13 @@ fn rest_commits(run_gh: RunGh<'_>, repo: &str, number: u64) -> Result<BTreeSet<S
 
 mod landed;
 
+mod ownership;
+
 #[cfg(test)]
 mod stacked_verdict_tests;
+
+#[cfg(test)]
+mod parent_child_tests;
 
 #[cfg(test)]
 mod tests;

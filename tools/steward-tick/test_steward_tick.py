@@ -337,6 +337,30 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.run_tick()
         self.assertIn(" recovery_store=1024/1024!FULL", self.summary_line())
 
+    def test_ownership_activity_reads_are_named_in_the_summary_line(self):
+        body = json.dumps({"repos": [
+            {"repo": "acme/repo", "prs": [], "errors": [],
+             "api_calls": {"sites": [
+                 {"kind": "rest", "site": "api repos/*/*/activity", "calls": 4},
+                 {"kind": "rest", "site": "api repos/*/*/compare/{range}", "calls": 9},
+             ]}},
+        ]})
+        (self.home / "pass.json").write_text(body)
+        stub = self.home / ".local" / "bin" / "shipyard"
+        stub.write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = --version ]; then echo 'shipyard 1.0'; exit 0; fi\n"
+            f"cat '{self.home / 'pass.json'}'\n"
+        )
+        stub.chmod(0o755)
+        self.run_tick()
+        self.assertIn(" ownership_reads=4", self.summary_line())
+
+    def test_a_pass_without_ownership_reads_omits_the_field(self):
+        self.steward_prints([], rc=0)
+        self.run_tick()
+        self.assertNotIn("ownership_reads=", self.summary_line())
+
     def test_a_pass_without_recovery_publication_reports_the_store_off(self):
         self.steward_prints([], rc=0)
         self.run_tick()

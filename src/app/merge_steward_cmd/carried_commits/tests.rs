@@ -30,6 +30,7 @@ fn open(number: u64, head_ref: &str, base_ref: &str, head: &str, shas: &[&str]) 
         author: None,
         commits: CommitList::Complete(set(shas)),
         stacked_on: None,
+        created_at: None,
     }
 }
 
@@ -199,6 +200,7 @@ fn listing(prs: &[(&OpenPr, usize)]) -> serde_json::Value {
                 "baseRefName": pr.base_ref,
                 "headRefOid": pr.head_sha,
                 "isCrossRepository": pr.cross_repository,
+                "createdAt": "2026-11-27T23:00:00Z",
                 "author": {"login": "someone"},
                 "carriedCommits": {
                     "totalCount": total,
@@ -546,26 +548,106 @@ fn first_parent_refusal(
     p_graph: Graph<'_>,
     others: &[(&OpenPr, Graph<'_>)],
 ) -> Option<super::Refusal> {
-    let listed = listing(
-        &others
-            .iter()
-            .map(|(q, _)| {
-                let CommitList::Complete(c) = &q.commits else {
-                    unreachable!()
-                };
-                (*q, c.len())
-            })
-            .collect::<Vec<_>>(),
-    )
-    .to_string();
+    let mut order: Vec<&str> = others.iter().map(|(q, _)| q.head_ref.as_str()).collect();
+    order.push(P_HEAD_BRANCH);
+    first_parent_ordered(p_head, p_graph, others, &order)
+}
+
+/// [`first_parent_refusal`] with each branch's activity log served: every
+/// branch was created once, at its current head, in the order `order` names
+/// the branches (P's is [`P_HEAD_BRANCH`]). [`first_parent_refusal`] creates
+/// P's branch last, so P owns nothing.
+fn first_parent_ordered(
+    p_head: &str,
+    p_graph: Graph<'_>,
+    others: &[(&OpenPr, Graph<'_>)],
+    order: &[&str],
+) -> Option<super::Refusal> {
+    let head_of = |branch: &str| {
+        if branch == P_HEAD_BRANCH {
+            p_head.to_owned()
+        } else {
+            others
+                .iter()
+                .find(|(q, _)| q.head_ref == branch)
+                .expect("an ordered branch is listed")
+                .0
+                .head_sha
+                .clone()
+        }
+    };
+    let logs: Vec<(String, Vec<(usize, String)>)> = order
+        .iter()
+        .enumerate()
+        .map(|(index, branch)| ((*branch).to_owned(), vec![(index + 1, head_of(branch))]))
+        .collect();
+    ownership_refusal(p_head, p_graph, others, &logs, &[])
+}
+
+/// P (#11363, base main, listed) at `p_head` with `p_graph`, `others` with
+/// their own graphs, each branch's activity log as `(hour, head)` entries
+/// (the first a creation), and `extra` graphs (`main...head`) for logged
+/// heads that are no pull request's current head.
+fn ownership_refusal(
+    p_head: &str,
+    p_graph: Graph<'_>,
+    others: &[(&OpenPr, Graph<'_>)],
+    logs: &[(String, Vec<(usize, String)>)],
+    extra: &[(&str, Graph<'_>)],
+) -> Option<super::Refusal> {
+    let p_row = open(
+        11363,
+        P_HEAD_BRANCH,
+        "main",
+        p_head,
+        &p_graph.iter().map(|(sha, _)| *sha).collect::<Vec<_>>(),
+    );
+    let mut rows: Vec<(&OpenPr, usize)> = others
+        .iter()
+        .map(|(q, _)| {
+            let CommitList::Complete(c) = &q.commits else {
+                unreachable!()
+            };
+            (*q, c.len())
+        })
+        .collect();
+    rows.push((&p_row, p_graph.len()));
+    let listed = listing(&rows).to_string();
     let mut compares = vec![("main".to_owned(), p_head.to_owned(), p_graph)];
     for (q, g) in others {
         compares.push((q.base_ref.clone(), q.head_sha.clone(), *g));
+        // The ownership read compares each logged head against the base.
+        compares.push(("main".to_owned(), q.head_sha.clone(), *g));
+    }
+    for (head, g) in extra {
+        compares.push(("main".to_owned(), (*head).to_owned(), *g));
     }
     let run_gh = |argv: &[String]| -> Result<String, String> {
         let joined = argv.join(" ");
         if joined.contains("OPEN") {
             return Ok(listed.clone());
+        }
+        if joined.contains("/activity?") {
+            for (branch, entries) in logs {
+                if joined.contains(&format!("ref=refs/heads/{branch}&")) {
+                    return Ok(entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (hour, head))| {
+                            let (kind, before) = if index == 0 {
+                                ("branch_creation", "0".repeat(40))
+                            } else {
+                                ("push", entries[index - 1].1.clone())
+                            };
+                            json!({"at": format!("2026-11-27T{hour:02}:00:00Z"),
+                                "kind": kind, "before": before, "after": head})
+                            .to_string()
+                        })
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n"));
+                }
+            }
         }
         for (base, head, g) in &compares {
             if joined.contains(&format!("compare/{base}...{head}?")) {
@@ -591,6 +673,17 @@ fn first_parent_refusal(
     )
 }
 
+/// One branch's log.
+fn log(branch: &str, entries: &[(usize, &str)]) -> (String, Vec<(usize, String)>) {
+    (
+        branch.to_owned(),
+        entries
+            .iter()
+            .map(|(hour, head)| (*hour, (*head).to_owned()))
+            .collect(),
+    )
+}
+
 const P_LINE: Graph<'static> = &[(FP_P1, &[FP_MAIN]), (FP_P2, &[FP_P1])];
 
 #[test]
@@ -603,9 +696,20 @@ fn a_stacked_pr_that_merged_the_candidates_branch_does_not_hold_it() {
         (FP_P2, &[FP_P1]),
         (FP_QM, &["feat-x-tip", FP_P2]),
     ];
-    assert_eq!(first_parent_refusal(FP_P2, P_LINE, &[(&q, q_graph)]), None);
+    // P's branch held P1 and P2 before Q's did: they are P's.
+    assert_eq!(
+        first_parent_ordered(FP_P2, P_LINE, &[(&q, q_graph)], &[P_HEAD_BRANCH, "feat/q2"]),
+        None
+    );
+    // Control: Q's branch held them first, so they are Q's and refuse P.
+    assert_eq!(
+        first_parent_refusal(FP_P2, P_LINE, &[(&q, q_graph)])
+            .expect("refused")
+            .token,
+        "carries_unapproved_commits:#21"
+    );
 
-    // A refusal P still gets from another pull request says why Q is not in it.
+    // A refusal P still gets from another pull request leaves Q out of it.
     let held = open(30, "feat/held", "main", FP_H2, &[FP_H1, FP_H2]);
     let held_graph: Graph<'_> = &[(FP_H1, &[FP_MAIN]), (FP_H2, &[FP_H1])];
     let p_graph: Graph<'_> = &[
@@ -615,13 +719,18 @@ fn a_stacked_pr_that_merged_the_candidates_branch_does_not_hold_it() {
         (FP_H2, &[FP_H1]),
         (FP_PM, &[FP_P2, FP_H2]),
     ];
-    let refusal = first_parent_refusal(FP_PM, p_graph, &[(&q, q_graph), (&held, held_graph)])
-        .expect("the held pull request still refuses");
+    let refusal = first_parent_ordered(
+        FP_PM,
+        p_graph,
+        &[(&q, q_graph), (&held, held_graph)],
+        &["feat/held", P_HEAD_BRANCH, "feat/q2"],
+    )
+    .expect("the held pull request still refuses");
     assert_eq!(refusal.token, "carries_unapproved_commits:#30");
     assert!(
         refusal
             .detail
-            .contains("#21 merged or built on #11363's branch; not carried"),
+            .contains("#30's branch held 2 of them before #11363's did"),
         "{}",
         refusal.detail
     );
@@ -694,7 +803,15 @@ fn a_merge_of_the_candidates_branch_with_one_real_q_commit_is_refused_for_that_c
         (FP_QM, &[FP_Q1, FP_P2]),
     ];
     let p_graph: Graph<'_> = &[(FP_Q1, &[FP_MAIN]), (FP_P1, &[FP_Q1]), (FP_P2, &[FP_P1])];
-    let refusal = first_parent_refusal(FP_P2, p_graph, &[(&q, q_graph)]).expect("refused");
+    // Q's branch held Q1 (1); P's branch was created on it with P1, P2 (2);
+    // Q then merged P's branch (3).
+    let logs = [
+        log("feat/q4", &[(1, FP_Q1), (3, FP_QM)]),
+        log(P_HEAD_BRANCH, &[(2, FP_P2)]),
+    ];
+    let extra: [(&str, Graph<'_>); 1] = [(FP_Q1, &[(FP_Q1, &[FP_MAIN])])];
+    let refusal =
+        ownership_refusal(FP_P2, p_graph, &[(&q, q_graph)], &logs, &extra).expect("refused");
     assert_eq!(refusal.token, "carries_unapproved_commits:#34");
     assert!(
         refusal.detail.contains("carries 1 commit(s) of #34"),
@@ -801,7 +918,7 @@ fn a_candidate_that_merged_a_held_pr_and_then_main_is_refused() {
 }
 
 #[test]
-fn a_criss_cross_merge_is_refused_for_qs_own_commit_only() {
+fn a_criss_cross_merge_is_refused_for_the_commit_qs_branch_held_first() {
     // P merged Q1 and Q (base feat/x) merged P1: P1 is P's own, Q1 is Q's.
     let q = open(38, "feat/q8", "feat/x", FP_QM, &[FP_Q1, FP_P1, FP_QM]);
     let q_graph: Graph<'_> = &[
@@ -814,19 +931,36 @@ fn a_criss_cross_merge_is_refused_for_qs_own_commit_only() {
         (FP_Q1, &[FP_MAIN]),
         (FP_PM, &[FP_P1, FP_Q1]),
     ];
-    let refusal = first_parent_refusal(FP_PM, p_graph, &[(&q, q_graph)]).expect("refused");
+    let logs = [
+        log(P_HEAD_BRANCH, &[(1, FP_P1), (4, FP_PM)]),
+        log("feat/q8", &[(2, FP_Q1), (3, FP_QM)]),
+    ];
+    let extra: [(&str, Graph<'_>); 2] = [
+        (FP_P1, &[(FP_P1, &[FP_MAIN])]),
+        (FP_Q1, &[(FP_Q1, &[FP_MAIN])]),
+    ];
+    let refusal =
+        ownership_refusal(FP_PM, p_graph, &[(&q, q_graph)], &logs, &extra).expect("refused");
     assert_eq!(refusal.token, "carries_unapproved_commits:#38");
     assert!(refusal.detail.contains(FP_Q1), "{}", refusal.detail);
     assert!(!refusal.detail.contains(FP_P1), "{}", refusal.detail);
+
+    // Control: with Q's branch first to hold P1 as well, both are Q's.
+    let q_first = [
+        log(P_HEAD_BRANCH, &[(4, FP_PM)]),
+        log("feat/q8", &[(2, FP_Q1), (3, FP_QM)]),
+    ];
+    let refusal =
+        ownership_refusal(FP_PM, p_graph, &[(&q, q_graph)], &q_first, &extra).expect("refused");
+    assert!(refusal.detail.contains(FP_P1), "{}", refusal.detail);
 }
 
 #[test]
-fn residual_a_candidate_built_on_commits_a_held_pr_merged_in_is_cleared() {
-    // Named residual, documented as current behaviour: held Q (base feat/x)
-    // is merge(feat/x tip, X2), taking X1..X2 in as a second parent, and P is
-    // built straight on X2. X1 and X2 are on P's first-parent chain and not
-    // on Q's, which the graph cannot tell from Q having merged P's branch, so
-    // Q is cleared and X lands under P's own approval.
+fn a_candidate_built_on_commits_a_held_pr_merged_in_is_refused() {
+    // Held Q (base feat/x) is merge(feat/x tip, X2), taking X1..X2 in as a
+    // second parent, and P is built straight on X2. The first-parent rule
+    // used to clear this (a named residual); Q's branch held X first, so X is
+    // Q's and refuses P.
     let q = open(39, "feat/q9", "feat/x", FP_QM, &[FP_H1, FP_H2, FP_QM]);
     let q_graph: Graph<'_> = &[
         (FP_H1, &[FP_MAIN]),
@@ -834,7 +968,19 @@ fn residual_a_candidate_built_on_commits_a_held_pr_merged_in_is_cleared() {
         (FP_QM, &["feat-x-tip", FP_H2]),
     ];
     let p_graph: Graph<'_> = &[(FP_H1, &[FP_MAIN]), (FP_H2, &[FP_H1]), (FP_P1, &[FP_H2])];
-    assert_eq!(first_parent_refusal(FP_P1, p_graph, &[(&q, q_graph)]), None);
+    let refusal = first_parent_refusal(FP_P1, p_graph, &[(&q, q_graph)]).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#39");
+
+    // Control: had P's branch held X first, it would be P's.
+    assert_eq!(
+        first_parent_ordered(
+            FP_P1,
+            p_graph,
+            &[(&q, q_graph)],
+            &[P_HEAD_BRANCH, "feat/q9"]
+        ),
+        None
+    );
 }
 
 #[test]
@@ -993,6 +1139,81 @@ fn an_over_cap_own_diff_that_carries_the_candidates_commit_is_refused() {
     let refusal = independent_refusal(&run_gh, &Cell::new(0)).expect("refused");
     assert_eq!(refusal.token, "carries_unapproved_commits:#11450");
     assert!(refusal.detail.contains(INDEPENDENT), "{}", refusal.detail);
+}
+
+/// Review 1754-r3-f2: an over-cap Q (its own diff over the cap, narrowed by
+/// probing) clears only through its approval. P's branch held the commit
+/// first by the activity log, and P is still refused.
+#[test]
+fn an_over_cap_own_diff_is_never_cleared_by_ownership() {
+    let listing = json!({"data": {"repository": {"pullRequests": {
+        "pageInfo": {"hasNextPage": false, "endCursor": null},
+        "nodes": [
+            {"number": 11450, "headRefName": "feat/stacked", "baseRefName": STACKED_BASE,
+             "headRefOid": STACKED_HEAD, "isCrossRepository": false,
+             "createdAt": "2026-11-27T23:00:00Z", "author": {"login": "someone"},
+             "carriedCommits": {"totalCount": 278, "nodes": []}},
+            {"number": 11558, "headRefName": "feat/independent", "baseRefName": "main",
+             "headRefOid": INDEPENDENT, "isCrossRepository": false,
+             "createdAt": "2026-11-27T23:00:00Z", "author": {"login": "someone"},
+             "carriedCommits": {"totalCount": 1, "nodes": [{"commit": {"oid": INDEPENDENT}}]}},
+        ],
+    }}}})
+    .to_string();
+    let zero = "0".repeat(40);
+    let p_log = json!({"at": "2026-11-27T01:00:00Z", "kind": "branch_creation",
+        "before": zero, "after": INDEPENDENT})
+    .to_string();
+    let q_log = json!({"at": "2026-11-27T02:00:00Z", "kind": "branch_creation",
+        "before": zero, "after": STACKED_HEAD})
+    .to_string();
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("activity?ref=refs/heads/feat/independent&") {
+            return Ok(p_log.clone());
+        }
+        if joined.contains("activity?ref=refs/heads/feat/stacked&") {
+            return Ok(q_log.clone());
+        }
+        if joined.contains(&format!("compare/main...{INDEPENDENT}?")) {
+            return Ok(if joined.contains("parents") {
+                graph(&[(INDEPENDENT, &["main-tip"])])
+            } else {
+                json!({"total": 1, "shas": [INDEPENDENT]}).to_string()
+            });
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 278, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_HEAD}...{INDEPENDENT}")) {
+            return Ok("behind".to_owned());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{INDEPENDENT}")) {
+            return Ok("ahead".to_owned());
+        }
+        if joined.contains("OPEN") {
+            return Ok(listing.clone());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let refusal = independent_refusal(&run_gh, &Cell::new(0)).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#11450");
+
+    // Control: Q approved admits P.
+    let mut judge = |_: &OpenPr| Judgement::Approved;
+    assert_eq!(
+        refusal_with(
+            &run_gh,
+            "Generous-Corp/pulp",
+            "main",
+            11558,
+            "feat/independent",
+            INDEPENDENT,
+            &mut PassCache::default(),
+            &mut judge,
+        ),
+        None
+    );
 }
 
 #[test]
@@ -1233,6 +1454,43 @@ fn an_over_cap_candidate_carrying_an_unapproved_prs_commit_is_refused() {
     assert!(refusal.detail.contains(Q_ROOT), "{}", refusal.detail);
 
     // The same head is admitted once Q's head is approved.
+    assert_eq!(
+        big_refusal(&[&q], &reads, &mut |_| Judgement::Approved),
+        None
+    );
+}
+
+/// Review 1754-r2-f1: an over-cap P (more than 250 commits) carrying a held
+/// Q's exact head is refused, even when the activity log says P's branch held
+/// Q's commits first. The over-cap path clears only an approved Q and reads
+/// no activity: ownership by first arrival never applies there.
+#[test]
+fn an_over_cap_candidate_carrying_a_held_prs_exact_head_is_refused() {
+    let q = open_q(228, "feat/other", "main", Q_HEAD);
+    let p_first =
+        json!({"at": "2026-11-27T01:00:00Z", "kind": "branch_creation", "after": BIG_HEAD})
+            .to_string();
+    let q_later = json!({"at": "2026-11-27T02:00:00Z", "kind": "branch_creation", "after": Q_HEAD})
+        .to_string();
+    let reads = |joined: &str| {
+        if joined.contains("/activity?") {
+            return Some(Ok(if joined.contains("feat/other") {
+                q_later.clone()
+            } else {
+                p_first.clone()
+            }));
+        }
+        if graph_read(joined, Q_HEAD) {
+            return Some(Ok(graph(&[(Q_ROOT, &[MAIN_TIP]), (Q_TIP, &[Q_ROOT])])));
+        }
+        // P reaches Q's root (and so Q's exact head's line).
+        probe_read(joined, Q_ROOT).then(|| Ok("behind".to_owned()))
+    };
+    let refusal =
+        big_refusal(&[&q], &reads, &mut |_| Judgement::Held("HOLD".to_owned())).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#228");
+
+    // Control: Q approved admits P.
     assert_eq!(
         big_refusal(&[&q], &reads, &mut |_| Judgement::Approved),
         None

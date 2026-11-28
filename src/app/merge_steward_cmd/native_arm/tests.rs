@@ -1202,6 +1202,82 @@ fn the_backstop_never_arms_a_head_carrying_another_prs_held_commit() {
     }
 }
 
+/// The held #11361 shares `CARRIED` with this head (#42, branch `feature`),
+/// and the activity log of each branch is served: `p_first` says #42's
+/// branch held `CARRIED` before #11361's did.
+#[cfg(unix)]
+fn carrying_with_logs(log: &str, p_first: bool) -> String {
+    const HELD_HEAD: &str = "883bb3f600000000000000000000000000000000";
+    const CARRIED: &str = "c26a23be00000000000000000000000000000000";
+    const ZERO: &str = "0000000000000000000000000000000000000000";
+    let review = r#"{"login":"someone","type":"User","at":"2026-10-04T01:00:00Z","state":"APPROVED","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+    let hold = format!(
+        r#"{{"id":777,"login":"someone","type":"User","at":"2026-10-04T02:00:00Z","body":"verdict: HOLD head:{HELD_HEAD}"}}"#
+    );
+    let listing = format!(
+        r#"{{"data":{{"repository":{{"pullRequests":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},"nodes":[{{"number":11361,"headRefName":"feat/real-world-inputs-t2","baseRefName":"main","headRefOid":"{HELD_HEAD}","isCrossRepository":false,"createdAt":"2026-10-04T05:00:00Z","author":{{"login":"author"}},"carriedCommits":{{"totalCount":2,"nodes":[{{"commit":{{"oid":"{CARRIED}"}}}},{{"commit":{{"oid":"{HELD_HEAD}"}}}}]}}}},{{"number":42,"headRefName":"feature","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","isCrossRepository":false,"createdAt":"2026-10-04T05:00:00Z","author":{{"login":"author"}},"carriedCommits":{{"totalCount":2,"nodes":[{{"commit":{{"oid":"{CARRIED}"}}}},{{"commit":{{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}]}}}}]}}}}}}}}"#
+    );
+    let (p_hour, q_hour) = if p_first { (1, 2) } else { (2, 1) };
+    let p_log = format!(
+        r#"{{"at":"2026-10-04T0{p_hour}:00:00Z","kind":"branch_creation","before":"{ZERO}","after":"{CARRIED}"}}"#
+    );
+    let q_log = format!(
+        r#"{{"at":"2026-10-04T0{q_hour}:00:00Z","kind":"branch_creation","before":"{ZERO}","after":"{HELD_HEAD}"}}"#
+    );
+    format!(
+        r#"# CARRIED_COMMITS
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"activity?ref=refs/heads/feature&"*) printf '%s\n' '{p_log}'; exit 0 ;;
+  *"activity?ref=refs/heads/feat/real-world-inputs-t2&"*) printf '%s\n' '{q_log}'; exit 0 ;;
+  *"/compare/main...{CARRIED}?"*parents*) printf '%s' '{{"total":1,"merge_base":"m","commits":[{{"sha":"{CARRIED}","parents":["m"]}}]}}'; exit 0 ;;
+  *"/compare/main...{HELD_HEAD}?"*parents*) printf '%s' '{{"total":2,"merge_base":"m","commits":[{{"sha":"{CARRIED}","parents":["m"]}},{{"sha":"{HELD_HEAD}","parents":["{CARRIED}"]}}]}}'; exit 0 ;;
+  *"/compare/main..."*"total_commits"*) printf '%s' '{{"total":2,"shas":["{CARRIED}","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}}'; exit 0 ;;
+  *carriedCommits*) printf '%s' '{listing}'; exit 0 ;;
+  *pulls/11361/reviews*) printf '%s' ''; exit 0 ;;
+  *issues/11361/comments*) printf '%s\n' '{hold}'; exit 0 ;;
+  *commits/{HELD_HEAD}*) printf '%s' '2026-10-03T00:00:00Z'; exit 0 ;;
+  *isInMergeQueue*number=11361*) printf '%s' '{{"data":{{"repository":{{"pullRequest":{{"number":11361,"state":"OPEN","headRefOid":"{HELD_HEAD}","isInMergeQueue":false,"mergeQueueEntry":null,"autoMergeRequest":null,"timelineItems":{{"pageInfo":{{"hasPreviousPage":false}},"nodes":[]}}}}}}}}}}'; exit 0 ;;
+esac
+{}"#,
+        approval_required(log, review)
+    )
+}
+
+/// End to end through `refusal_for` on the backstop: this head shares a
+/// commit with the held #11361, and the activity log says this head's branch
+/// held it first, so the parent is armed. With #11361's branch first, the
+/// same head is refused.
+#[cfg(unix)]
+#[test]
+fn the_backstop_arms_a_parent_whose_branch_held_the_shared_commit_first() {
+    for (p_first, armed) in [(true, true), (false, false)] {
+        let temp = tempfile::tempdir().expect("temp");
+        let log = temp.path().join("calls.log");
+        let actions = fake_gh(
+            &temp,
+            &carrying_with_logs(&log.display().to_string(), p_first),
+        );
+        let observation = observation(pr_row(&serde_json::json!({})), true);
+        let reports = report(StewardDecision::Unmanaged);
+        let (status, _) = apply_native_arm_backstop(
+            &actions,
+            &observation,
+            &reports,
+            "shipyard:no-auto-merge",
+            true,
+            no_authority_needed,
+        );
+        let calls = std::fs::read_to_string(&log).expect("log");
+        assert!(calls.contains("/activity?"), "the log is read: {calls}");
+        let expected = if armed { "armed" } else { "skipped" };
+        assert_eq!(
+            status.results[0].outcome, expected,
+            "p_first {p_first}: {status:?}"
+        );
+    }
+}
+
 /// Review of #1112: #11361 is listed at an approved head, then pushed to a
 /// new, unapproved head before its approval is read. The guard must not call
 /// the listed head's approval current: nothing is armed, and the row fails
