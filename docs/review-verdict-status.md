@@ -465,14 +465,17 @@ that, such as a newly registered hotspot, is not seen until the items run is
 re-run. `shipyard review-verdict` (Rust, `crate::review_verdict`) and the
 steward's own gate do not read review items yet, so on such a base they can
 report a head allowed that this status refuses. The status is the required
-check and decides the landing, but reviewer dispatch observes a trusted
-exact-head APPROVE through `crate::review_verdict` and counts the review as
-done: an APPROVE that forgets an accept line is not re-dispatched, and the
-head waits with no owner. A reviewer brief is not a recovery path
-(docs/autonomy-contract.md, A3 and A12), so this is a prerequisite: no base
-sets the keys until reviewer dispatch treats an exact-head APPROVE that lacks
-an accept (a `pending` status reading `awaiting reviewer acceptance of review
-items`) as a review not done, and dispatches again.
+check and decides the landing. The fleet's reviewer dispatcher is
+fleet-handbook's `scripts/pass-runner/must-review.py` on m3 (`shipyard
+reviewer-dispatch observe` has no installed caller). It skips every head with
+a counted exact-head APPROVE, so an APPROVE that forgets an accept line would
+never go back to a reviewer, and the head would wait with no owner. A
+reviewer brief is not a recovery path (docs/autonomy-contract.md, A3 and A12),
+so this is a prerequisite: no base sets the keys until the `must-review.py`
+change that lists such a head again is deployed on m3. It lists a head whose
+newest `review-verdict` status is `pending` reading `awaiting reviewer
+acceptance of review items` or `awaiting the review items check for head`, at
+most twice per head, and keeps skipping it when the status cannot be read.
 
 **Permissions.** The reader lists Actions runs and jobs and reads check-run
 annotations, so the `review-verdict` job needs `actions: read` (or `write`)
@@ -482,7 +485,7 @@ queue-arm guard. Without them every head on such a base fails closed.
 **Rollout order.** A Shipyard script from before review items ignores the two
 keys, so setting them first leaves the status unenforced with no error.
 
-1. Land this change, and the reviewer-dispatch prerequisite above.
+1. Land this change, and deploy the `must-review.py` prerequisite above on m3.
 2. Bump the repository's pinned Shipyard commit in `review-verdict.yml`, and in
    the same change add `checks: read` and the items workflow's name under
    `workflow_run`.
