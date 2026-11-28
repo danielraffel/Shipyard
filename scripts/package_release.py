@@ -21,6 +21,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_build_guard  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIST_DIR = ROOT / "dist" / "release"
@@ -351,7 +354,17 @@ def build_release(cargo_target: str | None) -> None:
     ]
     if cargo_target:
         args.extend(["--target", cargo_target])
-    run(args)
+    # A hard wall-clock limit, cargo network retries and closed stdin; a stall
+    # writes diagnostics before the build is killed (scripts/release_build_guard.py).
+    diagnostics = os.environ.get(release_build_guard.DIAGNOSTICS_ENV)
+    release_build_guard.run_bounded(
+        release_build_guard.with_verbose(args),
+        cwd=ROOT,
+        timeout=release_build_guard.timeout_seconds(),
+        diagnostics_dir=Path(diagnostics) if diagnostics else ROOT / "dist" / "build-diagnostics",
+        redact=redact_text,
+        env=release_build_guard.build_env(),
+    )
 
 
 class LaunchGateFailed(SystemExit):
@@ -1012,6 +1025,14 @@ def package(args: argparse.Namespace) -> list[Path]:
     if args.notarize:
         require_commands(["security", "xcrun"])
 
+    if getattr(args, "build_only", False):
+        if args.skip_build or args.binary or args.companion_binary:
+            raise SystemExit("--build-only cannot be combined with --skip-build or --binary")
+        build_release(args.cargo_target)
+        print(f"built {default_binary_path(target, args.cargo_target)}")
+        print(f"built {default_binary_path(target, args.cargo_target, COMPANION_BIN_NAME)}")
+        return []
+
     if not args.skip_build:
         build_release(args.cargo_target)
 
@@ -1116,6 +1137,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--companion-binary", type=Path, help="Use an already-built provider binary"
     )
     parser.add_argument("--skip-build", action="store_true", help="Do not run cargo build")
+    parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="Run only the bounded release build, so CI can time it apart from signing",
+    )
     parser.add_argument("--tag", help="Release tag label for output layout")
     parser.add_argument("--dist-dir", type=Path, default=DEFAULT_DIST_DIR)
     parser.add_argument("--artifact-prefix", default=BIN_NAME)
