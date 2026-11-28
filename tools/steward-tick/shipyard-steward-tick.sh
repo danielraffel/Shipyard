@@ -221,11 +221,15 @@ steward_one() {
     # Recovery store fill after this pass pruned dead requests: active/limit,
     # with !FULL when it cannot take another request, or off when recovery is
     # disabled. A full store silently skips recovery for every red PR.
+    # Activity-log reads the carried-commit ownership proof made this pass
+    # (counted by call site in api_calls); omitted when there were none.
+    ownership_reads=$(jq -r '[.repos[]?.api_calls.sites[]? | select(.site == "api repos/*/*/activity") | .calls] | add // 0' "$out" 2>/dev/null || echo ERROR)
+    [ "$ownership_reads" = 0 ] && ownership_reads=
     recovery_store=$(jq -r '[.repos[]? | select(has("recovery_store")) | .recovery_store | if (.error // "") != "" then "ERROR" elif .active >= .limit then "\(.active)/\(.limit)!FULL" else "\(.active)/\(.limit)" end] | if length==0 then "off" else join(",") end' "$out" 2>/dev/null || echo ERROR)
     # Heads merged over advisory checks that were red or pending (GitHub
     # UNSTABLE, [auto_merge] unstable_advisory_checks): logged, never a gate.
     advisory_not_green=$(jq -r '[.repos[]?.prs[]? | . as $pr | (.mutation // "" | tostring | split(",")[] | select(startswith("advisory_not_green:")) | "#\($pr.number):" + (ltrimstr("advisory_not_green:") | gsub("[[:space:][:cntrl:];=]+";"_")))] | join(",")' "$out" 2>/dev/null || true)
-    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver launcher=$launcher_path invariants=$invariants red_everywhere=$red_everywhere recovery_store=$recovery_store${oldest:+ oldest=$oldest}${advisory_not_green:+ advisory_not_green=$advisory_not_green}" >> "$log_dir/summary.log"
+    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver launcher=$launcher_path invariants=$invariants red_everywhere=$red_everywhere recovery_store=$recovery_store${ownership_reads:+ ownership_reads=$ownership_reads}${oldest:+ oldest=$oldest}${advisory_not_green:+ advisory_not_green=$advisory_not_green}" >> "$log_dir/summary.log"
   elif grep -q "another steward apply pass is already running" "$out.err" 2>/dev/null; then
     echo "$stamp $repo skipped=lock_busy" >> "$log_dir/summary.log"
   else

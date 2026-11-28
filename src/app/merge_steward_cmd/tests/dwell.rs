@@ -474,6 +474,7 @@ fn stacked(number: u64, base_ref: &str, parent: u64) -> OpenPr {
         author: None,
         commits: CommitList::Complete(std::collections::BTreeSet::new()),
         stacked_on: Some(parent),
+        created_at: None,
     }
 }
 

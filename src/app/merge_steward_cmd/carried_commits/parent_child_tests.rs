@@ -15,6 +15,17 @@ use super::{Judgement, OpenPr, PassCache, Refusal, refusal_with};
 
 const BASE_TIP: &str = "b000000000000000000000000000000000000000";
 
+/// In `mid_life`, leaves P out of the listing.
+const UNLISTED_P: u64 = u64::MAX;
+
+/// The `before` of a creation.
+const ZERO: &str = "0000000000000000000000000000000000000000";
+
+/// When every listed pull request was opened: after each fixture's branch
+/// creations, as on GitHub, where a branch is pushed before its pull request
+/// is opened.
+const OPENED: &str = "2026-11-27T23:00:00Z";
+
 /// One commit and its parents.
 type Node = (&'static str, &'static [&'static str]);
 
@@ -43,6 +54,7 @@ fn listing(rows: &[Row]) -> String {
             json!({
                 "number": row.number, "headRefName": branch(row.number), "baseRefName": "main",
                 "headRefOid": row.head, "isCrossRepository": false,
+                "createdAt": OPENED,
                 "author": {"login": "someone"},
                 "labels": {"nodes": labels},
                 "carriedCommits": {"totalCount": row.range.len(),
@@ -113,7 +125,14 @@ fn run_logged(
     mid_life: &[u64],
     gate: &dyn Fn(u64) -> Judgement,
 ) -> Option<Refusal> {
-    let listed = listing(rows);
+    // P is listed like every open pull request, except when a test leaves
+    // it out (`UNLISTED_P` in `mid_life`).
+    let listed_rows: Vec<Row> = rows
+        .iter()
+        .copied()
+        .filter(|row| !(row.number == p && mid_life.contains(&UNLISTED_P)))
+        .collect();
+    let listed = listing(&listed_rows);
     let run_gh = |argv: &[String]| -> Result<String, String> {
         let joined = argv.join(" ");
         if joined.contains("OPEN") {
@@ -135,8 +154,15 @@ fn run_logged(
                             } else {
                                 "push"
                             };
+                            // Each entry starts where the previous one left
+                            // the branch; a creation starts from nothing.
+                            let before = if kind == "branch_creation" || index == 0 {
+                                ZERO.to_owned()
+                            } else {
+                                entries[index - 1].1.trim_start_matches('+').to_owned()
+                            };
                             json!({"at": format!("2026-11-27T{hour:02}:00:00Z"),
-                                "kind": kind, "after": after})
+                                "kind": kind, "before": before, "after": after})
                             .to_string()
                         })
                         .collect::<Vec<_>>()
@@ -590,4 +616,26 @@ fn a_parent_branch_reused_after_a_deletion_cannot_claim_its_earlier_life() {
     // Control: one life from hour 1, C is P's.
     let one_life = vec![(20, vec![(1, C)]), (21, vec![(2, Q_TIP)])];
     assert_eq!(run_full(&RESET, 20, &one_life, &[], &unreviewed), None);
+}
+
+#[test]
+fn a_parent_missing_from_the_listing_owns_nothing() {
+    let logs = created_in_order(&PULP_12982, &[12982, 12984, 12987]);
+    let refused = refusal(run_logged(
+        &PULP_12982,
+        12982,
+        &logs,
+        &[],
+        &[UNLISTED_P],
+        &unreviewed,
+    ));
+    assert_eq!(refused.token, "carries_unapproved_commits:#12984");
+    assert!(
+        refused.detail.contains("could not be settled"),
+        "{}",
+        refused.detail
+    );
+
+    // Control: listed, the same logs admit P.
+    assert_eq!(run_full(&PULP_12982, 12982, &logs, &[], &unreviewed), None);
 }

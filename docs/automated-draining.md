@@ -123,9 +123,13 @@ each parent of a child built on several parents is settled on its own. A
 commit that came to P from Q (P merged Q, was reset or fast-forwarded onto Q,
 or cherry-picked the same sha) stays Q's and refuses P while Q's current head
 is not approved, however recent P's approval or however old Q's HOLD. An
-unreadable log, a log of Q's branch that does not reach back to its creation,
-a compare over the cap, more than 60 logged entries, a cross-repository
-branch, or equal times leave the commit Q's, and the detail says which
+unreadable log, a log of Q's branch that is not whole and current (it must
+start at a creation no later than Q was opened, chain each entry's `before`
+to the previous `after`, end at Q's listed head, and show every shared
+commit Q holds), a compare over the cap, more than 60 logged entries, a
+cross-repository branch, or equal times leave the commit Q's. Ownership
+follows push order, not intent: a child pushed before its parent, or in the
+same second, owns the shared commits, and the detail says which
 branch held it first or why that could not be settled. An over-cap Q, and
 every overlap of an over-cap P (more than 250 commits), are cleared only by
 Q's approval. Named residuals: the log's retention bounds what can be proved

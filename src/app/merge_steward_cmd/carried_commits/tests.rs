@@ -30,6 +30,7 @@ fn open(number: u64, head_ref: &str, base_ref: &str, head: &str, shas: &[&str]) 
         author: None,
         commits: CommitList::Complete(set(shas)),
         stacked_on: None,
+        created_at: None,
     }
 }
 
@@ -199,6 +200,7 @@ fn listing(prs: &[(&OpenPr, usize)]) -> serde_json::Value {
                 "baseRefName": pr.base_ref,
                 "headRefOid": pr.head_sha,
                 "isCrossRepository": pr.cross_repository,
+                "createdAt": "2026-11-27T23:00:00Z",
                 "author": {"login": "someone"},
                 "carriedCommits": {
                     "totalCount": total,
@@ -632,13 +634,13 @@ fn ownership_refusal(
                         .iter()
                         .enumerate()
                         .map(|(index, (hour, head))| {
-                            let kind = if index == 0 {
-                                "branch_creation"
+                            let (kind, before) = if index == 0 {
+                                ("branch_creation", "0".repeat(40))
                             } else {
-                                "push"
+                                ("push", entries[index - 1].1.clone())
                             };
                             json!({"at": format!("2026-11-27T{hour:02}:00:00Z"),
-                                "kind": kind, "after": head})
+                                "kind": kind, "before": before, "after": head})
                             .to_string()
                         })
                         .collect::<Vec<_>>()

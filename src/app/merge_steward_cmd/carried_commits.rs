@@ -40,9 +40,12 @@
 //!   was reset or fast-forwarded onto Q, or cherry-picked the same sha)
 //!   stays Q's: while Q's current head is not approved it refuses P, however
 //!   recent P's approval or however old Q's HOLD. An unreadable log, a log of
-//!   Q's branch that does not reach back to a creation, a compare over the
-//!   cap, more logged entries than the read limit, a cross-repository
-//!   branch, or equal times leave the commit Q's, and the refusal says so.
+//!   Q's branch that is not whole and current (see [`ownership`]), a compare
+//!   over the cap, more logged entries than the read limit, a
+//!   cross-repository branch, or equal times leave the commit Q's, and the
+//!   refusal says so. Ownership follows push order, not intent: a child
+//!   pushed before its parent, or in the same second, owns the shared
+//!   commits.
 //!   Ownership is read only for an overlap whose shared commits are listed:
 //!   an over-cap Q, and every overlap of an over-cap P, clear only by Q's
 //!   approval. Named residuals: the log's retention bounds what can be
@@ -135,7 +138,7 @@ const SHAS_NAMED: usize = 10;
 const OPEN_PULL_COMMITS_QUERY: &str = "query($owner:String!,$name:String!,$cursor:String){\
      repository(owner:$owner,name:$name){pullRequests(states:OPEN,first:50,after:$cursor){\
      pageInfo{hasNextPage endCursor} nodes{number headRefName headRefOid baseRefName \
-     isCrossRepository author{login} labels(first:50){nodes{name}} \
+     isCrossRepository createdAt author{login} labels(first:50){nodes{name}} \
      carriedCommits:commits(first:100){totalCount nodes{commit{oid}}}}}}}";
 
 /// The commits a pull request carries, as far as the steward read them.
@@ -163,6 +166,8 @@ pub(super) struct OpenPr {
     /// The parent pull request a `stacked:<n>` label names, the label
     /// `shipyard pr --stacked-on <n>` applies.
     pub stacked_on: Option<u64>,
+    /// When the pull request was opened (GitHub's `createdAt`), when listed.
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The candidate under admission.
@@ -1452,6 +1457,10 @@ fn parse_open_pr(run_gh: RunGh<'_>, repo: &str, node: &Value) -> Result<OpenPr, 
             .flatten()
             .filter_map(|label| label.get("name").and_then(Value::as_str))
             .find_map(stacked_label_parent),
+        created_at: node
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .and_then(|at| at.parse().ok()),
     })
 }
 

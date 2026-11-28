@@ -379,6 +379,7 @@ fn the_guard_admits_the_landed_merge_shape_and_refuses_it_with_one_extra_line() 
         author: None,
         commits: CommitList::Complete(std::iter::once(MERGE.to_owned()).collect()),
         stacked_on: None,
+        created_at: None,
     };
     let listing = json!({"data": {"repository": {"pullRequests": {
         "pageInfo": {"hasNextPage": false, "endCursor": null},
