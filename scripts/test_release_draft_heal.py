@@ -296,7 +296,7 @@ class FakeGitHub:
                  issue: bool = True, workflow: str | None = None, history: bool = True,
                  status: str = "in_progress", conclusion: str | None = None, die_on_poll: int = 0,
                  poll_errors: int = 0, workflow_unreadable: bool = False,
-                 cancel_refusal: str | None = None) -> None:
+                 cancel_refusal: str | None = None, fail_reads_after_rerun: bool = False) -> None:
         self.now = datetime.now(timezone.utc)
         self.step_minutes_ago = step_minutes_ago
         self.step = step
@@ -311,6 +311,8 @@ class FakeGitHub:
         self.poll_errors = poll_errors
         self.workflow_unreadable = workflow_unreadable
         self.cancel_refusal = cancel_refusal
+        self.fail_reads_after_rerun = fail_reads_after_rerun
+        self.rerun_requested = False
         self.posts: list[str] = []
         self.reads: list[str] = []
         self.cancelled_at: str | None = None
@@ -335,6 +337,7 @@ class FakeGitHub:
                 if self.settles:
                     self.state.update(status="completed", conclusion="cancelled")
             elif url.endswith("/rerun-failed-jobs"):
+                self.rerun_requested = True
                 if not self.failed_rerun_restarts:
                     raise subprocess.CalledProcessError(1, ["gh"], stderr="no failed jobs (HTTP 422)")
                 self._restart()
@@ -352,6 +355,8 @@ class FakeGitHub:
         if "/issues?" in url:
             return json.dumps([{"number": 42, "labels": [{"name": "release-blocked"}]}] if self.issue else [])
         if url.endswith("/runs/7"):
+            if self.fail_reads_after_rerun and self.rerun_requested:
+                raise subprocess.CalledProcessError(1, ["gh"], stderr="Bad Gateway (HTTP 502)")
             if self.die_on_poll:
                 raise RuntimeError("the heal runner went away")
             if self.poll_errors:
@@ -430,6 +435,17 @@ class StallMainTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["cancel", "rerun-failed-jobs"])
         self.assertEqual(fake.state["run_attempt"], 2)
+
+    def test_unreadable_confirmation_never_sends_the_fallback(self) -> None:
+        # Attempt 2: the first re-run starts attempt 3, which fails fast, and
+        # every read after it fails. A second request could start attempt 4.
+        fake = FakeGitHub(step_minutes_ago=45, attempt=2, rerun_fails_fast=True,
+                          fail_reads_after_rerun=True, issue=False)
+        rc, out = heal_main(fake)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["cancel", "rerun-failed-jobs"])
+        self.assertEqual(fake.state["run_attempt"], 3)
+        self.assertIn("outcome is unknown", out)
 
     def test_an_api_error_after_the_cancel_does_not_abort_the_pass(self) -> None:
         fake = FakeGitHub(step_minutes_ago=45, poll_errors=2, issue=False)

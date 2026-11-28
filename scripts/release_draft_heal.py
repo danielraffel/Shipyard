@@ -470,6 +470,15 @@ def _try_run(repo: str, run_id: int) -> dict | None:
         return None
 
 
+def _post_rerun(endpoint: str) -> bool:
+    try:
+        _gh("api", "-X", "POST", endpoint)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"re-run via {endpoint} refused: {(exc.stderr or '').strip()}", file=sys.stderr)
+        return False
+
+
 def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Stall, *, what: str,
                       sleep=None) -> int:
     """Re-run a cancelled stalled run and confirm from the API that a new attempt exists.
@@ -477,28 +486,40 @@ def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Sta
     Re-run failed jobs first; GitHub does not document whether that endpoint
     includes cancelled jobs, so if no new attempt appears, re-run the stalled
     job and its dependents directly. An increased run_attempt alone is the
-    proof: a new attempt that already failed fast is still a restart, and
-    re-running it again would burn a second attempt.
+    proof: a new attempt that already failed fast is still a restart.
+
+    The fallback is a second mutating request, so it fails closed: it is sent
+    only after a successful fresh read shows the same attempt, the run
+    finished, and the attempt under MAX_ATTEMPTS. An unreadable run is an
+    unknown outcome, never "not restarted".
     """
     def restarted() -> bool:
         latest = _try_run(repo, run_id)
         return latest is not None and int(latest.get("run_attempt") or 1) > attempt
 
-    for endpoint in (f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs",
-                     f"repos/{repo}/actions/jobs/{stall.job_id}/rerun"):
-        try:
-            _gh("api", "-X", "POST", endpoint)
-        except subprocess.CalledProcessError as exc:
-            print(f"re-run via {endpoint} refused: {(exc.stderr or '').strip()}", file=sys.stderr)
-            if restarted():
-                break
-            continue
-        if _wait_for(restarted, timeout=RERUN_CONFIRM_SECS, poll=10, sleep=sleep):
-            break
-    else:
-        print(f"::error title=Release {tag} heal could not restart run {run_id}::"
-              "the stalled run is cancelled but no re-run started; the next heal pass tries again")
+    def stop(reason: str) -> int:
+        print(f"::error title=Release {tag} heal could not confirm a restart of run {run_id}::{reason}; "
+              "the next heal pass judges the run again")
         return 1
+
+    first = f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"
+    accepted = _post_rerun(first)
+    confirmed = _wait_for(restarted, timeout=RERUN_CONFIRM_SECS, poll=10, sleep=sleep) if accepted else False
+    if not confirmed:
+        latest = _try_run(repo, run_id)
+        if latest is None:
+            return stop("the run could not be read after the re-run request, so its outcome is unknown")
+        current = int(latest.get("run_attempt") or 1)
+        if current > attempt:
+            confirmed = True
+        elif latest.get("status") != "completed":
+            return stop(f"attempt {current} is {latest.get('status')} without a new attempt")
+        elif current >= MAX_ATTEMPTS:
+            return stop(f"attempt {current} reached the cap of {MAX_ATTEMPTS}")
+    if not confirmed:
+        fallback = f"repos/{repo}/actions/jobs/{stall.job_id}/rerun"
+        if not (_post_rerun(fallback) and _wait_for(restarted, timeout=RERUN_CONFIRM_SECS, poll=10, sleep=sleep)):
+            return stop("the stalled run is cancelled but no re-run was confirmed")
     message = (f"release-heal: {what} release run {run_id} ({tag}): job "
                f"`{stall.job_name}` step `{stall.step_name}` had run "
                f"{int(stall.elapsed_secs // 60)} min, over its {int(stall.threshold_secs // 60)} min "
