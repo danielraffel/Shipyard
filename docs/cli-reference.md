@@ -165,7 +165,9 @@ shipyard reviewer-dispatch observe --repo OWNER/REPO --pr 123 \
   --reviewer infra-review2 --head SHA [--now TIME] \
   [--max-retries 1] [--store PATH] [--json]
                                              # reconcile the latest exact-head attempt against a live review-verdict read;
-                                             # missing or stale evidence fails closed; launcher retry/escalation is a
+                                             # missing or stale evidence fails closed; an APPROVE the head's newest
+                                             # review-verdict status has not judged yet, or that leaves review items
+                                             # unaccepted, is not a finished review; launcher retry/escalation is a
                                              # separate caller-owned follow-up
 shipyard landability --repo OWNER/REPO       # can this PR's required contexts be scheduled at all
 
