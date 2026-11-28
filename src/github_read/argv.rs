@@ -7,6 +7,7 @@
 
 use serde_json::{Map, Value};
 
+use super::jq::Program;
 use super::pr_view::PrField;
 
 /// One read an in-process client can answer.
@@ -16,6 +17,18 @@ pub(crate) enum ReadRequest {
     Rest {
         /// Endpoint path and query, without a leading slash.
         path: String,
+    },
+    /// `gh api [--paginate [--slurp]] [--jq FILTER] repos/OWNER/REPO/...`: a
+    /// REST `GET` whose pages are followed, joined or filtered in process.
+    RestShaped {
+        /// Endpoint path and query, without a leading slash.
+        path: String,
+        /// Follow `Link: rel="next"` as `gh --paginate` does.
+        paginate: bool,
+        /// Wrap the pages' bodies in one array (`--slurp`).
+        slurp: bool,
+        /// Filter applied to each page (`--jq`), with its source for logs.
+        jq: Option<Program>,
     },
     /// `gh api graphql -f query=... [-f|-F name=value]...`: a read query.
     Graphql {
@@ -67,10 +80,37 @@ pub(crate) fn classify(args: &[String], scope_repo: Option<&str>) -> Option<Clas
 }
 
 fn classify_rest(args: &[String]) -> Option<ClassifiedRead> {
-    // Exactly `api ENDPOINT`: any flag (`-X`, `-f`, `--input`, `--paginate`,
-    // `--jq`, `-H`, ...) changes the method, the body or the output.
-    let [_, endpoint] = args else {
-        return None;
+    // `api ENDPOINT`, optionally with `--paginate`, `--slurp` and `--jq` in
+    // any order. Any other flag (`-X`, `-f`, `--input`, `-H`, ...) changes
+    // the method, the body or the output and is declined.
+    let mut endpoint = None;
+    let mut paginate = false;
+    let mut slurp = false;
+    let mut jq = None;
+    let mut iter = args[1..].iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--paginate" if !paginate => paginate = true,
+            "--slurp" if !slurp => slurp = true,
+            "--jq" | "-q" if jq.is_none() => jq = Some(iter.next()?),
+            flag if flag.starts_with('-') => return None,
+            _ if endpoint.replace(arg).is_some() => return None,
+            _ => {}
+        }
+    }
+    let endpoint = endpoint?;
+    // The shaped forms whose output is proven against `gh`: a filter on one
+    // page, a filter on every page, or every page's body as one array. A bare
+    // `--paginate` (gh splices the pages itself) and `--slurp` without
+    // `--paginate` stay with `gh`.
+    let shaped = match (paginate, slurp, jq.is_some()) {
+        (false, false, false) => false,
+        (_, false, true) | (true, true, false) => true,
+        _ => return None,
+    };
+    let jq = match jq {
+        Some(source) => Some(Program::parse(source)?),
+        None => None,
     };
     let path = endpoint.strip_prefix('/').unwrap_or(endpoint);
     if path.is_empty()
@@ -93,12 +133,18 @@ fn classify_rest(args: &[String]) -> Option<ClassifiedRead> {
         return None;
     }
     let repo = exact_slug(&format!("{owner}/{name}"))?;
-    Some(ClassifiedRead {
-        request: ReadRequest::Rest {
-            path: path.to_owned(),
-        },
-        repo,
-    })
+    let path = path.to_owned();
+    let request = if shaped {
+        ReadRequest::RestShaped {
+            path,
+            paginate,
+            slurp,
+            jq,
+        }
+    } else {
+        ReadRequest::Rest { path }
+    };
+    Some(ClassifiedRead { request, repo })
 }
 
 fn classify_graphql(rest: &[String]) -> Option<ReadRequest> {

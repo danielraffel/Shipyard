@@ -31,6 +31,7 @@
 pub(crate) mod argv;
 pub(crate) mod batch;
 pub(crate) mod credential;
+pub(crate) mod jq;
 pub(crate) mod pr_view;
 pub(crate) mod transport;
 
@@ -68,6 +69,8 @@ const DEFAULT_MAX_BODY: u64 = 32 * 1024 * 1024;
 const ETAG_MAX_BODY: usize = 1024 * 1024;
 /// Conditional-read entries kept per process.
 const ETAG_MAX_ENTRIES: usize = 256;
+/// Pages one shaped read follows before it is handed to `gh`.
+const MAX_PAGES: usize = 200;
 const API_VERSION: &str = "2022-11-28";
 const PR_VIEW_ACCEPT: &str =
     "application/vnd.github.merge-info-preview+json, application/vnd.github.nebula-preview";
@@ -200,21 +203,29 @@ struct TokenKey {
 
 #[derive(Default)]
 struct EtagCache {
-    entries: HashMap<(u64, String), (String, Vec<u8>)>,
+    entries: HashMap<(u64, String), CachedBody>,
     order: VecDeque<(u64, String)>,
 }
 
+/// A body kept for a conditional re-read: its ETag, bytes and `Link` header.
+struct CachedBody {
+    etag: String,
+    body: Vec<u8>,
+    link: Option<String>,
+}
+
 impl EtagCache {
-    fn get(&self, key: &(u64, String)) -> Option<&(String, Vec<u8>)> {
+    fn get(&self, key: &(u64, String)) -> Option<&CachedBody> {
         self.entries.get(key)
     }
 
-    fn put(&mut self, key: (u64, String), etag: String, body: Vec<u8>) {
+    fn put(&mut self, key: (u64, String), cached: CachedBody) {
+        let body = &cached.body;
         if body.len() > ETAG_MAX_BODY {
             self.entries.remove(&key);
             return;
         }
-        if self.entries.insert(key.clone(), (etag, body)).is_none() {
+        if self.entries.insert(key.clone(), cached).is_none() {
             self.order.push_back(key);
         }
         while self.entries.len() > ETAG_MAX_ENTRIES {
@@ -381,16 +392,23 @@ impl InprocReads {
         max_body: u64,
         meta: &mut CallMeta,
     ) -> Result<(bool, Vec<u8>, String), Unanswered> {
+        if let ReadRequest::RestShaped {
+            path,
+            paginate,
+            slurp,
+            jq,
+        } = &read.request
+        {
+            return self.answer_shaped(
+                &read.repo,
+                path,
+                (*paginate, *slurp, jq.as_ref()),
+                deadline,
+                meta,
+            );
+        }
         let request = match &read.request {
-            ReadRequest::Rest { path } => HttpRequest {
-                method: Method::Get,
-                path: path.clone(),
-                headers: vec![
-                    ("Accept", "application/vnd.github+json".to_owned()),
-                    ("X-GitHub-Api-Version", API_VERSION.to_owned()),
-                ],
-                body: None,
-            },
+            ReadRequest::Rest { path } | ReadRequest::RestShaped { path, .. } => rest_get(path),
             ReadRequest::Graphql { query, variables } => graphql_request(
                 &json!({"query": query, "variables": variables}),
                 "application/json",
@@ -474,6 +492,79 @@ impl InprocReads {
         }
     }
 
+    /// A REST read whose pages are followed (`--paginate`), joined into one
+    /// array (`--slurp`) or filtered (`--jq`), printed as `gh` prints it. An
+    /// error answer, a page it cannot join or print identically, or a next
+    /// page outside the API root is handed to `gh` whole, so error text and
+    /// exotic shapes stay `gh`'s.
+    fn answer_shaped(
+        &self,
+        repo: &str,
+        first_path: &str,
+        (paginate, slurp, jq): (bool, bool, Option<&jq::Program>),
+        deadline: Instant,
+        meta: &mut CallMeta,
+    ) -> Result<(bool, Vec<u8>, String), Unanswered> {
+        let mut path = first_path.to_owned();
+        let mut pages: Vec<Vec<u8>> = Vec::new();
+        let mut total = 0_u64;
+        loop {
+            let reply =
+                self.authorized_send(repo, &rest_get(&path), deadline, DEFAULT_MAX_BODY, meta)?;
+            if !(200..300).contains(&reply.status) {
+                return Err(Unanswered::Decline(format!(
+                    "paged read answered HTTP {}",
+                    reply.status
+                )));
+            }
+            total += reply.body.len() as u64;
+            if total > DEFAULT_MAX_BODY {
+                return Err(Unanswered::Decline("paged read is too large".to_owned()));
+            }
+            let next = if paginate {
+                next_page_url(reply.link.as_deref())
+            } else {
+                None
+            };
+            pages.push(reply.body);
+            let Some(next) = next else { break };
+            if pages.len() >= MAX_PAGES {
+                return Err(Unanswered::Decline(
+                    "paged read has too many pages".to_owned(),
+                ));
+            }
+            path = self.inner.transport.below_root(&next).ok_or_else(|| {
+                Unanswered::Decline("next page is outside the API root".to_owned())
+            })?;
+        }
+        let mut stdout = Vec::new();
+        if let Some(program) = jq {
+            for body in &pages {
+                let page = serde_json::from_slice::<Value>(body)
+                    .map_err(|_| Unanswered::Decline("page is not JSON".to_owned()))?;
+                program.run(&page, &mut stdout).map_err(|_| {
+                    Unanswered::Decline("filter output cannot be matched to gh".to_owned())
+                })?;
+            }
+        } else if slurp {
+            // gh joins the pages' bytes as they came: `[` page `,` page `]`.
+            stdout.push(b'[');
+            for (index, body) in pages.iter().enumerate() {
+                let padded = body.first().is_none_or(u8::is_ascii_whitespace)
+                    || body.last().is_none_or(u8::is_ascii_whitespace);
+                if padded || serde_json::from_slice::<Value>(body).is_err() {
+                    return Err(Unanswered::Decline("page is not compact JSON".to_owned()));
+                }
+                if index > 0 {
+                    stdout.push(b',');
+                }
+                stdout.extend_from_slice(body);
+            }
+            stdout.push(b']');
+        }
+        Ok((true, stdout, String::new()))
+    }
+
     /// Send `request` with the installation token for `repo`. A `401` drops
     /// the cached token and tries once more with a fresh one.
     fn authorized_send(
@@ -494,7 +585,7 @@ impl InprocReads {
                     .etags
                     .lock()
                     .ok()
-                    .and_then(|cache| cache.get(etag_key).map(|(etag, _)| etag.clone()))
+                    .and_then(|cache| cache.get(etag_key).map(|cached| cached.etag.clone()))
             });
             if let Some(etag) = &cached_etag {
                 request.headers.push(("If-None-Match", etag.clone()));
@@ -528,13 +619,12 @@ impl InprocReads {
             }
             if let Some(etag_key) = etag_key {
                 if reply.status == 304 {
-                    let cached = self
-                        .inner
-                        .etags
-                        .lock()
-                        .ok()
-                        .and_then(|cache| cache.get(&etag_key).map(|(_, body)| body.clone()));
-                    let Some(body) = cached else {
+                    let cached = self.inner.etags.lock().ok().and_then(|cache| {
+                        cache
+                            .get(&etag_key)
+                            .map(|cached| (cached.body.clone(), cached.link.clone()))
+                    });
+                    let Some((body, link)) = cached else {
                         return Err(Unanswered::Decline(
                             "conditional read lost its cached body".to_owned(),
                         ));
@@ -542,11 +632,19 @@ impl InprocReads {
                     meta.conditional_hit = true;
                     reply.status = 200;
                     reply.body = body;
+                    reply.link = link;
                 } else if reply.status == 200
                     && let Some(etag) = reply.etag.clone()
                     && let Ok(mut cache) = self.inner.etags.lock()
                 {
-                    cache.put(etag_key, etag, reply.body.clone());
+                    cache.put(
+                        etag_key,
+                        CachedBody {
+                            etag,
+                            body: reply.body.clone(),
+                            link: reply.link.clone(),
+                        },
+                    );
                 }
             }
             return Ok(reply);
@@ -822,6 +920,29 @@ fn graphql_request(body: &Value, accept: &str) -> HttpRequest {
 
 /// `gh api`'s answer to a REST reply: the body on stdout, and on a non-2xx
 /// status `gh: MESSAGE (HTTP STATUS)` on stderr.
+fn rest_get(path: &str) -> HttpRequest {
+    HttpRequest {
+        method: Method::Get,
+        path: path.to_owned(),
+        headers: vec![
+            ("Accept", "application/vnd.github+json".to_owned()),
+            ("X-GitHub-Api-Version", API_VERSION.to_owned()),
+        ],
+        body: None,
+    }
+}
+
+/// The `rel="next"` URL of a `Link` header, found the way `gh` finds it.
+fn next_page_url(link: Option<&str>) -> Option<String> {
+    static LINK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = LINK
+        .get_or_init(|| regex::Regex::new(r#"<([^>]+)>;\s*rel="([^"]+)""#).expect("link pattern"));
+    pattern
+        .captures_iter(link?)
+        .find(|found| &found[2] == "next")
+        .map(|found| found[1].to_owned())
+}
+
 fn rest_answer(reply: &HttpReply) -> (bool, Vec<u8>, String) {
     if (200..300).contains(&reply.status) {
         return (true, reply.body.clone(), String::new());
