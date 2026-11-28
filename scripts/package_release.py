@@ -994,6 +994,37 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+BUILD_MANIFEST_ENV = "SHIPYARD_RELEASE_BUILD_MANIFEST"
+
+
+def write_build_manifest(manifest: Path, binaries: list[Path]) -> None:
+    """Record the SHA-256 of each built binary, keyed by file name."""
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{sha256(path)}  {path.name}" for path in binaries]
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"build manifest={manifest}")
+
+
+def verify_build_manifest(manifest: Path, binaries: list[Path]) -> None:
+    """Refuse to package a binary that is not byte-for-byte the one the build step recorded."""
+    if not manifest.is_file():
+        raise SystemExit(f"{BUILD_MANIFEST_ENV} is set but {manifest} does not exist; refusing to sign")
+    recorded: dict[str, str] = {}
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        digest, _, name = line.partition("  ")
+        if digest and name:
+            recorded[name] = digest
+    for path in binaries:
+        expected = recorded.get(path.name)
+        actual = sha256(path)
+        if expected != actual:
+            raise SystemExit(
+                f"{path} sha256 {actual} does not match the build step's "
+                f"{expected or 'missing entry'} in {manifest}; refusing to sign"
+            )
+        print(f"verified {path.name} sha256={actual} matches the build step")
+
+
 def write_checksums(output_dir: Path, artifact: Path) -> Path:
     checksums = output_dir / "checksums.sha256"
     existing = []
@@ -1029,8 +1060,14 @@ def package(args: argparse.Namespace) -> list[Path]:
         if args.skip_build or args.binary or args.companion_binary:
             raise SystemExit("--build-only cannot be combined with --skip-build or --binary")
         build_release(args.cargo_target)
-        print(f"built {default_binary_path(target, args.cargo_target)}")
-        print(f"built {default_binary_path(target, args.cargo_target, COMPANION_BIN_NAME)}")
+        built = [
+            default_binary_path(target, args.cargo_target),
+            default_binary_path(target, args.cargo_target, COMPANION_BIN_NAME),
+        ]
+        for path in built:
+            print(f"built {path} sha256={sha256(path)}")
+        if manifest := os.environ.get(BUILD_MANIFEST_ENV):
+            write_build_manifest(Path(manifest), built)
         return []
 
     if not args.skip_build:
@@ -1044,6 +1081,9 @@ def package(args: argparse.Namespace) -> list[Path]:
         raise SystemExit(f"Built binary not found: {binary}")
     if not companion_binary.exists():
         raise SystemExit(f"Built companion binary not found: {companion_binary}")
+    if args.skip_build and (manifest := os.environ.get(BUILD_MANIFEST_ENV)):
+        # The binaries were built in an earlier CI step: sign exactly those.
+        verify_build_manifest(Path(manifest), [binary, companion_binary])
     expected_tag = None
     if args.version_must_match_tag:
         if args.no_smoke:

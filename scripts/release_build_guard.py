@@ -220,66 +220,78 @@ def capture_diagnostics(
     run: Runner = _run_diagnostic,
     elapsed: float = 0.0,
 ) -> Path:
-    """Write the stall report for process group ``root`` and echo it to stdout."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    sections: list[tuple[str, str]] = []
-    ps_out = run(
-        ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,etime=,%cpu=,command="],
-        PS_TIMEOUT_SECS,
-        None,
-    )
-    tree = build_tree(parse_ps(ps_out), root)
-    header = "  PID  PPID  PGID STAT     ELAPSED %CPU COMMAND"
-    sections.append(("process tree", "\n".join([header, *(row.line for row in tree)]) + "\n"))
-    pids = [row.pid for row in tree]
-    if pids:
-        sections.append(("lsof", run(["lsof", "-n", "-P", "-p", ",".join(map(str, pids))],
-                                     LSOF_TIMEOUT_SECS, None)))
-    for pid in sample_targets(tree, root):
-        # `sample` needs no sudo for the user's own processes; spindump does.
-        sample_file = out_dir / f"sample-{pid}.txt"
-        status = run(["sample", str(pid), str(SAMPLE_SECONDS), "-mayDie", "-file", str(sample_file)],
-                     SAMPLE_TIMEOUT_SECS, None)
-        text = ""
-        with contextlib.suppress(OSError):
-            text = sample_file.read_text(encoding="utf-8", errors="replace")
-            sample_file.write_text(redact(text), encoding="utf-8")
-        shown = "\n".join(text.splitlines()[:60])
-        sections.append((f"sample {pid} (full: {sample_file.name})", f"{status}{shown}\n"))
-    sections.append(("last output lines", "".join(tail)))
-    security_env = dict(os.environ)
-    security_env["HOME"] = _real_home()
-    keychain = "".join(
-        run(cmd, SECURITY_TIMEOUT_SECS, security_env)
-        for cmd in (
-            ["security", "default-keychain"],
-            ["security", "list-keychains"],
-            ["security", "show-keychain-info"],
-        )
-    )
-    sections.append(("default keychain", keychain))
+    """Write the stall report for process group ``root`` and echo it to stdout.
 
-    report = [f"release build stalled: no exit after {elapsed:.0f}s; root pid {root}\n"]
-    for title, body in sections:
-        report.append(f"===== {title} =====\n{body}")
-        if not body.endswith("\n"):
-            report.append("\n")
-    text = redact("".join(report))
+    Each section is written and printed as soon as it is collected, so a step
+    killed part-way through still keeps everything gathered so far. The
+    cheapest and most telling sections (the last output, the process tree)
+    come first.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "stall-report.txt"
-    path.write_text(text, encoding="utf-8")
-    print(text, end="", flush=True)
+    with path.open("w", encoding="utf-8") as report:
+
+        def emit(title: str | None, body: str) -> None:
+            text = body if title is None else f"===== {title} =====\n{body}"
+            if not text.endswith("\n"):
+                text += "\n"
+            text = redact(text)
+            report.write(text)
+            report.flush()
+            print(text, end="", flush=True)
+
+        emit(None, f"release build stalled: no exit after {elapsed:.0f}s; root pid {root}")
+        emit("last output lines", "".join(tail))
+        ps_out = run(
+            ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,etime=,%cpu=,command="],
+            PS_TIMEOUT_SECS,
+            None,
+        )
+        tree = build_tree(parse_ps(ps_out), root)
+        header = "  PID  PPID  PGID STAT     ELAPSED %CPU COMMAND"
+        emit("process tree", "\n".join([header, *(row.line for row in tree)]))
+        pids = [row.pid for row in tree]
+        if pids:
+            emit("lsof", run(["lsof", "-n", "-P", "-p", ",".join(map(str, pids))], LSOF_TIMEOUT_SECS, None))
+        for pid in sample_targets(tree, root):
+            # `sample` needs no sudo for the user's own processes; spindump does.
+            sample_file = out_dir / f"sample-{pid}.txt"
+            status = run(["sample", str(pid), str(SAMPLE_SECONDS), "-mayDie", "-file", str(sample_file)],
+                         SAMPLE_TIMEOUT_SECS, None)
+            text = ""
+            with contextlib.suppress(OSError):
+                text = sample_file.read_text(encoding="utf-8", errors="replace")
+                sample_file.write_text(redact(text), encoding="utf-8")
+            shown = "\n".join(text.splitlines()[:60])
+            emit(f"sample {pid} (full: {sample_file.name})", f"{status}{shown}")
+        security_env = dict(os.environ)
+        security_env["HOME"] = _real_home()
+        emit("default keychain", "".join(
+            run(cmd, SECURITY_TIMEOUT_SECS, security_env)
+            for cmd in (
+                ["security", "default-keychain"],
+                ["security", "list-keychains"],
+                ["security", "show-keychain-info"],
+            )
+        ))
     return path
 
 
 def _stop_group(proc: subprocess.Popen) -> None:
-    for sig, wait in ((signal.SIGTERM, KILL_GRACE_SECS), (signal.SIGKILL, KILL_WAIT_SECS)):
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, sig)
-        try:
-            proc.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    """SIGTERM the build's process group, then SIGKILL it after the grace period.
+
+    The SIGKILL goes to the group whether or not the leader exited on SIGTERM:
+    a child that ignores SIGTERM must not outlive the build.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGTERM)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=KILL_GRACE_SECS)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    # Still alive after SIGKILL means stuck in the kernel; do not block on it.
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=KILL_WAIT_SECS)
 
 
 def run_bounded(

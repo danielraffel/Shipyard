@@ -371,11 +371,15 @@ first; `spindump` needs sudo and is not used), the last 200 output lines and
 `security show-keychain-info` for the default keychain. All of it is redacted,
 echoed to the log and saved in `SHIPYARD_RELEASE_BUILD_DIAGNOSTICS_DIR`
 (default `dist/build-diagnostics`). In CI the build is its own step, "Build
-release binaries under a hard time limit" (`timeout-minutes: 25`: the 20-minute
-limit plus the diagnostics budget), before the signing identity is imported,
+release binaries under a hard time limit" (`timeout-minutes: 27`: the 20-minute
+limit, the diagnostics budget and 2 minutes of slack), before the signing
+identity is imported. Each report section is saved as soon as it is collected,
 and a failed or cancelled job uploads the directory as the
-`release-build-diagnostics-<run>-<attempt>` artifact. The signing step then
-packages the built binaries with `--skip-build`. v0.464.0's build sat at 0% CPU
+`release-build-diagnostics-<run>-<attempt>` artifact. The build step records
+the SHA-256 of both binaries in `SHIPYARD_RELEASE_BUILD_MANIFEST`; the signing
+step packages them with `--skip-build` and refuses to sign unless both hashes
+match. At the limit the build's process group gets SIGTERM, then SIGKILL after
+5 seconds whether or not the leader exited. v0.464.0's build sat at 0% CPU
 with no sockets for over an hour inside the signing step, whose only bound was
 115 minutes.
 
@@ -396,12 +400,23 @@ that bounds itself (a notarization retry may run 25 minutes); it backs up a
 runner that failed to enforce a limit and steps that have none. The current
 step's `started_at` is the progress signal, so a run moving through its steps
 is never cancelled, and a job with no step reported in progress is left alone.
-Heal uses a normal cancel (force-cancel would skip the keychain restore), waits
-up to 8 minutes for the run to stop, re-runs it, confirms a new attempt
-started, and comments on an open `release-blocked` issue. At attempt 3 it does
-not cancel; it fails with the reason. Cancelling is off until the repository
-variable `RELEASE_HEAL_CANCEL_STALLED` is `true`; until then a stall fails the
-heal run with the same reason and nothing is cancelled.
+Step limits come from `release.yml` at the run's own commit, not main's; a
+step with neither a known `timeout-minutes` nor any green history is never
+cancelled (the job timeout still bounds it). Heal uses a normal cancel
+(force-cancel would skip the keychain restore), waits up to 8 minutes for the
+run to stop, re-runs it, confirms from the API that `run_attempt` increased,
+and comments on an open `release-blocked` issue. If a pass dies or gives up
+after its cancel, the next pass finds a cancelled step that had run past its
+threshold and re-runs the run; a run cancelled while its steps were moving is
+left for a human, as before. At attempt 3 it neither cancels nor re-runs; it
+fails with the reason.
+
+Cancelling is off until the repository variable `RELEASE_HEAL_CANCEL_STALLED`
+is `true`; until then a stall fails the heal run with the same reason and
+nothing is cancelled. Leave the variable unset until the resume, attempt and
+tag-timeout handling above is on main and one cancel has been exercised
+against the real repository with `--dry-run` and then once for real, as
+`docs/autonomy-contract.md` requires before a default-off recovery is enabled.
 It only acts when `CI_MACOS_SIGNING_ENABLED=true` and never publishes or edits
 a release itself. Run `python3 scripts/release_draft_heal.py --dry-run` locally
 (with `GH_TOKEN`) to see the decision. An exhausted draft keeps Release Heal

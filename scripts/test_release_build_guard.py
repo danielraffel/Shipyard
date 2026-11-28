@@ -87,6 +87,75 @@ class BoundedBuildTests(unittest.TestCase):
                 os.kill(child, 9)
                 self.fail("a build child outlived the time limit")
 
+    def test_a_child_that_ignores_sigterm_is_still_killed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "child.pid"
+            # The leader exits on SIGTERM; its child ignores SIGTERM.
+            script = f"(trap '' TERM; exec sleep 120) & echo $! > {marker}; sleep 120"
+            with redirect_stdout(StringIO()), self.assertRaises(guard.BuildTimedOut), \
+                    mock.patch.object(guard, "KILL_GRACE_SECS", 0.5):
+                guard.run_bounded(["/bin/sh", "-c", script], cwd=Path(temp), timeout=1.0,
+                                  diagnostics_dir=Path(temp), diagnose=lambda *a, **k: Path(temp) / "r")
+            child = int(marker.read_text(encoding="utf-8").strip())
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                os.kill(child, 9)
+                self.fail("a SIGTERM-ignoring child outlived the build kill")
+
+    def test_report_keeps_sections_collected_before_a_kill(self) -> None:
+        def run(args, timeout, env):
+            if args[0] == "ps":
+                return "100 1 100 S 01:00 0.0 cargo build\n"
+            raise KeyboardInterrupt  # the step is killed while lsof runs
+
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                guard.capture_diagnostics(100, ["last cargo line\n"], Path(temp), run=run, redact=lambda t: t)
+            report = (Path(temp) / "stall-report.txt").read_text(encoding="utf-8")
+        self.assertIn("last cargo line", report)
+        self.assertIn("cargo build", report)
+
+    def test_signing_refuses_binaries_other_than_the_built_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary, companion = root / "shipyard", root / "shipyard-workstream-provider"
+            binary.write_bytes(b"built")
+            companion.write_bytes(b"built companion")
+            manifest = root / "manifest.sha256"
+            with redirect_stdout(StringIO()):
+                package_release.write_build_manifest(manifest, [binary, companion])
+                package_release.verify_build_manifest(manifest, [binary, companion])
+                binary.write_bytes(b"swapped")
+                with self.assertRaises(SystemExit) as raised:
+                    package_release.verify_build_manifest(manifest, [binary, companion])
+                self.assertIn("refusing to sign", str(raised.exception.code))
+                with self.assertRaises(SystemExit):
+                    package_release.verify_build_manifest(root / "missing", [binary, companion])
+
+    def test_skip_build_checks_the_manifest_before_anything_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary, companion = root / "shipyard", root / "shipyard-workstream-provider"
+            binary.write_bytes(b"a")
+            companion.write_bytes(b"b")
+            manifest = root / "manifest.sha256"
+            manifest.write_text("0" * 64 + "  shipyard\n" + "0" * 64 + "  shipyard-workstream-provider\n")
+            args = package_release.parse_args([
+                "--target", "macos-arm64", "--skip-build", "--binary", str(binary),
+                "--companion-binary", str(companion), "--tag", "v1.0.0", "--dist-dir", str(root / "dist")])
+            with mock.patch.dict(os.environ, {package_release.BUILD_MANIFEST_ENV: str(manifest)}), \
+                    mock.patch.object(package_release, "smoke_binary_pair") as smoke, \
+                    redirect_stdout(StringIO()), self.assertRaises(SystemExit) as raised:
+                package_release.package(args)
+            smoke.assert_not_called()
+            self.assertIn("refusing to sign", str(raised.exception.code))
+
     def test_failed_build_raises_build_failed_without_diagnostics(self) -> None:
         diagnose = mock.Mock()
         with tempfile.TemporaryDirectory() as temp, redirect_stdout(StringIO()):
@@ -168,11 +237,26 @@ class BoundedBuildTests(unittest.TestCase):
         self.assertEqual(kwargs["diagnostics_dir"], Path("/tmp/diag-x"))
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
 
-    def test_build_only_builds_and_packages_nothing(self) -> None:
+    def test_build_only_builds_records_hashes_and_packages_nothing(self) -> None:
         args = package_release.parse_args(["--target", "macos-arm64", "--build-only"])
-        with mock.patch.object(package_release, "build_release") as build, redirect_stdout(StringIO()):
-            self.assertEqual(package_release.package(args), [])
-        build.assert_called_once_with(None)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / "m.sha256"
+
+            def fake_path(target, cargo_target, name=package_release.BIN_NAME):
+                path = root / name
+                path.write_bytes(name.encode())
+                return path
+
+            with mock.patch.object(package_release, "build_release") as build, \
+                    mock.patch.object(package_release, "default_binary_path", side_effect=fake_path), \
+                    mock.patch.dict(os.environ, {package_release.BUILD_MANIFEST_ENV: str(manifest)}), \
+                    redirect_stdout(StringIO()):
+                self.assertEqual(package_release.package(args), [])
+            build.assert_called_once_with(None)
+            recorded = manifest.read_text(encoding="utf-8")
+        self.assertIn("  shipyard\n", recorded)
+        self.assertIn("  shipyard-workstream-provider\n", recorded)
         bad = package_release.parse_args(["--target", "macos-arm64", "--build-only", "--skip-build"])
         with self.assertRaises(SystemExit):
             package_release.package(bad)

@@ -352,7 +352,7 @@ jobs:
     # the tagged commit's own workflow, so the v* tag rulesets, not this file,
     # are what keep an unmerged commit away from them.
     environment: release
-    # Backstop over the per-step timeouts below (toolchain 45 + build 25 +
+    # Backstop over the per-step timeouts below (toolchain 45 + build 27 +
     # identity 10 + sign/notarize 105 + attestation 15 and its 2 min of
     # backoff + publish 20),
     # so a stall can never hold the release draft for the 6-hour default. The
@@ -445,12 +445,15 @@ jobs:
       # 200 output lines and the keychain state; the next step uploads them.
       # In the last 10 green runs the build and notarization together took
       # 2.5-4.5 minutes, so 20 is over 4x that p95 (3x plus margin for a cold
-      # crate download). The step timeout adds the diagnostics budget, so
-      # GitHub never kills the step before they are written.
+      # crate download). The step timeout adds the diagnostics budget and
+      # 2 minutes of slack, so GitHub never kills the step before they are
+      # written; each section is also saved as soon as it is collected.
       - name: Build release binaries under a hard time limit
-        timeout-minutes: 25
+        timeout-minutes: 27
         env:
           SHIPYARD_RELEASE_BUILD_TIMEOUT_MINUTES: "20"
+          # SHA-256 of both binaries; the signing step refuses any other bytes.
+          SHIPYARD_RELEASE_BUILD_MANIFEST: ${{ runner.temp }}/shipyard-build-manifest-${{ github.run_id }}-${{ github.run_attempt }}.sha256
           SHIPYARD_RELEASE_BUILD_DIAGNOSTICS_DIR: ${{ runner.temp }}/shipyard-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
         shell: bash
         run: |
@@ -533,6 +536,7 @@ jobs:
           SHIPYARD_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
           SHIPYARD_NOTARIZE_APP_PASSWORD: ${{ secrets.MACOS_NOTARIZE_APP_PASSWORD }}
           SHIPYARD_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}
+          SHIPYARD_RELEASE_BUILD_MANIFEST: ${{ runner.temp }}/shipyard-build-manifest-${{ github.run_id }}-${{ github.run_attempt }}.sha256
         shell: bash
         run: |
           set -euo pipefail

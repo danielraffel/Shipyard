@@ -284,67 +284,123 @@ class StallSelectionTests(unittest.TestCase):
         self.assertIsNone(heal.decide_stall(run(status="completed"), stall))
 
 
+class FakeGitHub:
+    """A fake `gh api` for one release run (id 7) that models cancel and re-run."""
+
+    SIGN = "Sign, notarize, staple, and upload macOS DMG"
+    BUILD = "Build release binaries under a hard time limit"
+
+    def __init__(self, *, step_minutes_ago: float, attempt: int = 1, step: str = BUILD,
+                 settles: bool = True, failed_rerun_restarts: bool = True, rerun_fails_fast: bool = False,
+                 issue: bool = True, workflow: str | None = None, history: bool = True,
+                 status: str = "in_progress", conclusion: str | None = None, die_on_poll: int = 0,
+                 poll_errors: int = 0) -> None:
+        self.now = datetime.now(timezone.utc)
+        self.step_minutes_ago = step_minutes_ago
+        self.step = step
+        self.state = {"status": status, "conclusion": conclusion, "run_attempt": attempt}
+        self.settles = settles
+        self.failed_rerun_restarts = failed_rerun_restarts
+        self.rerun_fails_fast = rerun_fails_fast
+        self.issue = issue
+        self.workflow = workflow if workflow is not None else RELEASE_YML
+        self.history = history
+        self.die_on_poll = die_on_poll
+        self.poll_errors = poll_errors
+        self.posts: list[str] = []
+        self.reads: list[str] = []
+        self.cancelled_at: str | None = None
+
+    def stamp(self, minutes: float) -> str:
+        return (self.now - timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _restart(self) -> None:
+        if self.rerun_fails_fast:
+            self.state.update(status="completed", conclusion="failure", run_attempt=self.state["run_attempt"] + 1)
+        else:
+            self.state.update(status="queued", conclusion=None, run_attempt=self.state["run_attempt"] + 1)
+
+    def __call__(self, *args: str) -> str:
+        if "-X" in args:
+            url = args[3]
+            self.posts.append(url)
+            if url.endswith("/cancel"):
+                self.cancelled_at = self.stamp(0)
+                if self.settles:
+                    self.state.update(status="completed", conclusion="cancelled")
+            elif url.endswith("/rerun-failed-jobs"):
+                if not self.failed_rerun_restarts:
+                    raise subprocess.CalledProcessError(1, ["gh"], stderr="no failed jobs (HTTP 422)")
+                self._restart()
+            elif url.endswith("/jobs/11/rerun"):
+                self._restart()
+            return "{}"
+        url = args[1]
+        self.reads.append(url)
+        if "/releases" in url:
+            return json.dumps([{"tag_name": "v1.2.3", "draft": True}])
+        if "/contents/.github/workflows/release.yml" in url:
+            return self.workflow
+        if "/issues?" in url:
+            return json.dumps([{"number": 42, "labels": [{"name": "release-blocked"}]}] if self.issue else [])
+        if url.endswith("/runs/7"):
+            if self.die_on_poll:
+                raise RuntimeError("the heal runner went away")
+            if self.poll_errors:
+                self.poll_errors -= 1
+                raise subprocess.CalledProcessError(1, ["gh"], stderr="Bad Gateway (HTTP 502)")
+            return json.dumps({"id": 7, "head_sha": "tagsha", **self.state})
+        if "/runs/7/jobs" in url:
+            step = {"name": self.step, "started_at": self.stamp(self.step_minutes_ago)}
+            if self.state["status"] == "in_progress":
+                step["status"] = "in_progress"
+                job = {"status": "in_progress", "conclusion": None}
+            else:
+                step.update(status="completed", conclusion="cancelled",
+                            completed_at=self.cancelled_at or self.stamp(0))
+                job = {"status": "completed", "conclusion": self.state["conclusion"]}
+            return json.dumps({"jobs": [{"id": 11, "name": "sign-and-upload-macos", **job, "steps": [step]}]})
+        if "/jobs" in url:
+            steps = [{"name": self.BUILD, "conclusion": "success",
+                      "started_at": "2026-11-01T00:00:00Z", "completed_at": "2026-11-01T00:02:00Z"}]
+            return json.dumps({"jobs": [{"name": "sign-and-upload-macos", "steps": steps if self.history else []}]})
+        if "status=success" in url:
+            return json.dumps({"workflow_runs": [{"id": 100 + i} for i in range(10)]})
+        # A finished run is past heal's 20-minute grace window.
+        age = self.step_minutes_ago if self.state["status"] != "completed" else max(self.step_minutes_ago, 30)
+        return json.dumps({"workflow_runs": [{"id": 7, "head_sha": "tagsha",
+                                              "updated_at": self.stamp(age), **self.state}]})
+
+
+RELEASE_YML = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+
+def heal_main(fake: FakeGitHub, *, dry_run: bool = False, enabled: bool = True,
+              settle_secs: float = 0) -> tuple[int, str]:
+    with tempfile.TemporaryDirectory() as d:
+        cargo = Path(d) / "Cargo.toml"
+        cargo.write_text('[package]\nname = "x"\nversion = "1.2.3"\n')
+        out = io.StringIO()
+        argv = ["heal", "--repo", "o/r", "--cargo-toml", str(cargo), *(["--dry-run"] if dry_run else [])]
+        with mock.patch.object(heal, "_gh", fake), \
+                mock.patch.object(heal.time, "sleep", lambda s: None), \
+                mock.patch.object(heal, "CANCEL_SETTLE_SECS", settle_secs), \
+                mock.patch.object(heal, "RERUN_CONFIRM_SECS", 0), \
+                mock.patch.dict("os.environ", {"CI_MACOS_SIGNING_ENABLED": "true",
+                                               heal.CANCEL_STALLED_ENV: "true" if enabled else ""}), \
+                mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = heal.main()
+    return rc, out.getvalue()
+
+
 class StallMainTests(unittest.TestCase):
     """main() end to end against a fake GitHub that models cancel and re-run."""
 
-    def _main(self, *, step_minutes_ago: float, attempt: int = 1, dry_run: bool = False,
-              settles: bool = True, failed_rerun_restarts: bool = True, issue: bool = True,
-              enabled: bool = True):
-        now = datetime.now(timezone.utc)
-        stamp = lambda m: (now - timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")  # noqa: E731
-        state = {"status": "in_progress", "conclusion": None, "run_attempt": attempt}
-        posts: list[str] = []
-        green_jobs = {"jobs": [{"name": "sign-and-upload-macos", "steps": [
-            {"name": "Build release binaries under a hard time limit", "conclusion": "success",
-             "started_at": "2026-11-01T00:00:00Z", "completed_at": "2026-11-01T00:02:00Z"}]}]}
-
-        def fake_gh(*args: str) -> str:
-            if "-X" in args:
-                url = args[3]
-                posts.append(url)
-                if url.endswith("/cancel"):
-                    if settles:
-                        state.update(status="completed", conclusion="cancelled")
-                elif url.endswith("/rerun-failed-jobs"):
-                    if not failed_rerun_restarts:
-                        raise subprocess.CalledProcessError(1, ["gh"], stderr="no failed jobs (HTTP 422)")
-                    state.update(status="queued", conclusion=None, run_attempt=state["run_attempt"] + 1)
-                elif url.endswith("/jobs/11/rerun"):
-                    state.update(status="queued", conclusion=None, run_attempt=state["run_attempt"] + 1)
-                return "{}"
-            url = args[1]
-            if "/releases" in url:
-                return json.dumps([{"tag_name": "v1.2.3", "draft": True}])
-            if "/issues?" in url:
-                return json.dumps([{"number": 42, "labels": [{"name": "release-blocked"}]}] if issue else [])
-            if url.endswith("/runs/7"):
-                return json.dumps({"id": 7, **state})
-            if "/runs/7/jobs" in url:
-                return json.dumps({"jobs": [{"id": 11, "name": "sign-and-upload-macos", "status": "in_progress",
-                                             "steps": [{"name": "Build release binaries under a hard time limit",
-                                                        "status": "in_progress",
-                                                        "started_at": stamp(step_minutes_ago)}]}]})
-            if "/jobs" in url:
-                return json.dumps(green_jobs)
-            if "status=success" in url:
-                return json.dumps({"workflow_runs": [{"id": 100 + i} for i in range(10)]})
-            return json.dumps({"workflow_runs": [{"id": 7, "updated_at": stamp(step_minutes_ago), **state}]})
-
-        with tempfile.TemporaryDirectory() as d:
-            cargo = Path(d) / "Cargo.toml"
-            cargo.write_text('[package]\nname = "x"\nversion = "1.2.3"\n')
-            out = io.StringIO()
-            argv = ["heal", "--repo", "o/r", "--cargo-toml", str(cargo), *(["--dry-run"] if dry_run else [])]
-            with mock.patch.object(heal, "_gh", fake_gh), \
-                    mock.patch.object(heal.time, "sleep", lambda s: None), \
-                    mock.patch.object(heal, "CANCEL_SETTLE_SECS", 0), \
-                    mock.patch.object(heal, "RERUN_CONFIRM_SECS", 0), \
-                    mock.patch.dict("os.environ", {"CI_MACOS_SIGNING_ENABLED": "true",
-                                                   heal.CANCEL_STALLED_ENV: "true" if enabled else ""}), \
-                    mock.patch.object(sys, "argv", argv), \
-                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                rc = heal.main()
-        return rc, out.getvalue(), posts
+    def _main(self, *, dry_run: bool = False, enabled: bool = True, **kw):
+        fake = FakeGitHub(**kw)
+        rc, out = heal_main(fake, dry_run=dry_run, enabled=enabled)
+        return rc, out, fake.posts
 
     def test_stalled_build_is_cancelled_rerun_and_reported(self) -> None:
         rc, out, posts = self._main(step_minutes_ago=45)
@@ -358,11 +414,75 @@ class StallMainTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("repos/o/r/actions/jobs/11/rerun", posts)
 
-    def test_a_cancel_that_does_not_settle_fails_without_rerunning(self) -> None:
-        rc, out, posts = self._main(step_minutes_ago=45, settles=False)
-        self.assertEqual(rc, 1)
-        self.assertEqual(len(posts), 1)
-        self.assertIn("did not stop", out)
+    def test_a_fast_failing_rerun_counts_as_restarted_and_is_not_rerun_again(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=45, rerun_fails_fast=True, issue=False)
+        rc, out = heal_main(fake)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["cancel", "rerun-failed-jobs"])
+        self.assertEqual(fake.state["run_attempt"], 2)
+
+    def test_an_api_error_after_the_cancel_does_not_abort_the_pass(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=45, poll_errors=2, issue=False)
+        rc, out = heal_main(fake, settle_secs=30)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("repos/o/r/actions/runs/7/rerun-failed-jobs", fake.posts)
+
+    def test_a_cancel_that_does_not_settle_is_rerun_by_the_next_pass(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=45, settles=False, issue=False)
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, len(fake.posts)), (1, 1))
+        self.assertIn("next heal pass re-runs it", out)
+        # The run stops later; the next pass finishes the job.
+        fake.state.update(status="completed", conclusion="cancelled")
+        rc, out = heal_main(fake)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(fake.posts[-1], "repos/o/r/actions/runs/7/rerun-failed-jobs")
+        self.assertEqual(fake.state["run_attempt"], 2)
+
+    def test_cancel_sent_then_pass_dies_then_next_pass_reruns(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=45, die_on_poll=1, issue=False)
+        with self.assertRaises(RuntimeError):
+            heal_main(fake)
+        self.assertEqual(fake.posts, ["repos/o/r/actions/runs/7/cancel"])
+        self.assertEqual(fake.state["conclusion"], "cancelled")
+        fake.die_on_poll = 0
+        rc, out = heal_main(fake)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("resume-rerun", out)
+        self.assertEqual(fake.posts[1:], ["repos/o/r/actions/runs/7/rerun-failed-jobs"])
+        self.assertEqual(fake.state["run_attempt"], 2)
+
+    def test_a_cancel_of_a_moving_run_is_not_resumed(self) -> None:
+        # A maintainer cancelled while the build was 3 minutes in: no stall trace.
+        rc, out, posts = self._main(step_minutes_ago=3, status="completed", conclusion="cancelled")
+        self.assertEqual((rc, posts), (1, []))
+        self.assertIn("was cancelled; re-run it by hand", out)
+
+    def test_a_cancelled_stall_is_not_resumed_with_the_variable_off(self) -> None:
+        rc, out, posts = self._main(step_minutes_ago=45, status="completed", conclusion="cancelled",
+                                    enabled=False)
+        self.assertEqual((rc, posts), (1, []))
+        self.assertIn("was cancelled", out)
+
+    def test_resume_respects_the_attempt_cap(self) -> None:
+        rc, out, posts = self._main(step_minutes_ago=45, status="completed", conclusion="cancelled", attempt=3)
+        self.assertEqual((rc, posts), (1, []))
+        self.assertIn("not retrying", out)
+
+    def test_step_timeouts_come_from_the_runs_own_commit(self) -> None:
+        # The tag's release.yml bounds signing at 115 (threshold 120); main's
+        # 105 would give 110. 112 minutes in, with no green history, is inside.
+        tag_yml = RELEASE_YML.replace("timeout-minutes: 105", "timeout-minutes: 115")
+        self.assertNotEqual(tag_yml, RELEASE_YML)
+        fake = FakeGitHub(step_minutes_ago=112, step=FakeGitHub.SIGN, workflow=tag_yml, history=False)
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (0, []), out)
+        self.assertIn("repos/o/r/contents/.github/workflows/release.yml?ref=tagsha", fake.reads)
+
+    def test_unknown_step_without_history_fails_closed(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=22, step="Renamed signing step", workflow="", history=False)
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (0, []), out)
 
     def test_a_step_inside_its_bound_is_not_touched(self) -> None:
         rc, out, posts = self._main(step_minutes_ago=10)

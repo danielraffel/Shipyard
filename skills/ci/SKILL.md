@@ -1199,7 +1199,11 @@ current step has run longer than the largest of 20 minutes, 3x that step's
 median over the last 10 green release runs, and the step's own
 `timeout-minutes` plus 5; it comments on an open `release-blocked` issue.
 Cancelling needs the repository variable `RELEASE_HEAL_CANCEL_STALLED=true`;
-without it a stall only fails the heal run with the reason.
+without it a stall only fails the heal run with the reason. Do not set it
+until one cancel has been exercised (RELEASING.md). Step limits are read from
+the run's own commit, a step with no known limit and no green history is never
+cancelled, and a later pass re-runs a heal cancel whose re-run never happened.
+The signing step refuses binaries whose SHA-256 differs from the build step's.
 The macOS release build runs in its own step, "Build release binaries under a
 hard time limit" (`scripts/release_build_guard.py`): cargo stops after
 `SHIPYARD_RELEASE_BUILD_TIMEOUT_MINUTES` (20), with network retries and closed

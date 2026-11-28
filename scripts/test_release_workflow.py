@@ -471,6 +471,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             int(step["timeout-minutes"]) * 60,
             cap_secs + release_build_guard.DIAGNOSTICS_BUDGET_SECS,
         )
+        # The signing step checks the exact bytes the build step recorded.
+        sign = next(s for s in job["steps"] if s.get("name") == "Sign, notarize, staple, and upload macOS DMG")
+        self.assertEqual(step["env"]["SHIPYARD_RELEASE_BUILD_MANIFEST"],
+                         sign["env"]["SHIPYARD_RELEASE_BUILD_MANIFEST"])
         diag_dir = step["env"]["SHIPYARD_RELEASE_BUILD_DIAGNOSTICS_DIR"]
         upload = job["steps"][build_index + 1]
         self.assertTrue(upload["uses"].startswith("actions/upload-artifact@"))
