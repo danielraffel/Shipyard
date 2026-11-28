@@ -643,6 +643,7 @@ fn ownership_refusal(
                                 "kind": kind, "before": before, "after": head})
                             .to_string()
                         })
+                        .rev()
                         .collect::<Vec<_>>()
                         .join("\n"));
                 }
@@ -1138,6 +1139,81 @@ fn an_over_cap_own_diff_that_carries_the_candidates_commit_is_refused() {
     let refusal = independent_refusal(&run_gh, &Cell::new(0)).expect("refused");
     assert_eq!(refusal.token, "carries_unapproved_commits:#11450");
     assert!(refusal.detail.contains(INDEPENDENT), "{}", refusal.detail);
+}
+
+/// Review 1754-r3-f2: an over-cap Q (its own diff over the cap, narrowed by
+/// probing) clears only through its approval. P's branch held the commit
+/// first by the activity log, and P is still refused.
+#[test]
+fn an_over_cap_own_diff_is_never_cleared_by_ownership() {
+    let listing = json!({"data": {"repository": {"pullRequests": {
+        "pageInfo": {"hasNextPage": false, "endCursor": null},
+        "nodes": [
+            {"number": 11450, "headRefName": "feat/stacked", "baseRefName": STACKED_BASE,
+             "headRefOid": STACKED_HEAD, "isCrossRepository": false,
+             "createdAt": "2026-11-27T23:00:00Z", "author": {"login": "someone"},
+             "carriedCommits": {"totalCount": 278, "nodes": []}},
+            {"number": 11558, "headRefName": "feat/independent", "baseRefName": "main",
+             "headRefOid": INDEPENDENT, "isCrossRepository": false,
+             "createdAt": "2026-11-27T23:00:00Z", "author": {"login": "someone"},
+             "carriedCommits": {"totalCount": 1, "nodes": [{"commit": {"oid": INDEPENDENT}}]}},
+        ],
+    }}}})
+    .to_string();
+    let zero = "0".repeat(40);
+    let p_log = json!({"at": "2026-11-27T01:00:00Z", "kind": "branch_creation",
+        "before": zero, "after": INDEPENDENT})
+    .to_string();
+    let q_log = json!({"at": "2026-11-27T02:00:00Z", "kind": "branch_creation",
+        "before": zero, "after": STACKED_HEAD})
+    .to_string();
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        let joined = argv.join(" ");
+        if joined.contains("activity?ref=refs/heads/feat/independent&") {
+            return Ok(p_log.clone());
+        }
+        if joined.contains("activity?ref=refs/heads/feat/stacked&") {
+            return Ok(q_log.clone());
+        }
+        if joined.contains(&format!("compare/main...{INDEPENDENT}?")) {
+            return Ok(if joined.contains("parents") {
+                graph(&[(INDEPENDENT, &["main-tip"])])
+            } else {
+                json!({"total": 1, "shas": [INDEPENDENT]}).to_string()
+            });
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{STACKED_HEAD}")) {
+            return Ok(json!({"total": 278, "shas": STACKED_OWN}).to_string());
+        }
+        if joined.contains(&format!("compare/{STACKED_HEAD}...{INDEPENDENT}")) {
+            return Ok("behind".to_owned());
+        }
+        if joined.contains(&format!("compare/{STACKED_BASE}...{INDEPENDENT}")) {
+            return Ok("ahead".to_owned());
+        }
+        if joined.contains("OPEN") {
+            return Ok(listing.clone());
+        }
+        Err(format!("unexpected: {joined}"))
+    };
+    let refusal = independent_refusal(&run_gh, &Cell::new(0)).expect("refused");
+    assert_eq!(refusal.token, "carries_unapproved_commits:#11450");
+
+    // Control: Q approved admits P.
+    let mut judge = |_: &OpenPr| Judgement::Approved;
+    assert_eq!(
+        refusal_with(
+            &run_gh,
+            "Generous-Corp/pulp",
+            "main",
+            11558,
+            "feat/independent",
+            INDEPENDENT,
+            &mut PassCache::default(),
+            &mut judge,
+        ),
+        None
+    );
 }
 
 #[test]

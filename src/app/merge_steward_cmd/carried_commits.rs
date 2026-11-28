@@ -919,7 +919,15 @@ fn without_p_owned(
                 shared,
             },
             judgement,
-        ) if judgement != Judgement::Approved => {
+        ) if judgement != Judgement::Approved
+            // An over-cap Q (its own diff over the cap, narrowed by probing)
+            // clears only through its approval: ownership is never read for
+            // it, since the walk cannot see all of Q's commits.
+            && !matches!(
+                graphs.get(&(q.base_ref.clone(), q.head_sha.clone())),
+                Some(Ok(CommitGraph::OverCap { .. }))
+            ) =>
+        {
             match ownership::p_owned(
                 run_gh,
                 repo,

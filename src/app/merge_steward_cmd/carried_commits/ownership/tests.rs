@@ -67,7 +67,13 @@ impl World {
             if joined.contains("/activity?") {
                 for (branch, entries) in &self.logs {
                     if joined.contains(&format!("ref=refs/heads/{branch}&")) {
-                        return Ok(entries.iter().map(entry).collect::<Vec<_>>().join("\n"));
+                        // Newest first, as GitHub serves `direction=desc`.
+                        return Ok(entries
+                            .iter()
+                            .rev()
+                            .map(entry)
+                            .collect::<Vec<_>>()
+                            .join("\n"));
                     }
                 }
                 return Err("no log".to_owned());
@@ -237,4 +243,92 @@ fn a_log_that_has_not_reached_qs_listed_head_fails_closed() {
         .settle(&q(OPENED, false), false)
         .expect_err("lagging log");
     assert!(error.contains("has not reached"), "{error}");
+}
+
+#[test]
+fn a_gap_in_ps_log_fails_closed() {
+    // Review 1754-r3-f1: P's branch was created at C (hour 1) and deleted
+    // (hour 2); its re-creation is missing, and a push from B to C follows
+    // (hour 4). Q's complete log first holds C at hour 3. P's earlier life
+    // must not be credited.
+    let mut world = World::parent_first();
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (1, "branch_creation", ZERO, C),
+            (2, "branch_deletion", C, ZERO),
+            (4, "push", BASE_TIP, C),
+        ],
+    );
+    world
+        .logs
+        .insert(Q_BRANCH, vec![(3, "branch_creation", ZERO, Q_HEAD)]);
+    let error = world
+        .settle(&q(OPENED, false), false)
+        .expect_err("gap in P's log");
+    assert!(error.contains("skips"), "{error}");
+
+    // Control: the re-creation logged (after Q's arrival), the log settles
+    // and C is Q's.
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (1, "branch_creation", ZERO, C),
+            (2, "branch_deletion", C, ZERO),
+            (3, "branch_creation", ZERO, BASE_TIP),
+            (4, "push", BASE_TIP, C),
+        ],
+    );
+    world.compares.insert(BASE_TIP, Some(Vec::new()));
+    assert_eq!(world.settle(&q(OPENED, false), false), Ok(Vec::new()));
+}
+
+#[test]
+fn a_deletion_with_no_later_creation_in_ps_log_fails_closed() {
+    let mut world = World::parent_first();
+    world.logs.insert(
+        P_BRANCH,
+        vec![
+            (1, "branch_creation", ZERO, C),
+            (2, "branch_deletion", C, ZERO),
+        ],
+    );
+    let error = world.settle(&q(OPENED, false), false).expect_err("deleted");
+    assert!(error.contains("no creation after it"), "{error}");
+}
+
+#[test]
+fn the_activity_read_is_one_bounded_page() {
+    // Review 1754-r3-f3: one page, newest first, one entry over the cap, and
+    // never paginated; a full page is refused.
+    let argvs = std::cell::RefCell::new(Vec::new());
+    let full_page = (0..=MAX_PUSHES_READ)
+        .map(|_| entry(&(1, "push", C, C)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let run_gh = |argv: &[String]| -> Result<String, String> {
+        argvs.borrow_mut().push(argv.join(" "));
+        Ok(full_page.clone())
+    };
+    let error = p_owned(
+        &run_gh,
+        "o/r",
+        "main",
+        P_BRANCH,
+        false,
+        &q(OPENED, false),
+        &[C.to_owned()],
+        &mut BTreeMap::new(),
+        &mut BTreeMap::new(),
+    )
+    .expect_err("over the cap");
+    assert!(error.contains("over the read cap"), "{error}");
+    let argvs = argvs.into_inner();
+    assert_eq!(argvs.len(), 1, "one read: {argvs:?}");
+    assert!(!argvs[0].contains("--paginate"), "{}", argvs[0]);
+    assert!(
+        argvs[0].contains(&format!("direction=desc&per_page={}", MAX_PUSHES_READ + 1)),
+        "{}",
+        argvs[0]
+    );
 }

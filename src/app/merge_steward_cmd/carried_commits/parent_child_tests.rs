@@ -165,6 +165,7 @@ fn run_logged(
                                 "kind": kind, "before": before, "after": after})
                             .to_string()
                         })
+                        .rev()
                         .collect::<Vec<_>>()
                         .join("\n"));
                 }

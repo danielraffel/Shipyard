@@ -28,6 +28,13 @@
 //! branch must be explained by entries after P's arrival; otherwise the log
 //! is incomplete and nothing is settled.
 //!
+//! P's log must be unbroken as well, and its last deletion must be followed
+//! by a creation, so a missing entry cannot credit an earlier life. Each log
+//! is read as one page, newest first, with one entry more than
+//! [`MAX_PUSHES_READ`]: a full page is refused after a single read. An
+//! over-cap Q (its own diff over the cap) is never judged here; it clears
+//! only through its approval.
+//!
 //! Ownership follows push order, not intent: a child pushed before its
 //! parent, or in the same second, owns the shared commits. For P only
 //! the branch's current life counts (entries from its last creation), so a
@@ -58,6 +65,8 @@ pub(super) struct Push {
 pub(super) struct Activity {
     pub pushes: Vec<Push>,
     pub gap: Option<String>,
+    /// When the branch was last deleted, if the log shows a deletion.
+    pub last_deletion: Option<DateTime<Utc>>,
 }
 
 /// Activity logs read this pass, by branch.
@@ -84,19 +93,30 @@ fn encode(branch: &str) -> String {
 fn read_activity(run_gh: RunGh<'_>, repo: &str, branch: &str) -> Result<Activity, String> {
     let raw = run_gh(&[
         "api".to_owned(),
-        "--paginate".to_owned(),
+        // One page, newest first, one entry over the cap: a log with more
+        // entries than the cap is refused after a single read, never paged.
         format!(
-            "repos/{repo}/activity?ref=refs/heads/{}&direction=asc&per_page=100",
-            encode(branch)
+            "repos/{repo}/activity?ref=refs/heads/{}&direction=desc&per_page={}",
+            encode(branch),
+            MAX_PUSHES_READ + 1
         ),
         "--jq".to_owned(),
         ".[] | {at: .timestamp, kind: .activity_type, before: .before, after: .after}".to_owned(),
     ])
     .map_err(|error| format!("activity of {branch} unreadable: {error}"))?;
+    let mut entries: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+    if entries.len() > MAX_PUSHES_READ {
+        return Err(format!(
+            "activity of {branch} has more than {MAX_PUSHES_READ} entries, over the read cap"
+        ));
+    }
+    // The page is newest first; walk it oldest first.
+    entries.reverse();
+    let mut last_deletion = None;
     let mut pushes = Vec::new();
     let mut gap = None;
     let mut previous: Option<String> = None;
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+    for line in entries {
         let value: serde_json::Value = serde_json::from_str(line)
             .map_err(|error| format!("activity of {branch} malformed: {error}"))?;
         let field = |name: &str| {
@@ -124,12 +144,13 @@ fn read_activity(run_gh: RunGh<'_>, repo: &str, branch: &str) -> Result<Activity
             ));
         }
         previous = Some(after.clone());
-        if kind == "branch_deletion" {
-            continue;
-        }
         let at = field("at")?
             .parse::<DateTime<Utc>>()
             .map_err(|error| format!("activity of {branch}: bad time: {error}"))?;
+        if kind == "branch_deletion" {
+            last_deletion = Some(at);
+            continue;
+        }
         if after.bytes().all(|byte| byte == b'0') {
             continue;
         }
@@ -141,13 +162,11 @@ fn read_activity(run_gh: RunGh<'_>, repo: &str, branch: &str) -> Result<Activity
     }
     // A stable sort: entries in the same second keep the log's order.
     pushes.sort_by_key(|push| push.at);
-    if pushes.len() > MAX_PUSHES_READ {
-        return Err(format!(
-            "activity of {branch} has {} entries, over the {MAX_PUSHES_READ} read",
-            pushes.len()
-        ));
-    }
-    Ok(Activity { pushes, gap })
+    Ok(Activity {
+        pushes,
+        gap,
+        last_deletion,
+    })
 }
 
 /// When `pushes` first reached each of `shas` (by `base...after`), for those
@@ -211,7 +230,13 @@ pub(super) fn p_owned(
             .or_insert_with(|| read_activity(run_gh, repo, branch))
             .clone()
     };
-    let p_log = log(p_branch)?.pushes;
+    // P's log must be unbroken too: a missing entry could hide a deletion
+    // and re-creation, crediting P with an earlier life's commits.
+    let p_activity = log(p_branch)?;
+    if let Some(gap) = p_activity.gap {
+        return Err(gap);
+    }
+    let p_log = p_activity.pushes;
     let q_activity = log(&q.head_ref)?;
     // Q's whole history must be in view and unbroken: a log that does not
     // start at a branch creation, skips an entry, or has not caught up with
@@ -247,11 +272,21 @@ pub(super) fn p_owned(
         }
         None => return Err(format!("#{} has no listed opening time", q.number)),
     }
-    // P's branch in its current life: from its last creation.
+    // P's branch in its current life: from its last creation, which must
+    // follow its last deletion (an open pull request's branch exists).
     let p_life = p_log
         .iter()
         .rposition(|push| push.creation)
         .map_or(&p_log[..], |start| &p_log[start..]);
+    if let Some(deleted) = p_activity.last_deletion
+        && !p_life
+            .first()
+            .is_some_and(|push| push.creation && push.at >= deleted)
+    {
+        return Err(format!(
+            "the activity log of {p_branch} shows a deletion at {deleted} with no creation after it"
+        ));
+    }
     let shas: BTreeSet<String> = shared.iter().cloned().collect();
     let on_p = first_reached(run_gh, repo, base, p_life, &shas, None, graphs)?;
     let latest = on_p.values().max().copied();
