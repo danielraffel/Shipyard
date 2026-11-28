@@ -458,7 +458,7 @@ fn git_command() -> Command {
     command
 }
 
-fn clear_repository_selecting_env(mut command: Command) -> Command {
+pub(crate) fn clear_repository_selecting_env(mut command: Command) -> Command {
     for name in REPOSITORY_SELECTING_GIT_ENV {
         command.env_remove(name);
     }
