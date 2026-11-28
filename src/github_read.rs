@@ -14,8 +14,9 @@
 //! exact repository, as the wrapper's token helper does.
 //!
 //! Only reads come here. [`argv::classify`] accepts the exact `gh` shapes the
-//! steward's read paths build (`gh api repos/...`, a read-only `gh api graphql`
-//! query, and `gh pr view --json` for a known field set) and declines
+//! steward's read paths build (`gh api repos/...`, optionally with `--paginate`,
+//! `--slurp` or a `--jq` filter from the subset in [`jq`], a read-only
+//! `gh api graphql` query, and `gh pr view --json` for a known field set) and declines
 //! everything else, so every write, and every read it does not fully
 //! understand, still runs through `gh` and the wrapper's guards. The answer is
 //! shaped as `gh` would have printed it, error text included, so callers and
