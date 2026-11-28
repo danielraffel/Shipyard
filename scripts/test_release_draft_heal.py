@@ -61,8 +61,8 @@ class DecideTests(unittest.TestCase):
         src = (ROOT / "scripts" / "release_draft_heal.py").read_text()
         # Every write is a POST whose endpoint is named on the same line or
         # comes from the re-run endpoint tuple; none publishes or edits a release.
-        self.assertEqual(src.count('"-X", "POST"'), 4)
-        for endpoint in ("rerun-failed-jobs", "/cancel", "/rerun", "/comments"):
+        self.assertEqual(src.count('"-X", "POST"'), 5)
+        for endpoint in ("rerun-failed-jobs", "/cancel", "/rerun", "/comments", "/commits/{sha}/comments"):
             self.assertIn(endpoint, src)
         # A normal cancel only: force-cancel skips the keychain restore.
         self.assertNotIn("/force-cancel", src)
@@ -297,7 +297,8 @@ class FakeGitHub:
                  status: str = "in_progress", conclusion: str | None = None, die_on_poll: int = 0,
                  poll_errors: int = 0, workflow_unreadable: bool = False,
                  cancel_refusal: str | None = None, fail_reads_after_rerun: bool = False,
-                 attempt_after_rerun=None) -> None:
+                 attempt_after_rerun=None, markers: list | None = None, marker_read_fails: bool = False,
+                 marker_write_fails: bool = False) -> None:
         self.now = datetime.now(timezone.utc)
         self.step_minutes_ago = step_minutes_ago
         self.step = step
@@ -317,6 +318,10 @@ class FakeGitHub:
         # What /runs/7 reports as run_attempt once a re-run was requested:
         # None leaves it alone, MISSING drops the key, anything else replaces it.
         self.attempt_after_rerun = attempt_after_rerun
+        # Commit comments on the run's head commit: (author login, body).
+        self.markers: list = list(markers or [])
+        self.marker_read_fails = marker_read_fails
+        self.marker_write_fails = marker_write_fails
         self.posts: list[str] = []
         self.reads: list[str] = []
         self.cancelled_at: str | None = None
@@ -334,6 +339,12 @@ class FakeGitHub:
         if "-X" in args:
             url = args[3]
             self.posts.append(url)
+            if url.endswith("/commits/tagsha/comments"):
+                if self.marker_write_fails:
+                    raise subprocess.CalledProcessError(1, ["gh"], stderr="Forbidden (HTTP 403)")
+                body = args[args.index("-f") + 1].removeprefix("body=")
+                self.markers.append(("github-actions[bot]", body))
+                return "{}"
             if url.endswith("/cancel"):
                 if self.cancel_refusal:
                     raise subprocess.CalledProcessError(1, ["gh"], stderr=self.cancel_refusal)
@@ -352,6 +363,10 @@ class FakeGitHub:
         self.reads.append(url)
         if "/releases" in url:
             return json.dumps([{"tag_name": "v1.2.3", "draft": True}])
+        if "/commits/tagsha/comments" in url:
+            if self.marker_read_fails:
+                raise subprocess.CalledProcessError(1, ["gh"], stderr="Bad Gateway (HTTP 502)")
+            return json.dumps([{"user": {"login": login}, "body": body} for login, body in self.markers])
         if "/contents/.github/workflows/release.yml" in url:
             if self.workflow_unreadable:
                 raise subprocess.CalledProcessError(1, ["gh"], stderr="Bad Gateway (HTTP 502)")
@@ -432,7 +447,9 @@ class StallMainTests(unittest.TestCase):
     def test_stalled_build_is_cancelled_rerun_and_reported(self) -> None:
         rc, out, posts = self._main(step_minutes_ago=45)
         self.assertEqual(rc, 0, out)
-        self.assertEqual([p.rsplit("/", 1)[-1] for p in posts], ["cancel", "rerun-failed-jobs", "comments"])
+        self.assertEqual([p.rsplit("/", 1)[-1] for p in posts],
+                         ["comments", "cancel", "rerun-failed-jobs", "comments"])
+        self.assertEqual(posts[0], "repos/o/r/commits/tagsha/comments")
         self.assertIn("issues/42/comments", posts[-1])
         self.assertIn("attempt 2/3", out)
 
@@ -445,7 +462,7 @@ class StallMainTests(unittest.TestCase):
         fake = FakeGitHub(step_minutes_ago=45, rerun_fails_fast=True, issue=False)
         rc, out = heal_main(fake)
         self.assertEqual(rc, 0, out)
-        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["cancel", "rerun-failed-jobs"])
+        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "rerun-failed-jobs"])
         self.assertEqual(fake.state["run_attempt"], 2)
 
     def test_unreadable_confirmation_never_sends_the_fallback(self) -> None:
@@ -455,7 +472,7 @@ class StallMainTests(unittest.TestCase):
                           fail_reads_after_rerun=True, issue=False)
         rc, out = heal_main(fake)
         self.assertEqual(rc, 1, out)
-        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["cancel", "rerun-failed-jobs"])
+        self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "rerun-failed-jobs"])
         self.assertEqual(fake.state["run_attempt"], 3)
         self.assertIn("outcome is unknown", out)
 
@@ -468,7 +485,7 @@ class StallMainTests(unittest.TestCase):
                                   attempt_after_rerun=reported, issue=False)
                 rc, out = heal_main(fake)
                 self.assertEqual(rc, 1, out)
-                self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["cancel", "rerun-failed-jobs"])
+                self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["comments", "cancel", "rerun-failed-jobs"])
                 self.assertIn("outcome is unknown", out)
         fake = FakeGitHub(step_minutes_ago=45, attempt=2, failed_rerun_restarts=False,
                           attempt_after_rerun=2, issue=False)
@@ -487,7 +504,7 @@ class StallMainTests(unittest.TestCase):
     def test_a_cancel_that_does_not_settle_is_rerun_by_the_next_pass(self) -> None:
         fake = FakeGitHub(step_minutes_ago=45, settles=False, issue=False)
         rc, out = heal_main(fake)
-        self.assertEqual((rc, len(fake.posts)), (1, 1))
+        self.assertEqual((rc, len(fake.posts)), (1, 2))
         self.assertIn("next heal pass re-runs it", out)
         # The run stops later; the next pass finishes the job.
         fake.state.update(status="completed", conclusion="cancelled")
@@ -500,14 +517,56 @@ class StallMainTests(unittest.TestCase):
         fake = FakeGitHub(step_minutes_ago=45, die_on_poll=1, issue=False)
         with self.assertRaises(RuntimeError):
             heal_main(fake)
-        self.assertEqual(fake.posts, ["repos/o/r/actions/runs/7/cancel"])
+        self.assertEqual(fake.posts, ["repos/o/r/commits/tagsha/comments", "repos/o/r/actions/runs/7/cancel"])
         self.assertEqual(fake.state["conclusion"], "cancelled")
         fake.die_on_poll = 0
         rc, out = heal_main(fake)
         self.assertEqual(rc, 0, out)
         self.assertIn("resume-rerun", out)
-        self.assertEqual(fake.posts[1:], ["repos/o/r/actions/runs/7/rerun-failed-jobs"])
+        self.assertEqual(fake.posts[2:], ["repos/o/r/actions/runs/7/rerun-failed-jobs"])
         self.assertEqual(fake.state["run_attempt"], 2)
+
+    def _cancelled_long(self, **kw) -> FakeGitHub:
+        return FakeGitHub(step_minutes_ago=45, status="completed", conclusion="cancelled", issue=False, **kw)
+
+    def test_a_maintainer_cancelled_stall_is_not_resumed(self) -> None:
+        # A long cancelled step, but no heal marker: a maintainer (or the
+        # concurrency group) cancelled it.
+        fake = self._cancelled_long()
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (1, []), out)
+        self.assertIn("no release-heal cancel marker", out)
+
+    def test_a_heal_cancelled_run_with_its_marker_is_resumed(self) -> None:
+        marker = "<!-- release-heal-cancel run=7 attempt=1 nonce=0123456789abcdef -->"
+        fake = self._cancelled_long(markers=[("github-actions[bot]", marker)])
+        rc, out = heal_main(fake)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(fake.posts, ["repos/o/r/actions/runs/7/rerun-failed-jobs"])
+
+    def test_a_marker_must_name_this_run_and_attempt_and_come_from_the_workflow(self) -> None:
+        for author, marker in (
+            ("github-actions[bot]", "<!-- release-heal-cancel run=7 attempt=2 nonce=0123456789abcdef -->"),
+            ("github-actions[bot]", "<!-- release-heal-cancel run=8 attempt=1 nonce=0123456789abcdef -->"),
+            ("someone", "<!-- release-heal-cancel run=7 attempt=1 nonce=0123456789abcdef -->"),
+        ):
+            with self.subTest(author=author, marker=marker):
+                fake = self._cancelled_long(markers=[(author, marker)])
+                rc, out = heal_main(fake)
+                self.assertEqual((rc, fake.posts), (1, []), out)
+
+    def test_an_unreadable_marker_is_not_resumed(self) -> None:
+        marker = "<!-- release-heal-cancel run=7 attempt=1 nonce=0123456789abcdef -->"
+        fake = self._cancelled_long(markers=[("github-actions[bot]", marker)], marker_read_fails=True)
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (1, []), out)
+        self.assertIn("unreadable; not resuming", out)
+
+    def test_no_cancel_without_a_recorded_marker(self) -> None:
+        fake = FakeGitHub(step_minutes_ago=45, marker_write_fails=True, issue=False)
+        rc, out = heal_main(fake)
+        self.assertEqual((rc, fake.posts), (1, ["repos/o/r/commits/tagsha/comments"]), out)
+        self.assertIn("could not record the cancel intent", out)
 
     def test_a_cancel_of_a_moving_run_is_not_resumed(self) -> None:
         # A maintainer cancelled while the build was 3 minutes in: no stall trace.
@@ -562,7 +621,8 @@ class StallMainTests(unittest.TestCase):
         started = time.monotonic()
         rc, out = heal_main(fake, settle_secs=5)
         self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual((rc, fake.posts), (1, ["repos/o/r/actions/runs/7/cancel"]))
+        self.assertEqual((rc, fake.posts), (1, ["repos/o/r/commits/tagsha/comments",
+                                                "repos/o/r/actions/runs/7/cancel"]))
         self.assertIn("could not cancel", out)
         self.assertNotIn("has not stopped", out)
 

@@ -405,10 +405,13 @@ step with neither a known `timeout-minutes` nor any green history is never
 cancelled (the job timeout still bounds it). Heal uses a normal cancel
 (force-cancel would skip the keychain restore), waits up to 8 minutes for the
 run to stop, re-runs it, confirms from the API that `run_attempt` increased,
-and comments on an open `release-blocked` issue. If a pass dies or gives up
-after its cancel, the next pass finds a cancelled step that had run past its
-threshold and re-runs the run; a run cancelled while its steps were moving is
-left for a human, as before. At attempt 3 it neither cancels nor re-runs; it
+and comments on an open `release-blocked` issue. Before it cancels, heal writes a marker comment on the run's
+head commit naming the run id, attempt and a nonce; if that write fails it
+does not cancel. If a pass dies or gives up after its cancel, the next pass
+re-runs the run only when that marker, posted by `github-actions[bot]`, names
+the exact run id and attempt and a cancelled step had run past its threshold.
+A run a maintainer or the concurrency group cancelled has no marker and is
+left for a human, as is any run whose markers cannot be read. At attempt 3 it neither cancels nor re-runs; it
 fails with the reason. To keep a stalled run dead, unset the variable or
 delete the draft. If `release.yml` at the run's commit cannot be read, that
 pass judges no stall and cancels or resumes nothing.

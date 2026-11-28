@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -547,6 +548,59 @@ def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Sta
     return 0
 
 
+# Durable proof that heal itself cancelled a run: a commit comment on the
+# run's head commit, written before the cancel and by the workflow token.
+# A later pass resumes a cancelled run only with this marker for its exact
+# run id and attempt; a run a maintainer or the concurrency group cancelled
+# has none and is left for a human.
+MARKER_RE = re.compile(r"<!-- release-heal-cancel run=(\d+) attempt=(\d+) nonce=([0-9a-f]{16}) -->")
+MARKER_AUTHOR = "github-actions[bot]"
+MARKER_PAGES = 10
+
+
+def write_cancel_marker(repo: str, run: dict, stall: Stall) -> str | None:
+    """Record the intent to cancel ``run``; the nonce, or None when it could not be written."""
+    sha = run.get("head_sha")
+    if not sha:
+        return None
+    nonce = secrets.token_hex(8)
+    attempt = int(run.get("run_attempt") or 1)
+    body = (f"release-heal is cancelling stalled release run {run['id']} (attempt {attempt}): job "
+            f"`{stall.job_name}` step `{stall.step_name}` ran {int(stall.elapsed_secs // 60)} min, over its "
+            f"{int(stall.threshold_secs // 60)} min threshold. A later heal pass may re-run it.\n\n"
+            f"<!-- release-heal-cancel run={run['id']} attempt={attempt} nonce={nonce} -->")
+    try:
+        _gh("api", "-X", "POST", f"repos/{repo}/commits/{sha}/comments", "-f", f"body={body}")
+    except subprocess.CalledProcessError as exc:
+        print(f"::warning::could not record the cancel intent for run {run['id']}: {(exc.stderr or '').strip()}")
+        return None
+    print(f"recorded cancel intent for run {run['id']} attempt {attempt} (nonce {nonce})")
+    return nonce
+
+
+def has_cancel_marker(repo: str, run: dict) -> bool | None:
+    """True when heal recorded a cancel of this exact run id and attempt; None if unreadable."""
+    sha = run.get("head_sha")
+    if not sha:
+        return None
+    want = (str(run["id"]), str(run.get("run_attempt")))
+    try:
+        for page in range(1, MARKER_PAGES + 1):
+            comments = json.loads(_gh("api", f"repos/{repo}/commits/{sha}/comments?per_page=100&page={page}"))
+            for comment in comments:
+                if (comment.get("user") or {}).get("login") != MARKER_AUTHOR:
+                    continue
+                for match in MARKER_RE.finditer(comment.get("body") or ""):
+                    if (match.group(1), match.group(2)) == want:
+                        return True
+            if len(comments) < 100:
+                return False
+    except (subprocess.CalledProcessError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+        print(f"::warning::could not read the cancel markers on {sha}: {exc}")
+        return None
+    return None
+
+
 def cancel_and_rerun(repo: str, tag: str, run: dict, stall: Stall, *, sleep=None) -> int:
     """Cancel a stalled run, wait for it to settle, then re-run it.
 
@@ -557,6 +611,12 @@ def cancel_and_rerun(repo: str, tag: str, run: dict, stall: Stall, *, sleep=None
     """
     run_id = run["id"]
     attempt = int(run.get("run_attempt") or 1)
+    # The marker first: without it a later pass could never tell this cancel
+    # from a maintainer's, so no marker means no cancel.
+    if write_cancel_marker(repo, run, stall) is None:
+        print(f"::error title=Release {tag} heal did not cancel stalled run {run_id}::"
+              "could not record the cancel intent on the run's commit")
+        return 1
     try:
         _gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
         print(f"cancel requested for run {run_id}")
@@ -647,7 +707,17 @@ def main() -> int:
             decision = decide_stall(run, stall) or decision
         else:
             stall = find_cancelled_stall(jobs, history=history, timeouts=timeouts)
-            decision = decide_resume(run, stall) or decision
+            resume = decide_resume(run, stall)
+            if resume is not None and resume.action == "resume-rerun":
+                marker = has_cancel_marker(repo, run)
+                if marker is None:
+                    print(f"::warning::cancel markers for run {run['id']} are unreadable; not resuming this pass")
+                    resume = None
+                elif not marker:
+                    print(f"run {run['id']} attempt {run.get('run_attempt')} has no release-heal cancel marker; "
+                          "it was not cancelled by heal, so it is left for a human")
+                    resume = None
+            decision = resume or decision
     print(f"{tag}: {decision.action}: {decision.reason}")
     if decision.action == "resume-rerun" and not args.dry_run:
         assert stall is not None and run is not None
