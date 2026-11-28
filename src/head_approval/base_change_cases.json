@@ -338,6 +338,18 @@
      "kind": "comment",
      "at": "2026-11-20T11:00:00Z",
      "verdict": "APPROVE"
+    },
+    {
+     "id": 3,
+     "kind": "review",
+     "at": null,
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 4,
+     "kind": "review",
+     "at": "2026-11-20",
+     "verdict": "APPROVE"
     }
    ],
    "kept": [

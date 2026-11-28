@@ -226,9 +226,18 @@ pub(super) fn without_approvals_through(
 ) -> (Vec<Value>, Vec<Value>) {
     let floor = DateTime::parse_from_rfc3339(&change.at)
         .map_or(DateTime::<Utc>::MAX_UTC, |at| at.with_timezone(&Utc));
-    records
-        .into_iter()
-        .partition(|record| !is_approval(record) || at(record).is_some_and(|when| when > floor))
+    records.into_iter().partition(|record| {
+        if !is_approval(record) {
+            return true;
+        }
+        // An APPROVE is kept only when its time is readable and after the
+        // change: a missing or malformed time is dropped (void), as
+        // `_approvals_through` in the Python guard.
+        match at(record) {
+            Some(when) => when > floor,
+            None => false,
+        }
+    })
 }
 
 /// Reviews, comments, and the base change that voided an approval.
