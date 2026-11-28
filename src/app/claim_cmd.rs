@@ -166,10 +166,19 @@ fn release_command<W: Write>(
                 format!("claim release refused: this worktree has no claim record for {repo}#{pr}"),
             )
         })?;
+    let read = |repo: &str, args: &[String], timeout: Duration| fleet_gh(repo, args, None, timeout);
+    let started = Instant::now();
+    let elapsed = || started.elapsed();
+    let io = FenceIo {
+        read: &read,
+        sleep: &std::thread::sleep,
+        elapsed: &elapsed,
+        now: Utc::now(),
+    };
     let write = |repo: &str, args: &[String]| {
         run_tool("ghapp", repo, args, true, WRITE_TIMEOUT).map_err(|error| error.text)
     };
-    let posted = release(&write, &repo, &record)
+    let posted = release(&io, &write, &repo, &record)
         .map_err(|error| CliFailure::new(1, format!("claim release refused: {}", error.0)))?;
     remove_record(cwd, &repo, pr).map_err(|error| {
         CliFailure::new(
@@ -319,12 +328,18 @@ fn git_ok(command: &mut Command) -> Result<String, String> {
 /// Write `record` to this worktree's own config, turning on
 /// `extensions.worktreeConfig` first if it is off: without it `--worktree`
 /// writes the clone's shared config, which every worktree reads.
+///
+/// With the extension on, git stops reading `core.bare` and `core.worktree`
+/// from the shared config as the main worktree's own, so a bare clone's linked
+/// worktrees would stop working and a shared `core.worktree` would move every
+/// worktree's top level. Like git's own `worktree add`, this first moves them
+/// to the main worktree's `config.worktree`.
 fn write_record(cwd: &Path, record: &ClaimRecord) -> Result<(), String> {
     let enabled =
         git_ok(git_here(cwd).args(["config", "--type=bool", "extensions.worktreeConfig"]))
             .is_ok_and(|value| value == "true");
     if !enabled {
-        git_ok(git_here(cwd).args(["config", "extensions.worktreeConfig", "true"]))?;
+        enable_worktree_config(cwd)?;
     }
     git_ok(git_here(cwd).args([
         "config",
@@ -333,6 +348,48 @@ fn write_record(cwd: &Path, record: &ClaimRecord) -> Result<(), String> {
         &record.value(),
     ]))
     .map(drop)
+}
+
+/// Turn on `extensions.worktreeConfig`, moving a shared `core.bare=true` and
+/// `core.worktree` to the main worktree's `config.worktree` first.
+fn enable_worktree_config(cwd: &Path) -> Result<(), String> {
+    let common =
+        git_ok(git_here(cwd).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]))?;
+    let shared = Path::new(&common).join("config");
+    let main_worktree = Path::new(&common).join("config.worktree");
+    let shared_arg = shared.to_string_lossy().into_owned();
+    let main_arg = main_worktree.to_string_lossy().into_owned();
+    let read = |args: &[&str]| -> Option<String> {
+        git_ok(
+            git_here(cwd)
+                .args(["config", "--file", &shared_arg])
+                .args(args),
+        )
+        .ok()
+        .filter(|value| !value.is_empty())
+    };
+    let bare = read(&["--type=bool", "core.bare"]).is_some_and(|value| value == "true");
+    let worktree = read(&["core.worktree"]);
+    if bare {
+        git_ok(git_here(cwd).args(["config", "--file", &main_arg, "core.bare", "true"]))?;
+    }
+    if let Some(worktree) = &worktree {
+        git_ok(git_here(cwd).args(["config", "--file", &main_arg, "core.worktree", worktree]))?;
+    }
+    git_ok(git_here(cwd).args([
+        "config",
+        "--file",
+        &shared_arg,
+        "extensions.worktreeConfig",
+        "true",
+    ]))?;
+    if bare {
+        git_ok(git_here(cwd).args(["config", "--file", &shared_arg, "--unset", "core.bare"]))?;
+    }
+    if worktree.is_some() {
+        git_ok(git_here(cwd).args(["config", "--file", &shared_arg, "--unset", "core.worktree"]))?;
+    }
+    Ok(())
 }
 
 fn remove_record(cwd: &Path, repo: &str, pr: u64) -> Result<(), String> {

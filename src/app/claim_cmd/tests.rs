@@ -184,3 +184,123 @@ fn a_claim_record_stays_in_the_worktree_that_wrote_it() {
     assert!(read_records(&lane).is_empty());
     assert_eq!(read_records(&main), vec![record(463)]);
 }
+
+fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
+    git_here(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .output()
+        .expect("git")
+}
+
+fn git_must(dir: &Path, args: &[&str]) -> String {
+    let output = git_out(dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn a_record(pr: u64) -> ClaimRecord {
+    ClaimRecord {
+        repo: "generous-corp/vellum".to_owned(),
+        pr,
+        owner: "lane-a".to_owned(),
+        until: "2026-11-27T22:00:00Z".to_owned(),
+        comment_id: 10,
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn recording_a_claim_keeps_a_bare_clone_s_linked_worktree_working() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("source");
+    let bare = temp.path().join("bare.git");
+    let lane = temp.path().join("lane");
+    std::fs::create_dir_all(&source).expect("source");
+    git_must(&source, &["init", "-q", "-b", "main"]);
+    git_must(&source, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    git_must(
+        temp.path(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &source.to_string_lossy(),
+            &bare.to_string_lossy(),
+        ],
+    );
+    git_must(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            &lane.to_string_lossy(),
+            "-b",
+            "lane",
+        ],
+    );
+    git_must(&lane, &["status", "--short"]);
+
+    write_record(&lane, &a_record(462)).expect("write");
+    assert_eq!(read_records(&lane), vec![a_record(462)]);
+    git_must(&lane, &["status", "--short"]);
+    assert_eq!(
+        git_must(&lane, &["rev-parse", "--is-bare-repository"]),
+        "false"
+    );
+    assert_eq!(
+        git_must(&bare, &["rev-parse", "--is-bare-repository"]),
+        "true"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn recording_a_claim_keeps_a_shared_core_worktree_on_the_main_worktree_only() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let main = temp.path().join("main");
+    let gitdir = temp.path().join("repo.git");
+    let lane = temp.path().join("lane");
+    std::fs::create_dir_all(&main).expect("main");
+    git_must(
+        &main,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            &gitdir.to_string_lossy(),
+        ],
+    );
+    git_must(&main, &["commit", "-q", "--allow-empty", "-m", "x"]);
+    // A git dir that names its work tree in its shared config (a submodule's
+    // git dir looks like this).
+    git_must(&main, &["config", "core.worktree", &main.to_string_lossy()]);
+    git_must(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            &lane.to_string_lossy(),
+            "-b",
+            "lane",
+        ],
+    );
+    let top = |dir: &Path| {
+        std::fs::canonicalize(git_must(dir, &["rev-parse", "--show-toplevel"])).expect("top")
+    };
+    let lane_top = top(&lane);
+    let main_top = top(&main);
+
+    write_record(&lane, &a_record(462)).expect("write");
+    assert_eq!(read_records(&lane), vec![a_record(462)]);
+    assert_eq!(top(&lane), lane_top, "the lane's top level moved");
+    assert_eq!(top(&main), main_top, "the main worktree's top level moved");
+}

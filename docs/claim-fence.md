@@ -153,7 +153,9 @@ shipyard claim release --pr 462
 `post` posts `repair-claim: <owner> until <YYYY-MM-DDTHH:MM:SSZ>` through
 `ghapp`, checks the posted body, and writes one record to this worktree's own
 git config (`config.worktree`, turning on `extensions.worktreeConfig` if it is
-off):
+off; as `git worktree add` does, it first moves a shared `core.bare=true` or
+`core.worktree` to the main worktree's `config.worktree`, so a bare clone's
+worktrees keep working):
 
 ```text
 shipyard.claim.<owner>/<repo>#<pr>.record = <owner> <until> <comment-id>
@@ -185,8 +187,15 @@ The fence counts a claim as yours only when all of these hold:
 Every other live claim on the pull request still refuses the push. A record
 that matches no live claim prints a note naming it and counts for nothing.
 
-`release` posts `repair-claim-released: <owner>` for the owner the record
-names and removes the record.
+`release` reads the pull request first. It posts `repair-claim-released:
+<owner>` only while the record's comment still holds the claim; a stale record
+(expired, released, taken, or the name claimed again by another session) posts
+nothing, since a release by name would end that other session's claim. Either
+way it removes the record.
+
+A record lives as long as the worktree. A later session reusing the same
+worktree inherits it until the claim expires (24h at most), so release a claim
+when the work is done.
 
 This is a coordination fence, not a trust boundary. The same user could write
 the record by hand, as they could set `SHIPYARD_CLAIM_OWNER`; the record is

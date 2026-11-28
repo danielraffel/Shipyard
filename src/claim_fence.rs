@@ -234,7 +234,8 @@ fn judge(
                     notes.push(format!(
                         "claim-fence: this worktree's claim record for {repo}#{pr} names comment {} by {}, \
                          which is not a live claim (expired, released, taken, or claimed again); it counts \
-                         for nothing. `shipyard claim release --repo {repo} --pr {pr}` removes it.",
+                         for nothing. `shipyard claim release --repo {repo} --pr {pr}` drops the record and \
+                         posts a release only while that comment still holds the claim.",
                         record.comment_id, record.owner
                     ));
                 }
@@ -613,12 +614,28 @@ pub(crate) fn post(
     Ok((record, format!("{line}\nposted: {url}")))
 }
 
-/// Post `repair-claim-released: <owner>` for the claim `record` names.
+/// Release the claim `record` names: post `repair-claim-released: <owner>`
+/// only while that exact comment still holds the claim. A stale record (the
+/// claim expired into another session's re-claim under the same name, was
+/// released, or was taken) posts nothing, since a release by name would end
+/// someone else's claim; the caller just drops the record.
 pub(crate) fn release(
+    io: &FenceIo<'_>,
     write: Write<'_>,
     repo: &str,
     record: &ClaimRecord,
 ) -> Result<String, TakeError> {
+    let comments = read_comments(io, repo, record.pr).map_err(TakeError)?;
+    let held = held_claims_in_records(&comments);
+    if !held
+        .iter()
+        .any(|claim| record.names(repo, record.pr, claim))
+    {
+        return Ok(format!(
+            "comment {} no longer holds {}'s claim on {repo}#{}; posted nothing and dropped this worktree's record",
+            record.comment_id, record.owner, record.pr
+        ));
+    }
     let line = format!("repair-claim-released: {}", record.owner);
     let (_, url) = post_line(write, repo, record.pr, &line)?;
     Ok(format!("{line}\nposted: {url}"))
