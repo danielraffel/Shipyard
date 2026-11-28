@@ -354,6 +354,16 @@ impl InprocReads {
         let Some(read) = argv::classify(args, scope_repo) else {
             return ReadOutcome::Declined { reason: None };
         };
+        self.try_classified(&read, timeout, max_stdout)
+    }
+
+    /// Answer a read [`argv::classify`] already accepted.
+    pub(crate) fn try_classified(
+        &self,
+        read: &ClassifiedRead,
+        timeout: Duration,
+        max_stdout: Option<usize>,
+    ) -> ReadOutcome {
         let deadline = Instant::now() + timeout;
         // A REST body is printed as is, so the caller's bound applies to it.
         // A GraphQL body is reshaped first; its bound is checked on the output.
@@ -362,7 +372,7 @@ impl InprocReads {
             _ => DEFAULT_MAX_BODY,
         };
         let mut meta = CallMeta::default();
-        let outcome = self.answer(&read, deadline, max_body, &mut meta);
+        let outcome = self.answer(read, deadline, max_body, &mut meta);
         match outcome {
             Ok((success, stdout, stderr)) => {
                 if max_stdout.is_some_and(|limit| stdout.len() > limit) {
@@ -506,7 +516,11 @@ impl InprocReads {
         deadline: Instant,
         meta: &mut CallMeta,
     ) -> Result<(bool, Vec<u8>, String), Unanswered> {
-        let mut path = first_path.to_owned();
+        let mut path = if paginate {
+            with_per_page(first_path)
+        } else {
+            first_path.to_owned()
+        };
         let mut pages: Vec<Vec<u8>> = Vec::new();
         let mut total = 0_u64;
         loop {
@@ -576,9 +590,40 @@ impl InprocReads {
         max_body: u64,
         meta: &mut CallMeta,
     ) -> Result<HttpReply, Unanswered> {
+        self.authorized_send_paged(repo, request, deadline, max_body, meta, false)
+    }
+
+    /// [`Self::authorized_send`] for one page of a listing. When `needs_next`
+    /// is set, a 304 whose `Link` names no next page is not believed: a new
+    /// page may have appeared behind an unchanged one, so the page is read
+    /// again without `If-None-Match`.
+    fn authorized_send_paged(
+        &self,
+        repo: &str,
+        request: &HttpRequest,
+        deadline: Instant,
+        max_body: u64,
+        meta: &mut CallMeta,
+        needs_next: bool,
+    ) -> Result<HttpReply, Unanswered> {
+        self.send_with_token(repo, request, deadline, max_body, meta, needs_next, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_with_token(
+        &self,
+        repo: &str,
+        request: &HttpRequest,
+        deadline: Instant,
+        max_body: u64,
+        meta: &mut CallMeta,
+        needs_next: bool,
+        conditional: bool,
+    ) -> Result<HttpReply, Unanswered> {
         for fresh_token_retry in [false, true] {
             let (key, token) = self.token_for(repo, deadline, meta)?;
             let mut request = request.clone();
+            let request_unconditional = request.clone();
             let etag_key = (request.method == Method::Get)
                 .then(|| (key.installation_id, request.path.clone()));
             let cached_etag = etag_key.as_ref().and_then(|etag_key| {
@@ -588,7 +633,7 @@ impl InprocReads {
                     .ok()
                     .and_then(|cache| cache.get(etag_key).map(|cached| cached.etag.clone()))
             });
-            if let Some(etag) = &cached_etag {
+            if let Some(etag) = cached_etag.as_ref().filter(|_| conditional) {
                 request.headers.push(("If-None-Match", etag.clone()));
             }
             let authorization = Zeroizing::new(format!("token {}", token.secret.as_str()));
@@ -630,6 +675,18 @@ impl InprocReads {
                             "conditional read lost its cached body".to_owned(),
                         ));
                     };
+                    let link = reply.link.take().or(link);
+                    if needs_next && next_page_url(link.as_deref()).is_none() {
+                        return self.send_with_token(
+                            repo,
+                            &request_unconditional,
+                            deadline,
+                            max_body,
+                            meta,
+                            false,
+                            false,
+                        );
+                    }
                     meta.conditional_hit = true;
                     reply.status = 200;
                     reply.body = body;
@@ -921,6 +978,22 @@ fn graphql_request(body: &Value, accept: &str) -> HttpRequest {
 
 /// `gh api`'s answer to a REST reply: the body on stdout, and on a non-2xx
 /// status `gh: MESSAGE (HTTP STATUS)` on stderr.
+/// `gh api --paginate` asks for 100 per page unless the query names a size.
+fn with_per_page(path: &str) -> String {
+    let (route, query) = path.split_once('?').unwrap_or((path, ""));
+    if query
+        .split('&')
+        .any(|pair| pair.split('=').next() == Some("per_page"))
+    {
+        return path.to_owned();
+    }
+    if query.is_empty() {
+        format!("{route}?per_page=100")
+    } else {
+        format!("{route}?{query}&per_page=100")
+    }
+}
+
 fn rest_get(path: &str) -> HttpRequest {
     HttpRequest {
         method: Method::Get,

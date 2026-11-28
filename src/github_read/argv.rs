@@ -58,6 +58,15 @@ pub(crate) struct ClassifiedRead {
 /// client to (`GH_REPO` for the wrapper); a read whose own repository
 /// disagrees with it is declined rather than guessed.
 pub(crate) fn classify(args: &[String], scope_repo: Option<&str>) -> Option<ClassifiedRead> {
+    classify_with(args, scope_repo, Program::parse_allowed)
+}
+
+/// [`classify`] with its own rule for which `--jq` filters may be parsed.
+pub(crate) fn classify_with(
+    args: &[String],
+    scope_repo: Option<&str>,
+    parse_filter: fn(&str) -> Option<Program>,
+) -> Option<ClassifiedRead> {
     let first = args.first()?.as_str();
     let classified = match first {
         "api" if args.get(1).map(String::as_str) == Some("graphql") => {
@@ -67,7 +76,7 @@ pub(crate) fn classify(args: &[String], scope_repo: Option<&str>) -> Option<Clas
                 repo: exact_slug(scope_repo?)?,
             }
         }
-        "api" => classify_rest(args)?,
+        "api" => classify_rest(args, parse_filter)?,
         "pr" => classify_pr_view(args)?,
         _ => return None,
     };
@@ -79,7 +88,10 @@ pub(crate) fn classify(args: &[String], scope_repo: Option<&str>) -> Option<Clas
     Some(classified)
 }
 
-fn classify_rest(args: &[String]) -> Option<ClassifiedRead> {
+fn classify_rest(
+    args: &[String],
+    parse_filter: fn(&str) -> Option<Program>,
+) -> Option<ClassifiedRead> {
     // `api ENDPOINT`, optionally with `--paginate`, `--slurp` and `--jq` in
     // any order. Any other flag (`-X`, `-f`, `--input`, `-H`, ...) changes
     // the method, the body or the output and is declined.
@@ -109,7 +121,7 @@ fn classify_rest(args: &[String]) -> Option<ClassifiedRead> {
         _ => return None,
     };
     let jq = match jq {
-        Some(source) => Some(Program::parse(source)?),
+        Some(source) => Some(parse_filter(source)?),
         None => None,
     };
     let path = endpoint.strip_prefix('/').unwrap_or(endpoint);

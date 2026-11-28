@@ -73,5 +73,49 @@
    "out": "\n\n\n\n\n\n",
    "err": ""
   }
+ ],
+ "errors": [
+  {
+   "endpoint": "repos/danielraffel/Shipyard/pulls/1483/commits?per_page=2",
+   "jq": ".[0].sha.x // \"err\"",
+   "rc": 1,
+   "err": "expected an object but got: string (\"2aeba2b07daf63849dace979 ...\")\n"
+  },
+  {
+   "endpoint": "repos/danielraffel/Shipyard/pulls/1483/commits?per_page=2",
+   "jq": "(.[] | .sha.x) // \"err\"",
+   "rc": 1,
+   "err": "expected an object but got: string (\"2aeba2b07daf63849dace979 ...\")\n"
+  },
+  {
+   "endpoint": "repos/danielraffel/Shipyard/pulls/1483/commits?per_page=2",
+   "jq": ".[0].sha[] // \"err\"",
+   "rc": 1,
+   "err": "cannot iterate over: string (\"2aeba2b07daf63849dace979 ...\")\n"
+  },
+  {
+   "endpoint": "repos/danielraffel/Shipyard/pulls/1483/commits?per_page=2",
+   "jq": "[(.[] | .commit.verification.verified | length) // \"caught\"]",
+   "rc": 1,
+   "err": "length cannot be applied to: boolean (true)\n"
+  },
+  {
+   "endpoint": "repos/danielraffel/Shipyard/pulls/1483/commits?per_page=2",
+   "jq": "(.[] | (if .sha == \"2aeba2b07daf63849dace979204c7c6a81ff300a\" then .commit else .sha end) | .message | length) // \"d\"",
+   "rc": 1,
+   "err": "532\nexpected an object but got: string (\"52609efd11cb4d86f3616186 ...\")\n"
+  },
+  {
+   "endpoint": "repos/danielraffel/Shipyard/pulls/1483/commits?per_page=2",
+   "jq": ".[].sha.x",
+   "rc": 1,
+   "err": "expected an object but got: string (\"2aeba2b07daf63849dace979 ...\")\n"
+  },
+  {
+   "endpoint": "repos/danielraffel/Shipyard/pulls/99999999/commits?per_page=2",
+   "jq": ".[].sha",
+   "rc": 1,
+   "err": "{\"message\":\"Not Found\",\"documentation_url\":\"https://docs.github.com/rest/pulls/pulls#list-commits-on-a-pull-request\",\"status\":\"404\"}gh: Not Found (HTTP 404)\n"
+  }
  ]
 }

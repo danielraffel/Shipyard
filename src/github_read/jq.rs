@@ -32,6 +32,49 @@ const MAX_DEPTH: usize = 24;
 /// Largest integer printed as `gh` prints it: gh decodes numbers as doubles.
 const MAX_SAFE_INTEGER: u64 = 1 << 53;
 
+/// The filters the steward builds, the only ones answered in process. Any
+/// other filter, even one this module can evaluate, runs through `gh`.
+/// Matched with runs of whitespace collapsed.
+pub(crate) const ALLOWED_FILTERS: &[&str] = &[
+    ".[].number",
+    ".[].ref",
+    ".[].sha",
+    ".sha",
+    ".status",
+    ".draft",
+    ".behind_by",
+    ".head.repo.full_name",
+    r#"if .merged then "merged" else .state end"#,
+    ".[] | {parents: (.parents | length), message: .commit.message, email: \
+     .commit.committer.email, date: .commit.committer.date}",
+    "{parents: [.parents[].sha], committer_email: .commit.committer.email, message: \
+     .commit.message}",
+    "{sha: .object.sha, kind: .object.type}",
+    "{truncated: .truncated, tree: [.tree[] | {name: .path, mode: .mode, kind: .type, sha: \
+     .sha}]}",
+    "{total: .total_commits, merge_base: .merge_base_commit.sha, shas: [.commits[].sha]}",
+    "{total: .total_commits, merge_base: .merge_base_commit.sha, commits: [.commits[] | \
+     {sha, parents: [.parents[].sha]}]}",
+    ".[] | {login: .user.login, state: .state, commit_id: .commit_id, submitted_at: \
+     .submitted_at}",
+    ".[] | {login: .user.login, body: .body, created_at: .created_at}",
+    ".[] | {event: .event, label: .label.name, login: .actor.login, at: .created_at}",
+    ".[] | {id: .id, type: .user.type, association: .author_association, at: .created_at, \
+     body: .body}",
+    ".[] | {id: .id, login: .user.login, type: .user.type, association: .author_association, at: \
+     .submitted_at, state: .state, commit_id: .commit_id, body: .body, \
+     performed_via_github_app_id: .performed_via_github_app.id}",
+    ".[] | {id: .id, node_id: .node_id, login: .user.login, type: .user.type, association: \
+     .author_association, at: .created_at, updated_at: .updated_at, body: .body, \
+     performed_via_github_app_id: .performed_via_github_app.id}",
+    "[.workflow_runs[] | {id, pr: (.pull_requests[0].number // null), branch: .head_branch}] \
+     | .[]",
+];
+
+fn collapse(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// A parsed filter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Program(Expr);
@@ -91,6 +134,16 @@ impl Program {
         let expr = parser.pipe()?;
         parser.skip_space();
         (parser.at == parser.chars.len()).then_some(Self(expr))
+    }
+
+    /// Parse `source` only when it is one of [`ALLOWED_FILTERS`].
+    pub(crate) fn parse_allowed(source: &str) -> Option<Self> {
+        let wanted = collapse(source);
+        ALLOWED_FILTERS
+            .iter()
+            .any(|allowed| collapse(allowed) == wanted)
+            .then(|| Self::parse(source))
+            .flatten()
     }
 
     /// Run the filter over one page and print its results as `gh` would.
@@ -518,15 +571,13 @@ fn eval(expr: &Expr, input: &Value) -> Result<Vec<Value>, Fail> {
             out
         }
         Expr::Alternative(left, right) => {
-            // An error on the left is not an answer: jq tries the right side.
-            let found = match eval(left, input) {
-                Ok(found) => found,
-                Err(Fail::Jq) => Vec::new(),
-                Err(Fail::Unsupported) => return Err(Fail::Unsupported),
-            }
-            .into_iter()
-            .filter(truthy)
-            .collect::<Vec<_>>();
+            // gojq propagates an error on the left of `//` (it exits 1), so
+            // any error here is gh's to report.
+            let found = eval(left, input)
+                .map_err(|_| Fail::Unsupported)?
+                .into_iter()
+                .filter(truthy)
+                .collect::<Vec<_>>();
             if found.is_empty() {
                 eval(right, input)?
             } else {
@@ -579,7 +630,8 @@ fn eval_rest(expr: &Expr, input: &Value) -> Result<Vec<Value>, Fail> {
             Value::String(text) => Value::from(text.chars().count() as u64),
             Value::Array(items) => Value::from(items.len() as u64),
             Value::Object(map) => Value::from(map.len() as u64),
-            Value::Bool(_) | Value::Number(_) => return Err(Fail::Jq),
+            // gojq answers a number's absolute value; not claimed here.
+            Value::Bool(_) | Value::Number(_) => return Err(Fail::Unsupported),
         }],
         Expr::Select(condition) => {
             let mut out = Vec::new();
@@ -701,42 +753,9 @@ mod tests {
         Ok(String::from_utf8(out).expect("utf8"))
     }
 
-    /// Every filter the steward's read paths build today.
-    const STEWARD_FILTERS: &[&str] = &[
-        ".[].number",
-        ".[].ref",
-        ".[].sha",
-        ".sha",
-        ".draft",
-        ".behind_by",
-        ".status",
-        ".head.repo.full_name",
-        r#"if .merged then "merged" else .state end"#,
-        ".[] | {parents: (.parents | length), message: .commit.message, email: \
-         .commit.committer.email, date: .commit.committer.date}",
-        "{parents: [.parents[].sha], committer_email: .commit.committer.email, message: \
-         .commit.message}",
-        "{sha: .object.sha, kind: .object.type}",
-        "{truncated: .truncated, tree: [.tree[] | {name: .path, mode: .mode, kind: .type, sha: \
-         .sha}]}",
-        "{total: .total_commits, merge_base: .merge_base_commit.sha, shas: [.commits[].sha]}",
-        "{total: .total_commits, merge_base: .merge_base_commit.sha, commits: [.commits[] | \
-         {sha, parents: [.parents[].sha]}]}",
-        ".[] | {login: .user.login, state: .state, commit_id: .commit_id, submitted_at: \
-         .submitted_at}",
-        ".[] | {login: .user.login, body: .body, created_at: .created_at}",
-        ".[] | {event: .event, label: .label.name, login: .actor.login, at: .created_at}",
-        ".[] | {id: .id, node_id: .node_id, login: .user.login, type: .user.type, association: \
-         .author_association, at: .created_at, updated_at: .updated_at, body: .body, \
-         performed_via_github_app_id: .performed_via_github_app.id}",
-        "[.workflow_runs[] | {id, pr: (.pull_requests[0].number // null), branch: .head_branch}] \
-         | .[]",
-        r#".[] | select(.event == "labeled") | .created_at"#,
-    ];
-
     #[test]
     fn every_steward_filter_parses() {
-        for filter in STEWARD_FILTERS {
+        for filter in super::ALLOWED_FILTERS {
             assert!(Program::parse(filter).is_some(), "must parse: {filter}");
         }
     }
@@ -818,7 +837,8 @@ mod tests {
         assert_eq!(eval(".list[1]"), "4\n");
         // `//` takes the right side for null and false, and for an error.
         assert_eq!(eval(".merged // \"f\""), "f\n");
-        assert_eq!(eval(".name.x // \"err\""), "err\n");
+        // An error on the left of `//` is gh's to report: declined, not defaulted.
+        assert!(run(".name.x // \"err\"", &page).is_err());
         // A value that yields nothing or several results is not an object.
         assert!(run("{a: .list[]}", &page).is_err());
         assert!(run("{a: select(.merged)}", &page).is_err());
@@ -846,5 +866,44 @@ mod tests {
         assert!(run(".f == .g // 1", &page).is_err());
         // A raw control character is fine as a scalar: gh prints the bytes.
         assert_eq!(run(".ctl", &page).unwrap(), "a\u{8}b\n");
+    }
+
+    /// Six filters run live against `gh` (page 1 of the recorded commits
+    /// listing): gh exits 1 on five and prints `0` for the sixth, where an
+    /// earlier head answered the `//` default. Every one is gh's to answer.
+    #[test]
+    fn errors_under_the_alternative_operator_are_declined() {
+        let recorded: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/gh_paged_commits.json")).expect("fixture");
+        let page: serde_json::Value =
+            serde_json::from_str(recorded["pages"][0].as_str().expect("page")).expect("page JSON");
+        for filter in [
+            r#".[0].sha.x // "err""#,
+            r#"(.[] | .sha.x) // "err""#,
+            r#".[0].sha[] // "err""#,
+            r#"[(.[] | .commit.verification.verified | length) // "caught"]"#,
+            r#"(.[0].commit.comment_count | length) // "x""#,
+            r#"(.[] | (if .sha == "2aeba2b07daf63849dace979204c7c6a81ff300a" then .commit else .sha end) | .message | length) // "d""#,
+        ] {
+            assert!(
+                run(filter, &page).is_err(),
+                "must decline, never default: {filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_steward_filters_are_allowed() {
+        for filter in super::ALLOWED_FILTERS {
+            assert!(Program::parse_allowed(filter).is_some(), "{filter}");
+        }
+        // Whitespace is not part of the match.
+        assert!(Program::parse_allowed(".[]  |  {id:\n .id, type: .user.type, association: .author_association, at: .created_at, body: .body}").is_some());
+        // A filter the evaluator handles, but the steward does not build.
+        assert!(Program::parse(".[] | .login").is_some());
+        assert!(Program::parse_allowed(".[] | .login").is_none());
+        assert!(Program::parse_allowed(".[] | {id}").is_none());
+        // The committed head-approval projections are on the list.
+        assert!(Program::parse_allowed(crate::head_approval::COMMENT_RECORD_JQ).is_some());
     }
 }
