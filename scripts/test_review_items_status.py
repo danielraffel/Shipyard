@@ -150,15 +150,17 @@ class ReviewItemsStatus(unittest.TestCase):
     def test_no_items_needs_no_accept(self) -> None:
         self.assertEqual(self.judged(self.trail(approve()), annotations=[listing()]), "success")
 
-    def test_one_unaccepted_item_fails_and_is_named(self) -> None:
+    def test_one_unaccepted_item_waits_on_the_reviewer_and_is_named(self) -> None:
+        # Only the reviewer can fix it (a new verdict), so it reads as
+        # waiting on the reviewer, never as a red the author must repair.
         state = self.judged(self.trail(approve(HOTSPOT)), annotations=[listing(HOTSPOT, FANOUT)])
-        self.assertEqual(state, "failure")
-        description = self.posted()["description"]
-        self.assertTrue(description.startswith(f"unaccepted review items: {FANOUT}"), description)
-        self.assertNotIn(HOTSPOT, description)
+        self.assertEqual(state, "pending")
+        self.assertEqual(self.posted()["description"],
+                         f"awaiting reviewer acceptance of review items: {FANOUT}")
+        self.assertIn("nothing for the author to do", self.last.stdout)
 
-    def test_an_approve_with_no_accept_lines_fails(self) -> None:
-        self.assertEqual(self.judged(self.trail(approve())), "failure")
+    def test_an_approve_with_no_accept_lines_is_not_success(self) -> None:
+        self.assertEqual(self.judged(self.trail(approve())), "pending")
         self.assertIn(HOTSPOT, self.posted()["description"])
 
     def test_fenced_quoted_or_near_miss_accept_lines_do_not_count(self) -> None:
@@ -172,7 +174,8 @@ class ReviewItemsStatus(unittest.TestCase):
                 f"Reviewed. accept-review-item: {HOTSPOT}\nreviewer: pulp-review\n{STAMP}\n"
                 f"verdict: APPROVE head:{HEAD}"):
             with self.subTest(body=body):
-                self.assertEqual(self.judged(self.trail(body)), "failure")
+                self.assertEqual(self.judged(self.trail(body)), "pending")
+                self.assertIn(HOTSPOT, self.posted()["description"])
 
     def test_an_accept_from_an_approve_that_does_not_count_is_not_success(self) -> None:
         # The same counting rules as the approval: an unsigned App APPROVE
@@ -183,7 +186,8 @@ class ReviewItemsStatus(unittest.TestCase):
         # APPROVE that decides.
         trail = [self.comment(approve(HOTSPOT), "2026-10-12T15:00:00Z"),
                  self.comment(approve(), "2026-10-12T16:00:00Z", id=2)]
-        self.assertEqual(self.judged(trail), "failure")
+        self.assertEqual(self.judged(trail), "pending")
+        self.assertIn(HOTSPOT, self.posted()["description"])
 
     # -- the trusted source ---------------------------------------------------
 
@@ -258,7 +262,8 @@ class ReviewItemsStatus(unittest.TestCase):
         state = self.judged(self.trail(approve()),
                             extra=[(f"commits/{HEAD}/check-runs", {"pages": [forged]}),
                                    ("check-runs/4242", {"pages": [[listing()]]})])
-        self.assertEqual(state, "failure")
+        self.assertEqual(state, "pending")
+        self.assertIn(HOTSPOT, self.posted()["description"])
         self.assertNotIn("check-runs/4242", self.calls())
         self.assertNotIn(f"commits/{HEAD}/check-runs", self.calls())
 
@@ -352,10 +357,15 @@ class ReviewItemsStatus(unittest.TestCase):
         # #784's accepting APPROVE does not cover #785's, which accepts none.
         result = self.post(self.shared(approve()))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.posted()["state"], "failure", result.stdout)
+        self.assertEqual(self.posted()["state"], "pending", result.stdout)
+        self.assertEqual(self.posted()["description"],
+                         f"awaiting reviewer acceptance of review items: {HOTSPOT}")
         self.assertIn("PR #784: allowed", result.stdout)
-        self.assertIn(f"PR #785: refused: PR #785 ({REPO}): unaccepted review items: {HOTSPOT}",
+        self.assertIn(f"PR #785: awaiting: PR #785 ({REPO}): unaccepted review items: {HOTSPOT}",
                       result.stdout)
+        # A HOLD on either pull request still fails the shared head.
+        result = self.post(self.shared(f"verdict: HOLD head:{HEAD}"))
+        self.assertEqual(self.posted()["state"], "failure", result.stdout)
         # Control: both accept, so the head is allowed; the items are read
         # once for the head, not once per pull request.
         result = self.post(self.shared(approve(HOTSPOT)))
@@ -365,7 +375,8 @@ class ReviewItemsStatus(unittest.TestCase):
     def test_a_backfill_style_pull_request_target_run_applies_the_same_rule(self) -> None:
         event = {"pull_request": {"number": 784}}
         result = self.post(self.answers(self.trail(approve())), "pull_request_target", event)
-        self.assertEqual(self.posted()["state"], "failure")
+        self.assertEqual(self.posted()["state"], "pending")
+        # The required check run on the head stays red until it is allowed.
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         result = self.post(self.answers(self.trail(approve(HOTSPOT))), "pull_request_target",
                            event)

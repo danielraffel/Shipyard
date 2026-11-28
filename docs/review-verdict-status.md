@@ -30,7 +30,8 @@ disagree:
   unlisted_stamp_session`; codes include `unattributed`, `uncounted_signer`,
   `not_exact_head`). Branch protection treats `pending` as unsatisfied exactly
   like `failure`, so nothing merges without an approval; `failure` is kept for a
-  counted HOLD or an unreadable review. The job (the required check run) still
+  counted HOLD, an unreadable review, or a review-items run that failed or
+  cannot be read (see Review items). The job (the required check run) still
   fails while awaiting, so that check cannot read as satisfied; it carries a
   notice saying there is nothing for the author to do;
 - whose verdict counts is the guard's rule: the base's `reviewer_identities`,
@@ -391,7 +392,7 @@ Why this chain and not a check run found by name:
 | not exactly one job of that name, or the job did not succeed | `failure` |
 | not exactly one `review-items` annotation, or a malformed one (a stray line, a duplicate id, no count or a wrong count) | `failure` |
 | any listing unreadable or short of its `total_count` | `failure` |
-| a well-formed list | judged against the verdict, below |
+| a well-formed list | judged against the verdict, below: `success` when every item is accepted, else `pending` naming the unaccepted ids |
 
 **Accepting an item.** The exact-head APPROVE comment that allows the head
 under every other rule here (signers, stamp sessions, never edited, newest
@@ -406,8 +407,9 @@ verdict: APPROVE head:<sha>
 ```
 
 Lines inside a fenced code block, and `>` quotes, do not count. Extra accepts
-are ignored. A missing one is `failure`, and the description names what is
-unaccepted (`unaccepted review items: <id>, ...`). Nothing else accepts an
+are ignored. A missing one keeps the head `pending`, since only the reviewer
+can fix it with a new verdict, and the description names what is unaccepted
+(`awaiting reviewer acceptance of review items: <id>, ...`). Nothing else accepts an
 item: an approval carried from an earlier head (merge-only or rebase), a
 rollup, a guard-mode admission, an `APPROVED` review and a `reviewed: <sha>`
 marker all accept none, so a head with items needs its own new verdict. A
@@ -436,8 +438,17 @@ or a re-run), against the default branch at that moment. A base change after
 that, such as a newly registered hotspot, is not seen until the items run is
 re-run. `shipyard review-verdict` (Rust, `crate::review_verdict`) and the
 steward's own gate do not read review items yet, so on such a base they can
-report a head allowed that this status refuses; the status is the required
-check and decides the landing.
+report a head allowed that this status refuses. The status is the required
+check and decides the landing, but reviewer dispatch observes a trusted
+exact-head APPROVE through `crate::review_verdict` and counts the review as
+done: an APPROVE that forgets an accept line is not re-dispatched, and the
+head waits with no owner. Until the Rust gate reads items too, a base turns
+this on only where its reviewer brief always lists the items first.
+
+**Permissions.** The reader lists Actions runs and jobs and reads check-run
+annotations, so the `review-verdict` job needs `actions: read` (or `write`)
+and `checks: read`, and the fleet App the same scopes for the host
+queue-arm guard. Without them every head on such a base fails closed.
 
 ## Rollout
 

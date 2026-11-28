@@ -86,9 +86,14 @@ HEAD_CHECK_EVENTS = frozenset({"pull_request_target"})
 # other refusal (a HOLD, an unreadable review, a self-approval) is a failure.
 # ``review_items_pending``: the base's review-items run on the head has not
 # finished (or not started); its completion re-judges the head through
-# ``workflow_run``. An unaccepted, unreadable or malformed item list fails.
+# ``workflow_run``. ``review_items_unaccepted``: the approval does not accept
+# every item, which only the reviewer can fix with a new verdict, so it waits
+# on the reviewer like an approval that does not count. An unreadable,
+# failed or malformed item list fails.
 AWAITING_CAUSES = frozenset({"unreviewed", "approval_does_not_carry", "admission_missing",
-                             "review_items_pending"})
+                             "review_items_pending", "review_items_unaccepted"})
+# The guard's message for ``review_items_unaccepted`` names the ids after this.
+UNACCEPTED_PREFIX = "unaccepted review items: "
 # A base whose `[auto_merge] approval_source = "guard"` takes authorization
 # from the fleet admission check run instead of comments; its completion
 # reaches this workflow as a ``check_run`` event (see event_target).
@@ -389,18 +394,34 @@ def decide(guard: ModuleType, repo: str, number: int, head: str) -> Decision:
 
 
 def awaiting_description(head: str, excluded: list[str], admission: bool = False,
-                         items: bool = False) -> str:
+                         items: bool = False, unaccepted: list[str] | None = None) -> str:
     """The ``pending`` description: waiting, and why any approval did not count."""
     if admission:
         return f"awaiting fleet-guard admission for head {head[:12]}"
     if items:
         return f"awaiting the review items check for head {head[:12]}"
+    if unaccepted:
+        text = f"awaiting reviewer acceptance of review items: {', '.join(unaccepted)}"
+        return text if len(text) <= DESCRIPTION_LIMIT else text[: DESCRIPTION_LIMIT - 1] + "…"
     if not excluded:
         return f"awaiting reviewer verdict for head {head[:12]}"
     codes = sorted(set(excluded))
     noun = "approval" if len(excluded) == 1 else "approvals"
     text = f"awaiting reviewer verdict; {len(excluded)} {noun} excluded: {', '.join(codes)}"
     return text if len(text) <= DESCRIPTION_LIMIT else text[: DESCRIPTION_LIMIT - 1] + "…"
+
+
+def unaccepted_items(refused: list[tuple[int, Decision]]) -> list[str]:
+    """Every unaccepted id, when each refusal is only that; else none."""
+    if not refused or any(d.cause != "review_items_unaccepted" for _, d in refused):
+        return []
+    found: list[str] = []
+    for _, decision in refused:
+        _, _, rest = decision.message.partition(UNACCEPTED_PREFIX)
+        for item in rest.split(";", 1)[0].split(", "):
+            if item and item not in found:
+                found.append(item)
+    return found
 
 
 def read_pages(guard: ModuleType, path: str, what: str) -> list[Any]:
@@ -671,7 +692,8 @@ def run(event_name: str, event: dict[str, Any], repo: str, run_url: str | None) 
         text = awaiting_description(
             head, [code for _, d in refused for code in d.excluded],
             admission=all(d.cause == "admission_missing" for _, d in refused),
-            items=all(d.cause == "review_items_pending" for _, d in refused))
+            items=all(d.cause == "review_items_pending" for _, d in refused),
+            unaccepted=unaccepted_items(refused))
     else:
         hard = next(d for _, d in refused if not d.awaiting)
         state, text = "failure", describe(False, hard.message + shared)
