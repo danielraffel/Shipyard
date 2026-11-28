@@ -486,6 +486,8 @@ codex_home = "/Users/you/.codex"
 first_line_model = "gpt-5.3-codex-spark"
 timeout_seconds = 120
 max_attempts_per_head = 1
+max_attempts_per_hour = 4        # default 4 (max 60), all repositories
+max_attempts_per_pr_per_day = 2  # default 2 (max 24), one pull request
 max_log_tail_bytes = 16384
 allowed_repositories = ["Generous-Corp/pulp", "Generous-Corp/forge", "Generous-Corp/vellum"]
 
@@ -494,6 +496,11 @@ allowed_repositories = ["Generous-Corp/pulp", "Generous-Corp/forge", "Generous-C
 "Generous-Corp/forge" = "/Volumes/Workshop/Code/forge"
 "Generous-Corp/vellum" = "/Volumes/Workshop/Code/vellum"
 ```
+
+A spent cap (`deferred_attempt_cap`) or another request's active claim on the same
+pull request (`skipped_active_claim`) leaves the request pending without spending an
+attempt; a closed, merged, draft, retargeted or moved PR is superseded, and a failed
+live read defers.
 
 The command is not configurable. Shipyard constructs the exact `codex exec`
 argv, disables all Codex tool surfaces used for shell, browser, app, MCP,
