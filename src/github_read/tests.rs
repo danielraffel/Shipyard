@@ -2072,7 +2072,7 @@ fn a_paged_read_revalidates_each_page_and_keeps_its_link() {
         first, second,
         "every page came back as a 304 and still chained"
     );
-    assert_eq!(second.matches("\"sha\"").count() > 0, true);
+    assert_eq!(second, recording.slurp, "all pages, joined from cached bodies");
 }
 
 /// The steward's reads of one Vellum pass that took the `gh` path before, by
