@@ -2367,9 +2367,9 @@ fn a_new_page_behind_an_unchanged_one_is_not_missed() {
     };
     assert_eq!(read(&reads), "1\n");
     grown.store(true, Ordering::SeqCst);
+    let second = read(&reads);
     assert_eq!(
-        read(&reads),
-        "1\n2\n",
+        second, "1\n2\n",
         "page 2 is read, not hidden by the cached 304"
     );
 }

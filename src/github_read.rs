@@ -524,8 +524,14 @@ impl InprocReads {
         let mut pages: Vec<Vec<u8>> = Vec::new();
         let mut total = 0_u64;
         loop {
-            let reply =
-                self.authorized_send(repo, &rest_get(&path), deadline, DEFAULT_MAX_BODY, meta)?;
+            let reply = self.authorized_send_paged(
+                repo,
+                &rest_get(&path),
+                deadline,
+                DEFAULT_MAX_BODY,
+                meta,
+                paginate,
+            )?;
             if !(200..300).contains(&reply.status) {
                 return Err(Unanswered::Decline(format!(
                     "paged read answered HTTP {}",
