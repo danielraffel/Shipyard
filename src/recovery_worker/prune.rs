@@ -26,6 +26,8 @@ pub struct PruneOutcome {
     pub retired_dead: usize,
     /// Retired because they sat unattempted past the age bound.
     pub retired_aged: usize,
+    /// Records that could not be read; the sweep skips them and goes on.
+    pub unreadable: usize,
 }
 
 impl PruneOutcome {
@@ -43,7 +45,9 @@ impl RecoveryStore {
     ///
     /// `open_heads` must be the complete open-pull-request list for that base.
     /// A record retired by mistake is reactivated by the next enqueue of the
-    /// same exact request, so a partial list costs one pass, not a failure.
+    /// same exact request; a pull request that is still needs-agent and still
+    /// observed is republished by the next pass, so a partial list costs one
+    /// pass.
     /// Claimed (`Running`) and attempted records are never touched.
     pub fn prune_unattempted(
         &self,
@@ -62,16 +66,27 @@ impl RecoveryStore {
         let mut active = 0;
         for id in self.record_ids_unlocked()? {
             active += 1;
-            let Some(record) = self.load_unlocked(&id)? else {
-                continue;
+            // One bad record must not stop the sweep for every id after it.
+            let record = match self.load_unlocked(&id) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(_) => {
+                    outcome.unreadable += 1;
+                    continue;
+                }
             };
             if record.receipt.status != RecoveryStatus::Pending || record.receipt.attempt != 0 {
                 continue;
             }
             let request = &record.request;
+            // A row with no readable head (a missing `headRefOid` parses as
+            // "") is missing evidence, not proof the request is dead.
             let dead = request.repo.eq_ignore_ascii_case(repo)
                 && request.base_ref == base
-                && open_heads.get(&request.pr) != Some(&request.head_sha);
+                && open_heads.get(&request.pr) != Some(&request.head_sha)
+                && open_heads
+                    .get(&request.pr)
+                    .is_none_or(|head| crate::merge_steward::is_full_sha(head));
             let aged = now.signed_duration_since(request.created_at) > max_age;
             let (reason, counter) = if dead {
                 (

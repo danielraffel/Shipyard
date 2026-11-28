@@ -4690,6 +4690,15 @@ red_everywhere` is `shadow` by default; under `enforce` an unchanged member head
 is not enqueued (`held_red_everywhere:<check>`) and `repair_skip` is true. See
 `docs/automated-draining.md` "Red everywhere".
 
+**Each applying steward pass retires dead recovery requests and reports the store's fill.**
+Pending, unattempted recovery requests whose pull request merged, closed or moved to
+a new head are superseded (so is any older than 7 days); the next pass republishes a
+request that is still needed. The repository report carries `recovery_store:
+{active, limit, retired_dead, retired_aged, unreadable}` and `summary.log` shows
+`recovery_store=<active>/<limit>`, with `!FULL` when the store cannot accept a request
+(`ERROR` when the prune failed, `off` when recovery publication is disabled). See
+`docs/automated-draining.md`.
+
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
 required check on the removal's merge-group commit must be an Actions job whose

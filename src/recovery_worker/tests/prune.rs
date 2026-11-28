@@ -200,3 +200,109 @@ fn a_store_full_of_dead_records_accepts_a_new_request_only_after_pruning() {
         EnqueueOutcome::Created
     );
 }
+
+fn other_request(repo: &str, base: &str, pr: u64) -> RecoveryRequest {
+    RecoveryRequest::new(
+        repo,
+        pr,
+        base,
+        HEAD_A,
+        "failure-v1",
+        "Required Windows check failed at the exact head.",
+        required_policy("windows"),
+        vec![required_check("windows")],
+        "policy-v1",
+        "config-v1",
+    )
+    .expect("request")
+}
+
+#[test]
+fn a_record_on_another_base_is_kept() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = RecoveryStore::new(temp.path()).expect("store");
+    let release = other_request("Generous-Corp/pulp", "release", 1);
+    store.enqueue(release.clone()).expect("enqueue");
+
+    let outcome = store
+        .prune_unattempted(
+            "Generous-Corp/pulp",
+            BASE,
+            &BTreeMap::new(),
+            Utc::now(),
+            age(),
+        )
+        .expect("prune");
+
+    assert_eq!(outcome.retired_dead, 0);
+    assert_eq!(status(&store, &release.id), RecoveryStatus::Pending);
+}
+
+#[test]
+fn the_age_bound_covers_other_repos_but_never_a_running_record() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = RecoveryStore::new(temp.path()).expect("store");
+    let idle = other_request("Generous-Corp/forge", BASE, 1);
+    let running = other_request("Generous-Corp/forge", BASE, 2);
+    store.enqueue(idle.clone()).expect("enqueue idle");
+    store.enqueue(running.clone()).expect("enqueue running");
+    store
+        .begin(&running.id, "config-v1", "generation-a")
+        .expect("claim");
+    let later = Utc::now() + chrono::Duration::days(MAX_PENDING_AGE_DAYS + 1);
+
+    let outcome = store
+        .prune_unattempted("Generous-Corp/pulp", BASE, &BTreeMap::new(), later, age())
+        .expect("prune");
+
+    assert_eq!((outcome.retired_dead, outcome.retired_aged), (0, 1));
+    assert_eq!(status(&store, &idle.id), RecoveryStatus::Superseded);
+    assert_eq!(status(&store, &running.id), RecoveryStatus::Running);
+}
+
+#[test]
+fn an_observed_row_without_a_full_head_does_not_retire_its_record() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = RecoveryStore::new(temp.path()).expect("store");
+    let request = request_for(1, HEAD_A);
+    store.enqueue(request.clone()).expect("enqueue");
+
+    for missing in ["", "abc123"] {
+        let outcome = store
+            .prune_unattempted(
+                "Generous-Corp/pulp",
+                BASE,
+                &heads(&[(1, missing)]),
+                Utc::now(),
+                age(),
+            )
+            .expect("prune");
+        assert_eq!(outcome.retired_dead, 0, "head {missing:?}");
+    }
+    assert_eq!(status(&store, &request.id), RecoveryStatus::Pending);
+}
+
+#[test]
+fn one_unreadable_record_does_not_stop_the_sweep() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = RecoveryStore::new(temp.path()).expect("store");
+    let dead = request_for(1, HEAD_A);
+    store.enqueue(dead.clone()).expect("enqueue");
+    // Sorts before every sha256 id that starts with a digit or letter.
+    let bad = format!("{}.json", "0".repeat(64));
+    fs::write(temp.path().join(bad), b"not-json").expect("corrupt record");
+
+    let outcome = store
+        .prune_unattempted(
+            "Generous-Corp/pulp",
+            BASE,
+            &BTreeMap::new(),
+            Utc::now(),
+            age(),
+        )
+        .expect("prune");
+
+    assert_eq!(outcome.unreadable, 1);
+    assert_eq!(outcome.retired_dead, 1);
+    assert_eq!(status(&store, &dead.id), RecoveryStatus::Superseded);
+}
