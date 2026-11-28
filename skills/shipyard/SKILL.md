@@ -6587,3 +6587,17 @@ requires review exactly as `REVIEW_REQUIRED_REPOS` membership does, in both
 the Rust policy and `ghapp_queue_arm_guard.py`; the compiled list remains a
 floor. The rendered onboarding PR is limited to the two review-verdict
 workflows and the named config keys.
+
+## In-process steward reads (`src/github_read`)
+
+With `[github.reads] transport = "inproc"`, the steward answers `gh api` reads
+in the Shipyard process. Besides plain `api repos/...` reads this covers
+`--paginate --jq`, `--jq` on one page, and `--paginate --slurp`, with output
+byte-identical to `gh`: pages follow `Link: rel="next"` (a URL outside the API
+root is never followed), `--paginate` adds `per_page=100` when the query names
+no size, and a page revalidated as 304 with no next link is re-read in full. Only the
+steward's own `--jq` projections are evaluated (`ALLOWED_FILTERS` in
+`jq.rs`); any other filter, a bare `--paginate`, `-H`, an error page, or output
+that cannot be matched exactly (floats, integers above 2^53, an error inside
+`//`) runs through `gh` unchanged. A new filter needs an entry in the list and
+a recorded `gh` comparison in `fixtures/gh_paged_commits.json`.
