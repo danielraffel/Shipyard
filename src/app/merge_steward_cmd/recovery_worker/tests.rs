@@ -1,6 +1,7 @@
 use super::witness::remove_recovery_witness;
 use super::*;
 use crate::config::LocalOverlaySource;
+use crate::recovery_worker::AttemptCaps;
 #[cfg(unix)]
 use crate::recovery_worker::RecoveryOutput;
 
@@ -708,6 +709,8 @@ fn expired_absolute_worker_deadline_never_launches_the_model() {
         codex_home: temp.path().join("codex-home"),
         timeout_seconds: 15,
         max_attempts_per_head: 1,
+        max_attempts_per_hour: 4,
+        max_attempts_per_pr_per_day: 2,
         max_log_tail_bytes: 4096,
         allowed_repositories: BTreeSet::new(),
         repo_paths: BTreeMap::new(),
@@ -766,6 +769,8 @@ json.dump({
         codex_home: temp.path().join("codex-home"),
         timeout_seconds: 15,
         max_attempts_per_head: 1,
+        max_attempts_per_hour: 4,
+        max_attempts_per_pr_per_day: 2,
         max_log_tail_bytes: 4096,
         allowed_repositories: BTreeSet::new(),
         repo_paths: BTreeMap::new(),
@@ -837,4 +842,370 @@ fn a_dry_worker_run_leaves_no_consumer_marker() {
     drop(RecoveryStore::new(recovery_store_root(temp.path())).expect("store"));
     assert_eq!(run_empty_worker_loop(false, temp.path()), ExitCode::SUCCESS);
     assert!(recovery_consumer_is_stale(temp.path()));
+}
+
+/// A pending request for `pr` at `head`, with the witness the worker checks,
+/// under a policy whose repository path is missing: a request that gets past
+/// the guards under test fails loudly with "is not a directory" instead.
+struct GuardFixture {
+    temp: tempfile::TempDir,
+    store: RecoveryStore,
+    config: LoadedConfig,
+    policy: RecoveryWorkerPolicy,
+    signature: String,
+}
+
+impl GuardFixture {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RecoveryStore::new(temp.path().join("store")).expect("store");
+        drop(
+            acquire_recovery_enqueue_lease(store.root(), recovery_lease_deadline())
+                .expect("enqueue lease fixture"),
+        );
+        let config = policy_with_repo_path(&temp.path().join("missing-repository"));
+        let policy = RecoveryWorkerPolicy::from_config(&config).expect("policy");
+        let signature = policy.signature().expect("signature");
+        Self {
+            temp,
+            store,
+            config,
+            policy,
+            signature,
+        }
+    }
+
+    fn enqueue(&self, pr: u64, head: &str) -> RecoveryRecord {
+        let request = RecoveryRequest::new(
+            "Generous-Corp/pulp",
+            pr,
+            "main",
+            head,
+            "failure-one",
+            "required check failed",
+            required_policy("macos"),
+            vec![required_check("macos")],
+            "steward-policy",
+            &self.signature,
+        )
+        .expect("request");
+        write_recovery_witness(
+            self.temp.path(),
+            &request.repo,
+            request.pr,
+            &request.id,
+            &request.head_sha,
+            &request.policy_signature,
+            &request.failure_fingerprint,
+        )
+        .expect("witness");
+        self.store.enqueue(request.clone()).expect("enqueue");
+        self.store.get(&request.id).expect("load").expect("record")
+    }
+
+    fn process(&self, record: &RecoveryRecord) -> Result<RecoveryWorkerReport, CliFailure> {
+        process_record(ProcessRecordInputs {
+            store: &self.store,
+            record,
+            apply: true,
+            policy: &self.policy,
+            policy_signature: &self.signature,
+            trusted_config: &self.config,
+            model_lease: None,
+            state_dir: self.temp.path(),
+            scratch_dir: &self.temp.path().join("scratch"),
+        })
+    }
+}
+
+const GUARD_HEAD_A: &str = "0123456789abcdef0123456789abcdef01234567";
+const GUARD_HEAD_B: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+#[test]
+fn a_pull_request_with_an_active_claim_is_never_touched_by_a_second_request() {
+    let fixture = GuardFixture::new();
+    let claimed = fixture.enqueue(42, GUARD_HEAD_A);
+    let newer = fixture.enqueue(42, GUARD_HEAD_B);
+    // Control: with no claim the second request goes on to the repository
+    // check, which this fixture makes fail.
+    let error = fixture
+        .process(&newer)
+        .expect_err("unfenced request proceeds");
+    assert!(error.message().contains("is not a directory"), "{error:?}");
+
+    fixture
+        .store
+        .begin(&claimed.request.id, &fixture.signature, "generation-a")
+        .expect("claim the first request");
+    let newer = fixture
+        .store
+        .get(&newer.request.id)
+        .expect("get")
+        .expect("record");
+    let report = fixture.process(&newer).expect("fenced request is skipped");
+    assert_eq!(report.action, "skipped_active_claim");
+    let after = fixture
+        .store
+        .get(&newer.request.id)
+        .expect("get")
+        .expect("record");
+    assert_eq!(after.receipt.status, RecoveryStatus::Pending);
+    assert_eq!(after.receipt.attempt, 0);
+}
+
+#[test]
+fn the_attempt_caps_defer_a_request_without_spending_its_attempt() {
+    let fixture = GuardFixture::new();
+    let record = fixture.enqueue(42, GUARD_HEAD_A);
+    let now = chrono::Utc::now();
+    // Control: under the caps the request proceeds to the repository check.
+    let error = fixture
+        .process(&record)
+        .expect_err("uncapped request proceeds");
+    assert!(error.message().contains("is not a directory"), "{error:?}");
+
+    // The per-pull-request cap: two prior attempts on PR 42 today.
+    for _ in 0..fixture.policy.max_attempts_per_pr_per_day {
+        fixture
+            .store
+            .admit_attempt(
+                &record.request.repo,
+                42,
+                now,
+                AttemptCaps {
+                    per_hour: 100,
+                    per_pr_per_day: 100,
+                },
+                true,
+            )
+            .expect("seed ledger");
+    }
+    let record = fixture
+        .store
+        .get(&record.request.id)
+        .expect("get")
+        .expect("record");
+    // The control run above already deferred the request once, so a later
+    // deferral timestamp is what shows the cap deferred it again.
+    let deferred_before = record.receipt.deferred_at.expect("control deferral");
+    let report = fixture
+        .process(&record)
+        .expect("capped request is deferred");
+    assert_eq!(report.action, "deferred_attempt_cap");
+    assert!(report.detail.contains("daily"), "{}", report.detail);
+    let after = fixture
+        .store
+        .get(&record.request.id)
+        .expect("get")
+        .expect("record");
+    assert_eq!(after.receipt.status, RecoveryStatus::Pending);
+    assert_eq!(after.receipt.attempt, 0);
+    assert!(after.receipt.deferred_at.expect("deferred") > deferred_before);
+    assert!(
+        after
+            .receipt
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("daily"))
+    );
+}
+
+#[test]
+fn the_hourly_cap_defers_a_different_pull_request() {
+    let fixture = GuardFixture::new();
+    let record = fixture.enqueue(43, GUARD_HEAD_A);
+    for pr in 100..100 + u64::from(fixture.policy.max_attempts_per_hour) {
+        fixture
+            .store
+            .admit_attempt(
+                &record.request.repo,
+                pr,
+                chrono::Utc::now(),
+                AttemptCaps {
+                    per_hour: 100,
+                    per_pr_per_day: 100,
+                },
+                true,
+            )
+            .expect("seed ledger");
+    }
+    let report = fixture
+        .process(&record)
+        .expect("capped request is deferred");
+    assert_eq!(report.action, "deferred_attempt_cap");
+    assert!(report.detail.contains("hourly"), "{}", report.detail);
+}
+
+#[test]
+fn the_policy_caps_are_conservative_and_outside_the_signature() {
+    let fixture = GuardFixture::new();
+    assert_eq!(fixture.policy.max_attempts_per_hour, 4);
+    assert_eq!(fixture.policy.max_attempts_per_pr_per_day, 2);
+    let mut loosened = fixture.policy.clone();
+    loosened.max_attempts_per_hour = 9;
+    assert_eq!(
+        loosened.signature().expect("signature"),
+        fixture.signature,
+        "tuning a cap must not supersede queued requests"
+    );
+}
+
+/// A worker run with a live-looking pull request: a policy on disk (so the
+/// claim-time refresh finds it) and a fake `gh` answering the live reads.
+struct LiveFixture {
+    inner: GuardFixture,
+    gh_dir: PathBuf,
+    gh: PathBuf,
+}
+
+const LIVE_HEAD: &str = GUARD_HEAD_A;
+
+impl LiveFixture {
+    fn new(gh_body: &str) -> Self {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&global).expect("global dir");
+        fs::create_dir_all(&repo).expect("repo dir");
+        fs::write(global.join("config.toml"), recovery_test_policy_toml(&repo))
+            .expect("policy on disk");
+        let config = LoadedConfig::load_machine_global_from_dir(global).expect("load config");
+        let policy = RecoveryWorkerPolicy::from_config(&config).expect("policy");
+        let signature = policy.signature().expect("signature");
+        let store = RecoveryStore::new(temp.path().join("store")).expect("store");
+        drop(
+            acquire_recovery_enqueue_lease(store.root(), recovery_lease_deadline())
+                .expect("enqueue lease fixture"),
+        );
+        let gh = temp.path().join("gh");
+        crate::test_support::write_executable_script(&gh, gh_body);
+        let gh_dir = temp.path().to_path_buf();
+        Self {
+            inner: GuardFixture {
+                temp,
+                store,
+                config,
+                policy,
+                signature,
+            },
+            gh_dir,
+            gh,
+        }
+    }
+
+    /// Run the real `process_record` with the fake `gh` installed.
+    fn process(
+        &self,
+        record: &RecoveryRecord,
+        apply: bool,
+    ) -> Result<RecoveryWorkerReport, CliFailure> {
+        record::GH_OVERRIDE
+            .with(|cell| *cell.borrow_mut() = Some((self.gh_dir.clone(), self.gh.clone())));
+        let result = process_record(ProcessRecordInputs {
+            store: &self.inner.store,
+            record,
+            apply,
+            policy: &self.inner.policy,
+            policy_signature: &self.inner.signature,
+            trusted_config: &self.inner.config,
+            model_lease: None,
+            state_dir: self.inner.temp.path(),
+            scratch_dir: &self.inner.temp.path().join("scratch"),
+        });
+        record::GH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        result
+    }
+
+    /// The attempt-ledger entries as `admit_attempt` counts them: one probe
+    /// attempt under an hour cap of `n` reveals whether `n` are spent.
+    fn ledger_entries(&self, repo: &str, pr: u64) -> u32 {
+        let mut used = 0;
+        for cap in 1..=8 {
+            let admission = self
+                .inner
+                .store
+                .admit_attempt(
+                    repo,
+                    pr,
+                    chrono::Utc::now(),
+                    AttemptCaps {
+                        per_hour: cap,
+                        per_pr_per_day: 100,
+                    },
+                    false,
+                )
+                .expect("probe");
+            if admission == crate::recovery_worker::AttemptAdmission::Admitted {
+                break;
+            }
+            used = cap;
+        }
+        used
+    }
+}
+
+/// A `gh` that answers a live, still-failing pull request at `LIVE_HEAD`.
+fn live_pull_gh() -> String {
+    format!(
+        r#"#!/bin/sh
+case "$*" in
+  "pr view "*)
+    printf '%s' '{{"state":"OPEN","isDraft":false,"baseRefName":"main","headRefOid":"{head}","mergeStateStatus":"CLEAN","labels":[{{"name":"{managed}"}},{{"name":"{needs_agent}"}}],"statusCheckRollup":[{{"__typename":"CheckRun","name":"macos","status":"COMPLETED","conclusion":"FAILURE","completedAt":"2026-11-08T00:00:00Z"}}]}}' ;;
+  "api "*"/statuses"*)
+    printf '%s' '[{{"id":2,"context":"{recovery}","state":"failure","created_at":"2026-11-08T00:00:02Z"}},{{"id":1,"context":"{handoff}","state":"success","created_at":"2026-11-08T00:00:01Z"}}]' ;;
+  *) exit 1 ;;
+esac
+"#,
+        head = LIVE_HEAD,
+        managed = super::super::MANAGED_LABEL,
+        needs_agent = super::super::NEEDS_AGENT_LABEL,
+        recovery = super::super::RECOVERY_CONTEXT,
+        handoff = super::super::HANDOFF_CONTEXT,
+    )
+}
+
+fn live_record(fixture: &LiveFixture) -> RecoveryRecord {
+    // Reuse GuardFixture's enqueue under this fixture's policy signature.
+    fixture.inner.enqueue(42, LIVE_HEAD)
+}
+
+#[cfg(unix)]
+#[test]
+fn an_applying_run_counts_one_attempt_and_a_dry_run_counts_none() {
+    let fixture = LiveFixture::new(&live_pull_gh());
+    let record = live_record(&fixture);
+    let repo = record.request.repo.clone();
+
+    // Dry run: every live check passes and nothing is counted.
+    let report = fixture.process(&record, false).expect("dry run");
+    assert_eq!(report.action, "would_run");
+    assert_eq!(fixture.ledger_entries(&repo, 42), 0);
+
+    // Applying run: the same checks pass, one attempt is counted, and the
+    // run then stops at the missing model lease (no model is launched).
+    let _ = fixture.process(&record, true);
+    assert_eq!(fixture.ledger_entries(&repo, 42), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_live_read_defers_the_request_and_counts_no_attempt() {
+    let fixture = LiveFixture::new("#!/bin/sh\nexit 1\n");
+    let record = live_record(&fixture);
+    let repo = record.request.repo.clone();
+
+    let error = fixture
+        .process(&record, true)
+        .expect_err("a failed read must not proceed");
+    assert!(!error.message().is_empty());
+    let after = fixture
+        .inner
+        .store
+        .get(&record.request.id)
+        .expect("get")
+        .expect("record");
+    assert_eq!(after.receipt.status, RecoveryStatus::Pending);
+    assert_eq!(after.receipt.attempt, 0);
+    assert!(after.receipt.deferred_at.is_some());
+    assert_eq!(fixture.ledger_entries(&repo, 42), 0);
 }
