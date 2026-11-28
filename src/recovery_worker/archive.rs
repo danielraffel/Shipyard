@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const MAX_ACTIVE_RECORDS: usize = 1_024;
+pub(super) const MAX_ACTIVE_RECORDS: usize = 1_024;
 const ARCHIVE_DIR: &str = "archive";
 const HEAD_INDEX_DIR: &str = "head-index";
 

@@ -393,6 +393,69 @@ pub(super) fn recovery_consumer_facts(
     })
 }
 
+/// What the recovery store looked like after this pass's prune: its fill and
+/// what was retired, or why the prune could not run. Reported per repository
+/// so a full store is visible in the steward summary instead of silently
+/// skipping recovery.
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct RecoveryStoreStatus {
+    #[serde(flatten)]
+    pub(super) prune: Option<crate::recovery_worker::PruneOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) error: Option<String>,
+}
+
+/// Retire pending recovery requests for `repo` whose pull request is no longer
+/// open on `base` at the recorded head, or that aged out. `None` when recovery
+/// publication is disabled for the repository.
+pub(super) fn prune_recovery_store(
+    global_dir: &Path,
+    state_dir: &Path,
+    repo: &str,
+    base: &str,
+    open_heads: &BTreeMap<u64, String>,
+) -> Option<RecoveryStoreStatus> {
+    match recovery_publication_is_enabled(global_dir, state_dir, repo) {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(error) => {
+            return Some(RecoveryStoreStatus {
+                prune: None,
+                error: Some(error.message().to_owned()),
+            });
+        }
+    }
+    let result = (|| {
+        let lease = acquire_recovery_publication_lease(state_dir)?;
+        let store = RecoveryStore::new(recovery_store_root(state_dir)).map_err(|error| {
+            CliFailure::new(1, format!("failed to open recovery store: {error}"))
+        })?;
+        let outcome = store
+            .prune_unattempted(
+                repo,
+                base,
+                open_heads,
+                chrono::Utc::now(),
+                chrono::Duration::days(crate::recovery_worker::MAX_PENDING_AGE_DAYS),
+            )
+            .map_err(|error| {
+                CliFailure::new(1, format!("failed to prune recovery store: {error}"))
+            })?;
+        drop(lease);
+        Ok::<_, CliFailure>(outcome)
+    })();
+    Some(match result {
+        Ok(outcome) => RecoveryStoreStatus {
+            prune: Some(outcome),
+            error: None,
+        },
+        Err(error) => RecoveryStoreStatus {
+            prune: None,
+            error: Some(error.message().to_owned()),
+        },
+    })
+}
+
 /// Persist one deterministic exact-head recovery request after the steward has
 /// already written and revalidated its needs-agent signal.
 ///
@@ -786,7 +849,19 @@ fn reconcile_orphaned_requests(
         })
 }
 
+#[cfg(test)]
+thread_local! {
+    static LEASE_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn canonical_global_model_lease_path() -> Result<PathBuf, CliFailure> {
+    // Tests drive the real worker path with a temporary lease, never the
+    // account's own.
+    #[cfg(test)]
+    if let Some(path) = LEASE_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Ok(path);
+    }
     Ok(canonical_recovery_paths()?
         .state_dir
         .join("merge-steward")

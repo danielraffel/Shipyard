@@ -315,6 +315,119 @@ fn a_pass_spawns_a_cacheable_read_once_and_a_live_read_every_time() {
     assert_eq!((report.rest, report.graphql, report.cache_hits), (4, 0, 2));
 }
 
+/// An observed, failing pull request whose recovery is already published.
+const LIVE_FAILING: u64 = 100;
+
+fn recovery_request_for(number: u64) -> crate::recovery_worker::RecoveryRequest {
+    crate::recovery_worker::RecoveryRequest::new(
+        "owner/repo",
+        number,
+        "main",
+        head_for(number),
+        "failure-v1",
+        "Required macos check failed at the exact head.",
+        vec![crate::recovery_worker::RecoveryRequiredCheck {
+            context: "macos".to_owned(),
+            app_id: None,
+        }],
+        vec![crate::recovery_worker::RecoveryFailureFact::RequiredCheck {
+            context: "macos".to_owned(),
+            app_id: None,
+            conclusion: "FAILURE".to_owned(),
+            run_id: None,
+        }],
+        "policy-v1",
+        "config-v1",
+    )
+    .expect("recovery request")
+}
+
+/// Seed one record for a pull request the pass will not observe (999) and one
+/// for the observed failing pull request (`LIVE_FAILING`), then run one pass over the
+/// observation and return the store, the two ids and the report.
+fn pass_over_seeded_store(
+    publication: bool,
+    apply: bool,
+) -> (
+    crate::recovery_worker::RecoveryStore,
+    String,
+    String,
+    RepoReport,
+    tempfile::TempDir,
+) {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("calls");
+    let actions = fixture_gh(&temp, &log);
+    let mut observation = observation_for(fixture_pr(ADMISSIBLE, false), true);
+    observation.prs.push(fixture_pr(LIVE_FAILING, true));
+    let mut args = apply_args();
+    args.apply = apply;
+    let control = mutation_control(&temp, "studio", "studio");
+    let store = crate::recovery_worker::RecoveryStore::new(
+        control.state_dir.join("merge-steward").join("recovery"),
+    )
+    .expect("store");
+    let gone = recovery_request_for(999);
+    let live = recovery_request_for(LIVE_FAILING);
+    store.enqueue(gone.clone()).expect("seed gone");
+    store.enqueue(live.clone()).expect("seed live");
+    let ledger_path = temp.path().join("ledger.json");
+    let mut ledger = StewardLedger::default();
+    let report = with_recovery_publication(publication, || {
+        apply_repo_plan(
+            &actions,
+            &args,
+            &observation,
+            &ledger_path,
+            &mut ledger,
+            0,
+            apply.then_some(&control),
+            None,
+        )
+        .0
+    });
+    (store, gone.id, live.id, report, temp)
+}
+
+fn record_status(
+    store: &crate::recovery_worker::RecoveryStore,
+    id: &str,
+) -> crate::recovery_worker::RecoveryStatus {
+    store.get(id).expect("get").expect("record").receipt.status
+}
+
+#[test]
+fn an_applying_pass_retires_the_request_of_an_unobserved_pull_request() {
+    use crate::recovery_worker::RecoveryStatus::{Pending, Superseded};
+    let (store, gone, live, report, _temp) = pass_over_seeded_store(true, true);
+    assert_eq!(record_status(&store, &gone), Superseded);
+    assert_eq!(record_status(&store, &live), Pending);
+    // The shape the steward tick's jq reads: `.recovery_store.active` and
+    // `.recovery_store.limit` on the repository report.
+    let json = serde_json::to_value(&report).expect("report json");
+    assert_eq!(json["recovery_store"]["active"], 1);
+    assert_eq!(json["recovery_store"]["limit"], 1024);
+    assert_eq!(json["recovery_store"]["retired_dead"], 1);
+    assert!(json["recovery_store"].get("error").is_none());
+}
+
+#[test]
+fn a_dry_pass_prunes_nothing_and_reports_no_store() {
+    use crate::recovery_worker::RecoveryStatus::Pending;
+    let (store, gone, live, report, _temp) = pass_over_seeded_store(true, false);
+    assert_eq!(record_status(&store, &gone), Pending);
+    assert_eq!(record_status(&store, &live), Pending);
+    assert!(report.recovery_store.is_none());
+}
+
+#[test]
+fn a_pass_with_publication_off_neither_prunes_nor_reports() {
+    use crate::recovery_worker::RecoveryStatus::Pending;
+    let (store, gone, _, report, _temp) = pass_over_seeded_store(false, true);
+    assert_eq!(record_status(&store, &gone), Pending);
+    assert!(report.recovery_store.is_none());
+}
+
 /// One applying pass over a failing pull request whose recovery is already
 /// signalled, with recovery publication on. `worker_ran` writes the worker's
 /// last-run marker into the state directory first. Returns the failing row's
@@ -402,30 +515,6 @@ fn consumer_facts_read_the_store_without_creating_it() {
     let unreadable = facts(true).expect("facts survive an unreadable record");
     assert!(unreadable.backlog_unknown);
     assert_eq!(unreadable.last_worker_run, Some(ran));
-}
-
-fn recovery_request_for(number: u64) -> crate::recovery_worker::RecoveryRequest {
-    crate::recovery_worker::RecoveryRequest::new(
-        "owner/repo",
-        number,
-        "main",
-        head_for(number),
-        "failure-v1",
-        "Required macos check failed at the exact head.",
-        vec![crate::recovery_worker::RecoveryRequiredCheck {
-            context: "macos".to_owned(),
-            app_id: None,
-        }],
-        vec![crate::recovery_worker::RecoveryFailureFact::RequiredCheck {
-            context: "macos".to_owned(),
-            app_id: None,
-            conclusion: "FAILURE".to_owned(),
-            run_id: None,
-        }],
-        "policy-v1",
-        "config-v1",
-    )
-    .expect("recovery request")
 }
 
 #[test]

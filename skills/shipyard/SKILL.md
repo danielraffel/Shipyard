@@ -4693,6 +4693,15 @@ red_everywhere` is `shadow` by default; under `enforce` an unchanged member head
 is not enqueued (`held_red_everywhere:<check>`) and `repair_skip` is true. See
 `docs/automated-draining.md` "Red everywhere".
 
+**Each applying steward pass retires dead recovery requests and reports the store's fill.**
+Pending, unattempted recovery requests whose pull request merged, closed or moved to
+a new head are superseded (so is any older than 7 days); the next pass republishes a
+request that is still needed. The repository report carries `recovery_store:
+{active, limit, retired_dead, retired_aged, unreadable}` and `summary.log` shows
+`recovery_store=<active>/<limit>`, with `!FULL` when the store cannot accept a request
+(`ERROR` when the prune failed, `off` when recovery publication is disabled). See
+`docs/automated-draining.md`.
+
 **One same-head re-enqueue after an ENVIRONMENT ejection needs no new push**
 when the repo sets `[queue.environment_requeue] enabled = true`: every failing
 required check on the removal's merge-group commit must be an Actions job whose
@@ -6590,3 +6599,17 @@ requires review exactly as `REVIEW_REQUIRED_REPOS` membership does, in both
 the Rust policy and `ghapp_queue_arm_guard.py`; the compiled list remains a
 floor. The rendered onboarding PR is limited to the two review-verdict
 workflows and the named config keys.
+
+## In-process steward reads (`src/github_read`)
+
+With `[github.reads] transport = "inproc"`, the steward answers `gh api` reads
+in the Shipyard process. Besides plain `api repos/...` reads this covers
+`--paginate --jq`, `--jq` on one page, and `--paginate --slurp`, with output
+byte-identical to `gh`: pages follow `Link: rel="next"` (a URL outside the API
+root is never followed), `--paginate` adds `per_page=100` when the query names
+no size, and a page revalidated as 304 with no next link is re-read in full. Only the
+steward's own `--jq` projections are evaluated (`ALLOWED_FILTERS` in
+`jq.rs`); any other filter, a bare `--paginate`, `-H`, an error page, or output
+that cannot be matched exactly (floats, integers above 2^53, an error inside
+`//`) runs through `gh` unchanged. A new filter needs an entry in the list and
+a recorded `gh` comparison in `fixtures/gh_paged_commits.json`.
