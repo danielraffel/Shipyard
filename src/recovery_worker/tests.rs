@@ -62,6 +62,8 @@ mod claim;
 mod consumer;
 #[path = "tests/enqueue.rs"]
 mod enqueue;
+#[path = "tests/guards.rs"]
+mod guards;
 #[path = "tests/identity.rs"]
 mod identity;
 #[path = "tests/output.rs"]

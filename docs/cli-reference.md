@@ -432,6 +432,8 @@ codex_home = "/Users/you/.codex"
 first_line_model = "gpt-5.3-codex-spark"
 timeout_seconds = 120          # hard maximum: 300
 max_attempts_per_head = 1      # phase 1 permits exactly one
+max_attempts_per_hour = 4      # default 4, hard maximum 60, across all repositories
+max_attempts_per_pr_per_day = 2  # default 2, hard maximum 24, per pull request
 max_log_tail_bytes = 16384     # hard maximum: 65536
 allowed_repositories = [
   "Generous-Corp/pulp",
@@ -444,6 +446,16 @@ allowed_repositories = [
 "Generous-Corp/forge" = "/Volumes/Workshop/Code/forge"
 "Generous-Corp/vellum" = "/Volumes/Workshop/Code/vellum"
 ```
+
+The worker also refuses to run a model when a cap is spent
+(`deferred_attempt_cap`: the request stays pending and no attempt is spent),
+when another request already holds a claim on the same pull request
+(`skipped_active_claim`), and, as before, when a live read shows the pull
+request closed, merged, draft, retargeted or on another head. A failed live
+read defers the request. The caps live in a durable `attempt-ledger` in the
+recovery store. A missing ledger starts the counts at zero (deleting it resets the
+caps); a corrupt one defers every request until it is repaired. The claim fence
+is defense in depth: the machine-global model lease already serializes workers.
 
 Pulp dependency channels require an explicit tracked `[dependencies.pulp]`
 declaration; there is no floating-ref or unrelated-repository default. See

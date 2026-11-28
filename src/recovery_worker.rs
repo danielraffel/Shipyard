@@ -923,6 +923,9 @@ mod consumer;
 pub use consumer::{WORKER_STALE_AFTER_MINUTES, worker_is_stale};
 #[path = "recovery_worker/enqueue.rs"]
 mod enqueue;
+#[path = "recovery_worker/guards.rs"]
+mod guards;
+pub use guards::{AttemptAdmission, AttemptCaps};
 #[path = "recovery_worker/output.rs"]
 mod output;
 #[path = "recovery_worker/prune.rs"]

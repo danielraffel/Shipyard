@@ -557,3 +557,68 @@ esac
         RequestDisposition::Superseded(reason) => panic!("superseded: {reason}"),
     }
 }
+
+fn superseded_reason(pull: &Value, request: &RecoveryRequest) -> Option<String> {
+    match classify_pull_target(pull, request).expect("classified") {
+        RequestDisposition::Current => None,
+        RequestDisposition::Superseded(reason) => Some(reason),
+    }
+}
+
+#[test]
+fn a_closed_merged_or_moved_pull_request_is_skipped_at_claim_time() {
+    let request = app_bound_request();
+    let base = pull_without_app_identity(&request);
+    assert_eq!(superseded_reason(&base, &request), None, "control: live");
+
+    for state in ["CLOSED", "MERGED"] {
+        let mut pull = base.clone();
+        pull["state"] = state.into();
+        let reason = superseded_reason(&pull, &request).expect(state);
+        assert!(reason.contains("no longer open"), "{reason}");
+    }
+    let mut moved = base.clone();
+    moved["headRefOid"] = "fedcba9876543210fedcba9876543210fedcba98".into();
+    let reason = superseded_reason(&moved, &request).expect("head moved");
+    assert!(reason.contains("head changed"), "{reason}");
+    let mut retargeted = base;
+    retargeted["baseRefName"] = "release".into();
+    assert!(superseded_reason(&retargeted, &request).is_some());
+}
+
+#[test]
+fn a_pull_request_read_that_proves_nothing_fails_closed() {
+    let request = app_bound_request();
+    let base = pull_without_app_identity(&request);
+    for (field, value) in [
+        ("state", serde_json::json!("REOPENED")),
+        ("isDraft", serde_json::json!(null)),
+        ("headRefOid", serde_json::json!("")),
+        ("headRefOid", serde_json::json!("abc123")),
+    ] {
+        let mut pull = base.clone();
+        pull[field] = value;
+        assert!(
+            classify_pull_target(&pull, &request).is_err(),
+            "{field} must fail closed, never read as current"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_live_read_is_an_error_not_a_current_head() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let binary = temp.path().join("gh");
+    crate::test_support::write_executable_script(&binary, "#!/bin/sh\nexit 1\n");
+    let actions = GitHubActions::hermetic_for_tests(temp.path(), binary);
+    assert!(
+        inspect_request(
+            &actions,
+            &app_bound_request(),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .is_err(),
+        "a failed read must defer, never proceed"
+    );
+}
