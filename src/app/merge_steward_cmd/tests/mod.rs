@@ -247,6 +247,7 @@ mod flake_requeue;
 #[cfg(unix)]
 mod head_rollup;
 mod merge_group_stall;
+mod mq_stall;
 #[cfg(unix)]
 mod mutation_outcome;
 mod mutations;

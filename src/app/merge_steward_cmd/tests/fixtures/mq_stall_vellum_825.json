@@ -1,0 +1,250 @@
+{
+  "_comment": "Generous-Corp/vellum at 2026-11-28T04:55Z, read back with ghread: queue pr-825 (head) then pr-769 then pr-791. Job 140854026289 is shown as it was then (queued, runner_id 0); the sterile-consumer job of 46104476461 did not exist yet.",
+  "now": "2026-11-28T04:55:00Z",
+  "census": [
+    {
+      "id": 46104476461,
+      "workflow_id": 318592245,
+      "run_attempt": 1,
+      "name": "Locked macOS GPU proof",
+      "head_sha": "430728e9c997d53d71f6255dc26a3c76ea076131",
+      "head_branch": "gh-readonly-queue/main/pr-825-63db22bdad29dd0958cfbe413757bbad4ad327f3",
+      "status": "in_progress",
+      "conclusion": null,
+      "event": "merge_group",
+      "created_at": "2026-11-28T03:46:56Z",
+      "pull_requests": []
+    },
+    {
+      "id": 46104477453,
+      "workflow_id": 318592245,
+      "run_attempt": 1,
+      "name": "Locked macOS GPU proof",
+      "head_sha": "14817233736013cf383caf8480bac78d6cb5e7a0",
+      "head_branch": "gh-readonly-queue/main/pr-769-430728e9c997d53d71f6255dc26a3c76ea076131",
+      "status": "in_progress",
+      "conclusion": null,
+      "event": "merge_group",
+      "created_at": "2026-11-28T03:46:57Z",
+      "pull_requests": []
+    }
+  ],
+  "workflow_runs": [
+    {
+      "id": 46104476461,
+      "workflow_id": 318592245,
+      "run_attempt": 1,
+      "name": "Locked macOS GPU proof",
+      "head_sha": "430728e9c997d53d71f6255dc26a3c76ea076131",
+      "head_branch": "gh-readonly-queue/main/pr-825-63db22bdad29dd0958cfbe413757bbad4ad327f3",
+      "status": "in_progress",
+      "conclusion": null,
+      "event": "merge_group",
+      "created_at": "2026-11-28T03:46:56Z",
+      "pull_requests": []
+    },
+    {
+      "id": 46104477453,
+      "workflow_id": 318592245,
+      "run_attempt": 1,
+      "name": "Locked macOS GPU proof",
+      "head_sha": "14817233736013cf383caf8480bac78d6cb5e7a0",
+      "head_branch": "gh-readonly-queue/main/pr-769-430728e9c997d53d71f6255dc26a3c76ea076131",
+      "status": "in_progress",
+      "conclusion": null,
+      "event": "merge_group",
+      "created_at": "2026-11-28T03:46:57Z",
+      "pull_requests": []
+    },
+    {
+      "id": 46106139411,
+      "workflow_id": 318592245,
+      "run_attempt": 1,
+      "name": "Locked macOS GPU proof",
+      "head_sha": "a616c7b8a01fbee43478d69b51ceea89cad603b1",
+      "head_branch": "gh-readonly-queue/main/pr-791-14817233736013cf383caf8480bac78d6cb5e7a0",
+      "status": "completed",
+      "conclusion": "failure",
+      "event": "merge_group",
+      "created_at": "2026-11-28T04:08:33Z",
+      "pull_requests": []
+    }
+  ],
+  "jobs": {
+    "46104476461": [
+      {
+        "id": 140854026055,
+        "run_id": 46104476461,
+        "name": "cancel-destroyed-groups",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-11-28T03:46:57Z",
+        "started_at": "2026-11-28T03:47:00Z",
+        "runner_id": 1000750010,
+        "runner_name": "GitHub Actions 1000750010",
+        "labels": [
+          "ubuntu-24.04"
+        ]
+      },
+      {
+        "id": 140854026289,
+        "run_id": 46104476461,
+        "name": "gpu-macos-arm64",
+        "status": "queued",
+        "conclusion": null,
+        "created_at": "2026-11-28T03:46:57Z",
+        "started_at": "2026-11-28T03:46:57Z",
+        "runner_id": 0,
+        "runner_name": "",
+        "labels": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "vellum-build-macos-merge-group"
+        ]
+      },
+      {
+        "id": 140854027558,
+        "run_id": 46104476461,
+        "name": "decide",
+        "status": "completed",
+        "conclusion": "skipped",
+        "created_at": "2026-11-28T03:46:57Z",
+        "started_at": "2026-11-28T03:46:57Z",
+        "runner_id": null,
+        "runner_name": null,
+        "labels": [
+          "ubuntu-24.04"
+        ]
+      }
+    ],
+    "46104477453": [
+      {
+        "id": 140854028996,
+        "run_id": 46104477453,
+        "name": "cancel-destroyed-groups",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-11-28T03:46:57Z",
+        "started_at": "2026-11-28T03:46:59Z",
+        "runner_id": 1000750018,
+        "runner_name": "GitHub Actions 1000750018",
+        "labels": [
+          "ubuntu-24.04"
+        ]
+      },
+      {
+        "id": 140854029336,
+        "run_id": 46104477453,
+        "name": "gpu-macos-arm64",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-11-28T03:46:57Z",
+        "started_at": "2026-11-28T03:51:50Z",
+        "runner_id": 35831,
+        "runner_name": "studio-vellum-gate-slot2-02-59395-93",
+        "labels": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "vellum-build-macos-merge-group"
+        ]
+      },
+      {
+        "id": 140854030534,
+        "run_id": 46104477453,
+        "name": "decide",
+        "status": "completed",
+        "conclusion": "skipped",
+        "created_at": "2026-11-28T03:46:58Z",
+        "started_at": "2026-11-28T03:46:58Z",
+        "runner_id": null,
+        "runner_name": null,
+        "labels": [
+          "ubuntu-24.04"
+        ]
+      },
+      {
+        "id": 140868960413,
+        "run_id": 46104477453,
+        "name": "sterile-consumer",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "created_at": "2026-11-28T04:49:06Z",
+        "started_at": "2026-11-28T04:49:06Z",
+        "runner_id": 0,
+        "runner_name": "",
+        "labels": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "vellum-build-macos-merge-group"
+        ]
+      }
+    ],
+    "46106139411": [
+      {
+        "id": 140859201580,
+        "run_id": 46106139411,
+        "name": "cancel-destroyed-groups",
+        "status": "completed",
+        "conclusion": "success",
+        "created_at": "2026-11-28T04:08:34Z",
+        "started_at": "2026-11-28T04:08:36Z",
+        "runner_id": 1000750327,
+        "runner_name": "GitHub Actions 1000750327",
+        "labels": [
+          "ubuntu-24.04"
+        ]
+      },
+      {
+        "id": 140859201898,
+        "run_id": 46106139411,
+        "name": "gpu-macos-arm64",
+        "status": "completed",
+        "conclusion": "failure",
+        "created_at": "2026-11-28T04:08:34Z",
+        "started_at": "2026-11-28T04:11:24Z",
+        "runner_id": 35832,
+        "runner_name": "m5studio-vellum-gate-01-19987-181",
+        "labels": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "vellum-build-macos-merge-group"
+        ]
+      },
+      {
+        "id": 140859203963,
+        "run_id": 46106139411,
+        "name": "decide",
+        "status": "completed",
+        "conclusion": "skipped",
+        "created_at": "2026-11-28T04:08:35Z",
+        "started_at": "2026-11-28T04:08:35Z",
+        "runner_id": null,
+        "runner_name": null,
+        "labels": [
+          "ubuntu-24.04"
+        ]
+      },
+      {
+        "id": 140870199542,
+        "run_id": 46106139411,
+        "name": "sterile-consumer",
+        "status": "completed",
+        "conclusion": "skipped",
+        "created_at": "2026-11-28T04:54:33Z",
+        "started_at": "2026-11-28T04:54:33Z",
+        "runner_id": null,
+        "runner_name": null,
+        "labels": [
+          "self-hosted",
+          "macOS",
+          "ARM64",
+          "vellum-build-macos-merge-group"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,655 @@
+{
+ "_comment": "Generous-Corp/vellum at 2026-11-28T09:29Z, read back with ghread: seven approved PR heads with gpu-macos-arm64 queued (runner_id 0) while run 46118904930 (created 06:56, same labels) got a runner at 09:05 and completed.",
+ "now": "2026-11-28T09:30:00Z",
+ "census": [
+  {
+   "id": 46111057074,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "f2026fd5835ff4fbab4765082f791de16b940cc0",
+   "head_branch": "ci/gpu-proof-reorder-reproducibility",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T05:12:45Z",
+   "pull_requests": [
+    {
+     "number": 842
+    }
+   ]
+  },
+  {
+   "id": 46111430653,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "75d9ac66d18771cbd3939c42bc9c446fcf661cf5",
+   "head_branch": "fix/authority-tests-partial-clone",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T05:17:31Z",
+   "pull_requests": [
+    {
+     "number": 843
+    }
+   ]
+  },
+  {
+   "id": 46114407938,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "52972acb1e06858a7d4f4cfe090d278766b5e8a1",
+   "head_branch": "observatory/classify-vellum-lead-events",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T05:57:36Z",
+   "pull_requests": [
+    {
+     "number": 844
+    }
+   ]
+  },
+  {
+   "id": 46118730933,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "a8e77e819df6d01e514d084b82cb4df2d561dabe",
+   "head_branch": "chore/renderer-binding-key-name",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T06:54:10Z",
+   "pull_requests": [
+    {
+     "number": 833
+    }
+   ]
+  },
+  {
+   "id": 46122069534,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "628782866552eefdeab73f9fb2262ad0c5058feb",
+   "head_branch": "fix/android-lock-test",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T07:37:31Z",
+   "pull_requests": [
+    {
+     "number": 838
+    }
+   ]
+  },
+  {
+   "id": 46128116094,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "10214dc5f7027065f9332b5299d89015911a316f",
+   "head_branch": "ci/flake-requeue-apply",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T08:56:22Z",
+   "pull_requests": [
+    {
+     "number": 839
+    }
+   ]
+  },
+  {
+   "id": 46129273537,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "9d90d4ca5840f2aabb1034f8efd58e968784e686",
+   "head_branch": "chore/deps-dependabot-alerts",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T09:11:17Z",
+   "pull_requests": [
+    {
+     "number": 846
+    }
+   ]
+  }
+ ],
+ "workflow_runs": [
+  {
+   "id": 46111057074,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "f2026fd5835ff4fbab4765082f791de16b940cc0",
+   "head_branch": "ci/gpu-proof-reorder-reproducibility",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T05:12:45Z",
+   "pull_requests": [
+    {
+     "number": 842
+    }
+   ]
+  },
+  {
+   "id": 46111430653,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "75d9ac66d18771cbd3939c42bc9c446fcf661cf5",
+   "head_branch": "fix/authority-tests-partial-clone",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T05:17:31Z",
+   "pull_requests": [
+    {
+     "number": 843
+    }
+   ]
+  },
+  {
+   "id": 46114407938,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "52972acb1e06858a7d4f4cfe090d278766b5e8a1",
+   "head_branch": "observatory/classify-vellum-lead-events",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T05:57:36Z",
+   "pull_requests": [
+    {
+     "number": 844
+    }
+   ]
+  },
+  {
+   "id": 46118730933,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "a8e77e819df6d01e514d084b82cb4df2d561dabe",
+   "head_branch": "chore/renderer-binding-key-name",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T06:54:10Z",
+   "pull_requests": [
+    {
+     "number": 833
+    }
+   ]
+  },
+  {
+   "id": 46122069534,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "628782866552eefdeab73f9fb2262ad0c5058feb",
+   "head_branch": "fix/android-lock-test",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T07:37:31Z",
+   "pull_requests": [
+    {
+     "number": 838
+    }
+   ]
+  },
+  {
+   "id": 46128116094,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "10214dc5f7027065f9332b5299d89015911a316f",
+   "head_branch": "ci/flake-requeue-apply",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T08:56:22Z",
+   "pull_requests": [
+    {
+     "number": 839
+    }
+   ]
+  },
+  {
+   "id": 46129273537,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "9d90d4ca5840f2aabb1034f8efd58e968784e686",
+   "head_branch": "chore/deps-dependabot-alerts",
+   "status": "queued",
+   "conclusion": null,
+   "event": "pull_request",
+   "created_at": "2026-11-28T09:11:17Z",
+   "pull_requests": [
+    {
+     "number": 846
+    }
+   ]
+  },
+  {
+   "id": 46118904930,
+   "workflow_id": 318592245,
+   "run_attempt": 1,
+   "name": "Locked macOS GPU proof",
+   "head_sha": "d08e3d4830546e5b2fcee747aa8902a42c802003",
+   "head_branch": "feature/vellum-emit-fig",
+   "status": "completed",
+   "conclusion": "success",
+   "event": "pull_request",
+   "created_at": "2026-11-28T06:56:32Z",
+   "pull_requests": [
+    {
+     "number": 819
+    }
+   ]
+  }
+ ],
+ "jobs": {
+  "46111057074": [
+   {
+    "id": 140874457840,
+    "run_id": 46111057074,
+    "name": "gpu-macos-arm64",
+    "status": "queued",
+    "conclusion": null,
+    "created_at": "2026-11-28T05:12:45Z",
+    "started_at": "2026-11-28T05:12:45Z",
+    "runner_id": 0,
+    "runner_name": "",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "vellum-build-macos"
+    ]
+   },
+   {
+    "id": 140874458468,
+    "run_id": 46111057074,
+    "name": "cancel-destroyed-groups",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T05:12:45Z",
+    "started_at": "2026-11-28T05:12:45Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140874494808,
+    "run_id": 46111057074,
+    "name": "decide",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T05:12:54Z",
+    "started_at": "2026-11-28T05:12:54Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   }
+  ],
+  "46111430653": [
+   {
+    "id": 140875612212,
+    "run_id": 46111430653,
+    "name": "gpu-macos-arm64",
+    "status": "queued",
+    "conclusion": null,
+    "created_at": "2026-11-28T05:17:32Z",
+    "started_at": "2026-11-28T05:17:32Z",
+    "runner_id": 0,
+    "runner_name": "",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "vellum-build-macos"
+    ]
+   },
+   {
+    "id": 140875612989,
+    "run_id": 46111430653,
+    "name": "decide",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T05:17:32Z",
+    "started_at": "2026-11-28T05:17:32Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140875613006,
+    "run_id": 46111430653,
+    "name": "cancel-destroyed-groups",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T05:17:32Z",
+    "started_at": "2026-11-28T05:17:32Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   }
+  ],
+  "46114407938": [
+   {
+    "id": 140884875830,
+    "run_id": 46114407938,
+    "name": "gpu-macos-arm64",
+    "status": "queued",
+    "conclusion": null,
+    "created_at": "2026-11-28T05:57:37Z",
+    "started_at": "2026-11-28T05:57:37Z",
+    "runner_id": 0,
+    "runner_name": "",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "vellum-build-macos"
+    ]
+   },
+   {
+    "id": 140884876505,
+    "run_id": 46114407938,
+    "name": "decide",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T05:57:38Z",
+    "started_at": "2026-11-28T05:57:38Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140884877189,
+    "run_id": 46114407938,
+    "name": "cancel-destroyed-groups",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T05:57:38Z",
+    "started_at": "2026-11-28T05:57:38Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   }
+  ],
+  "46118730933": [
+   {
+    "id": 140898275692,
+    "run_id": 46118730933,
+    "name": "gpu-macos-arm64",
+    "status": "queued",
+    "conclusion": null,
+    "created_at": "2026-11-28T06:54:10Z",
+    "started_at": "2026-11-28T06:54:10Z",
+    "runner_id": 0,
+    "runner_name": "",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "vellum-build-macos"
+    ]
+   },
+   {
+    "id": 140898276415,
+    "run_id": 46118730933,
+    "name": "cancel-destroyed-groups",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T06:54:11Z",
+    "started_at": "2026-11-28T06:54:11Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140898304921,
+    "run_id": 46118730933,
+    "name": "decide",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T06:54:18Z",
+    "started_at": "2026-11-28T06:54:18Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   }
+  ],
+  "46122069534": [
+   {
+    "id": 140908536558,
+    "run_id": 46122069534,
+    "name": "gpu-macos-arm64",
+    "status": "queued",
+    "conclusion": null,
+    "created_at": "2026-11-28T07:37:33Z",
+    "started_at": "2026-11-28T07:37:33Z",
+    "runner_id": 0,
+    "runner_name": "",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "vellum-build-macos"
+    ]
+   },
+   {
+    "id": 140908537226,
+    "run_id": 46122069534,
+    "name": "decide",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T07:37:33Z",
+    "started_at": "2026-11-28T07:37:33Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140908565861,
+    "run_id": 46122069534,
+    "name": "cancel-destroyed-groups",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T07:37:41Z",
+    "started_at": "2026-11-28T07:37:41Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   }
+  ],
+  "46128116094": [
+   {
+    "id": 140927133730,
+    "run_id": 46128116094,
+    "name": "gpu-macos-arm64",
+    "status": "queued",
+    "conclusion": null,
+    "created_at": "2026-11-28T08:56:23Z",
+    "started_at": "2026-11-28T08:56:23Z",
+    "runner_id": 0,
+    "runner_name": "",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "vellum-build-macos"
+    ]
+   },
+   {
+    "id": 140927134823,
+    "run_id": 46128116094,
+    "name": "decide",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T08:56:23Z",
+    "started_at": "2026-11-28T08:56:23Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140927134971,
+    "run_id": 46128116094,
+    "name": "cancel-destroyed-groups",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T08:56:23Z",
+    "started_at": "2026-11-28T08:56:23Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   }
+  ],
+  "46129273537": [
+   {
+    "id": 140930668481,
+    "run_id": 46129273537,
+    "name": "gpu-macos-arm64",
+    "status": "queued",
+    "conclusion": null,
+    "created_at": "2026-11-28T09:11:18Z",
+    "started_at": "2026-11-28T09:11:18Z",
+    "runner_id": 0,
+    "runner_name": "",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "vellum-build-macos"
+    ]
+   },
+   {
+    "id": 140930669586,
+    "run_id": 46129273537,
+    "name": "cancel-destroyed-groups",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T09:11:18Z",
+    "started_at": "2026-11-28T09:11:18Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140930669736,
+    "run_id": 46129273537,
+    "name": "decide",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T09:11:18Z",
+    "started_at": "2026-11-28T09:11:18Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   }
+  ],
+  "46118904930": [
+   {
+    "id": 140898811001,
+    "run_id": 46118904930,
+    "name": "gpu-macos-arm64",
+    "status": "completed",
+    "conclusion": "success",
+    "created_at": "2026-11-28T06:56:33Z",
+    "started_at": "2026-11-28T09:05:16Z",
+    "runner_id": 35857,
+    "runner_name": "studio-vellum-gate-slot2-02-9313-1",
+    "labels": [
+     "self-hosted",
+     "macOS",
+     "ARM64",
+     "vellum-build-macos"
+    ]
+   },
+   {
+    "id": 140898812082,
+    "run_id": 46118904930,
+    "name": "cancel-destroyed-groups",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T06:56:33Z",
+    "started_at": "2026-11-28T06:56:33Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140898838746,
+    "run_id": 46118904930,
+    "name": "decide",
+    "status": "completed",
+    "conclusion": "skipped",
+    "created_at": "2026-11-28T06:56:41Z",
+    "started_at": "2026-11-28T06:56:41Z",
+    "runner_id": null,
+    "runner_name": null,
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   },
+   {
+    "id": 140933641693,
+    "run_id": 46118904930,
+    "name": "sterile-consumer",
+    "status": "completed",
+    "conclusion": "success",
+    "created_at": "2026-11-28T09:23:43Z",
+    "started_at": "2026-11-28T09:23:45Z",
+    "runner_id": 1000753675,
+    "runner_name": "GitHub Actions 1000753675",
+    "labels": [
+     "ubuntu-24.04"
+    ]
+   }
+  ]
+ }
+}

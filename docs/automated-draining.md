@@ -886,6 +886,88 @@ record. A file that cannot be read never stalls the queue: the last good read
 only a head that left the queue since that read is held
 (`defect_fix_removed:unjudged`); after that the error is only logged.
 
+## Jobs GitHub never gives a runner
+
+Sometimes GitHub leaves one job `queued` with no runner while newer jobs with
+the same labels get runners. At the head of an `ALLGREEN` merge queue that
+holds every entry behind it until the ruleset's check timeout (360 minutes on
+Vellum). On 2026-11-28 Vellum run 46104476461 (#825) waited 69 minutes this
+way and was cancelled by hand. The same day seven approved Vellum pull
+requests had their GPU job queued for hours while a newer job with the same
+labels started at 09:05.
+
+Each pass on a merge-queue base the steward looks at two kinds of target:
+
+- the queue head entry only: its unfinished `merge_group` runs on the group
+  head;
+- open, non-draft pull requests whose head the approval context
+  (`review-verdict`) reports green: their `pull_request` runs on that exact
+  head that are still `queued`.
+
+A target run is read only once it is older than the threshold (at most 15 per
+pass). A job is stalled when it is `queued`, has no runner (runner id absent
+or 0 and no runner name), has labels, has waited `mq_stall_minutes` (20) since
+it was created, and no other job of its run is `in_progress`. A pull request
+job must produce a required check. It counts only with a witness: a newer job
+of the same repository (created later, or the same second with a larger id)
+whose labels include all of the stalled job's and that started on a runner
+after the stalled job was created. Witnesses come from the pass's run census
+and one listing of the stalled workflow's runs since the stalled job, so a
+witness run that already completed counts; at most 10 job reads, and the scan
+stops once every stall has one. Jobs are read once per pass. A failed or
+partial read decides nothing (`detection.unread`).
+
+The tick's summary line names each stall as
+`mq_stall=#<pr>:run:<id>:job:<id>:<age>m` (queue head) or `pr_stall=...`
+(pull request), what the recovery did as `stall_act=<outcome>:#<pr>:run:<id>`,
+and failed recoveries as `mq_stall_unrecovered=#<pr>:run:<id>` or
+`pr_stall_unrecovered=...`. Each field is printed only when it has a value.
+The repository report's `mq_stall` section carries the detection, the actions
+and the progress lines.
+
+```toml
+[auto_merge]
+mq_stall_recover = "off"          # off (default) | shadow | apply: the queue head
+pr_stall_recover = "off"          # off (default) | shadow | apply: approved PR heads
+mq_stall_minutes = 20             # 5..=360
+mq_stall_max_cancels_per_hour = 3 # 1..=20, both kinds together
+```
+
+Read from the base branch's config. A value that does not parse keeps the
+default and is reported as `config_error`. `shadow`, or `apply` on a pass that
+does not apply, reports `would_cancel` and changes nothing.
+
+Under `apply` the steward cancels the stalled run, once per run id, under the
+run mutation guard, after a fresh read shows the entry is still the head on
+the same group (for a pull request: the head is unchanged and not queued) and
+the job is still queued with no runner. It never cancels a run whose job has
+a runner, a non-head queue entry, a pull request carrying the opt-out label,
+or anything after an incomplete read. At most one cancel per repository per
+pass, the queue head first, and at most `mq_stall_max_cancels_per_hour` per
+repository per hour. Each attempt is a receipt in the steward ledger
+(`mq_stall_cancels`).
+
+Later passes prove it from a fresh read of the run, starting a minute after
+the act:
+
+- **queue head**: recovered when the run concluded `cancelled` and the pull
+  request moved: it left the open set, is queued on a different group, has a
+  newer merge-group run, or this pass enqueued it again. The cancelled
+  required check ejects the entry, and the normal admission path re-enqueues
+  it (a `cancelled` check is an infrastructure signature, so the same-head
+  retry applies);
+- **pull request**: once the run is `cancelled` it is re-run
+  (`rerun-failed-jobs`, under the guard, once), and recovered when the run
+  shows a newer attempt (the steward's own transient re-run counts) or the
+  head moved.
+
+A receipt that has not moved stays pending for an hour after the last act:
+Vellum #825, cancelled by hand at 04:56Z on 2026-11-28, was ejected a minute
+later and re-enqueued by the steward 37 minutes after that. After the hour the
+receipt reads `unrecovered: ...`, the run is never cancelled again, and the
+summary names it. A run read that keeps failing holds the
+receipt pending for an hour, then it is unrecovered.
+
 ## Red everywhere: one cause on the base
 
 When one required check fails the same way on three or more open pull requests
@@ -922,6 +1004,7 @@ red_everywhere = "shadow"   # off | shadow (default) | enforce
 | row `next_action.action`, base tip unreadable | The cautious text: "Failing on N PRs with the same test: ... Likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green. Base health could not be read, so this is the cautious reading." |
 | `summary.log` | `red_everywhere=<episodes>` on each repository line |
 | `summary.log` | `recovery_store=<active>/<limit>` on each repository line: the recovery store's fill after the pass retired requests for pull requests that closed, merged or moved head (or aged past 7 days). `!FULL` means it cannot take another request; `ERROR` means the prune failed; `off` means recovery publication is disabled |
+| `summary.log` | `mq_stall=`, `pr_stall=`, `stall_act=`, `mq_stall_unrecovered=` and `pr_stall_unrecovered=` on a repository line only when set: jobs GitHub never gave a runner and what the recovery did. See [Jobs GitHub never gives a runner](#jobs-github-never-gives-a-runner) |
 | enqueue (enforce only) | a member whose head has not changed since the episode began is not enqueued: `held_red_everywhere:<check>`. Nothing is dequeued or closed |
 
 A member that pushes a new head leaves the episode; the episode ends (and is

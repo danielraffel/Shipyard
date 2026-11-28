@@ -261,6 +261,11 @@ struct RepoReport {
     /// the repository was not observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     merge_group_stalled: Option<Value>,
+    /// The queue head's merge-group job GitHub never gave a runner, and what
+    /// the recovery did ([`mq_stall`]). Absent when the repository was not
+    /// observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mq_stall: Option<mq_stall::RepoStatus>,
     /// Required checks re-run (or, in shadow, that would be) because they
     /// failed for an infrastructure reason, and outage findings
     /// ([`infra_rerun`]). Absent when the repository was not observed.
@@ -378,6 +383,11 @@ struct StewardLedger {
     /// `merge_group_stall`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     doomed_dequeues: BTreeMap<String, merge_group_stall::Receipt>,
+    /// Queue-head runs cancelled because GitHub never gave their job a
+    /// runner, keyed `repo#run-id`: once per run, with the progress proof.
+    /// See `mq_stall`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    mq_stall_cancels: BTreeMap<String, mq_stall::Receipt>,
     /// The last good read of the queue-removals ledger, honoured while the
     /// file cannot be read. See `defect_fix_removals`.
     #[serde(default)]
@@ -1965,6 +1975,7 @@ fn deferred_rate_limit_repo_report(
     RepoReport {
         base_poison: None,
         merge_group_stalled: None,
+        mq_stall: None,
         uncertain_mutations: Vec::new(),
         repo: repo.to_owned(),
         base: base.to_owned(),
@@ -2002,6 +2013,7 @@ fn unreadable_repo_report(
     RepoReport {
         base_poison: None,
         merge_group_stalled: None,
+        mq_stall: None,
         uncertain_mutations: Vec::new(),
         api_calls: None,
         repo: repo.to_owned(),
@@ -2089,6 +2101,7 @@ fn append_unmatched_recovery_errors(
         reports.push(RepoReport {
             base_poison: None,
             merge_group_stalled: None,
+            mq_stall: None,
             uncertain_mutations: Vec::new(),
             api_calls: None,
             repo: repo.clone(),
@@ -2136,6 +2149,7 @@ fn persist_final_ledger(
         reports.push(RepoReport {
             base_poison: None,
             merge_group_stalled: None,
+            mq_stall: None,
             uncertain_mutations: Vec::new(),
             api_calls: None,
             repo: "steward".to_owned(),
@@ -2334,6 +2348,7 @@ pub(super) mod infra_rerun;
 pub(super) mod invariants;
 mod ledger;
 mod merge_group_stall;
+mod mq_stall;
 mod mutation_outcome;
 mod native_arm;
 pub(super) mod next_action;
