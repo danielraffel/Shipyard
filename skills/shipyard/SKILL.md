@@ -51,6 +51,16 @@ Kick a pass by hand only once the checks are green, because the queue skips anyt
 The pass runner lives in fleet-handbook `scripts/pass-runner/` and is installed with its
 `scripts/install-pass-runner.sh`. See `docs/automated-draining.md`.
 
+## A stalled release build stops itself
+
+The macOS release build is bounded at 20 minutes in its own step. On a stall
+the guard records diagnostics (process tree, `lsof`, `sample`, last output,
+keychain state) and then kills cargo; once the guard exits, the next workflow
+step uploads them as a `release-build-diagnostics-*` artifact. With
+`RELEASE_HEAL_CANCEL_STALLED=true`, `release-heal.yml` also cancels and re-runs
+a run whose current step is far past its usual time. Read that artifact first
+when a release build hangs.
+
 ## A blocked release messages the lead
 
 A release that is not public, complete and installable 90 minutes after its

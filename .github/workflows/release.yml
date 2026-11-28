@@ -352,11 +352,12 @@ jobs:
     # the tagged commit's own workflow, so the v* tag rulesets, not this file,
     # are what keep an unmerged commit away from them.
     environment: release
-    # Backstop over the per-step timeouts below (toolchain 45 + identity 10 +
-    # sign/notarize 115 + attestation 15 and its 2 min of backoff + publish 20),
+    # Backstop over the per-step timeouts below (toolchain 45 + build 27 +
+    # identity 10 + sign/notarize 105 + attestation 15 and its 2 min of
+    # backoff + publish 20),
     # so a stall can never hold the release draft for the 6-hour default. The
     # always() keychain restore still runs when the job is cancelled.
-    timeout-minutes: 220
+    timeout-minutes: 230
     # Uploads the DMG and publishes the release (contents) after attesting it.
     permissions:
       attestations: write
@@ -436,6 +437,37 @@ jobs:
           esac
           rustc --version | grep -q "^rustc ${SHIPYARD_RELEASE_RUST_TOOLCHAIN} "
 
+      # The build has its own step, before any signing secret or keychain is in
+      # play, with a hard limit inside it. v0.464.0's build sat at 0% CPU for
+      # over an hour inside the signing step, bounded only by that step's
+      # 115 minutes. The script stops cargo at the limit after recording the
+      # process tree, open files, a `sample` of the stuck processes, the last
+      # 200 output lines and the keychain state; the next step uploads them.
+      # In the last 10 green runs the build and notarization together took
+      # 2.5-4.5 minutes, so 20 is over 4x that p95 (3x plus margin for a cold
+      # crate download). The step timeout adds the diagnostics budget and
+      # 2 minutes of slack, so GitHub never kills the step before they are
+      # written; each section is also saved as soon as it is collected.
+      - name: Build release binaries under a hard time limit
+        timeout-minutes: 27
+        env:
+          SHIPYARD_RELEASE_BUILD_TIMEOUT_MINUTES: "20"
+          # SHA-256 of both binaries; the signing step refuses any other bytes.
+          SHIPYARD_RELEASE_BUILD_MANIFEST: ${{ runner.temp }}/shipyard-build-manifest-${{ github.run_id }}-${{ github.run_attempt }}.sha256
+          SHIPYARD_RELEASE_BUILD_DIAGNOSTICS_DIR: ${{ runner.temp }}/shipyard-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/package_release.py --target macos-arm64 --build-only
+      - name: Upload release build diagnostics
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: release-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shipyard-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+
       # No cargo cache: release binaries build from a clean target/, and a tag
       # ref can only restore its own or main's entries, neither of which holds
       # a release-profile build, so the cache never hit and only filled quota.
@@ -492,9 +524,11 @@ jobs:
       # v0.398.0 sat in `notarytool submit --wait` for hours with no
       # submission reaching Apple. package_release.py caps every notarytool
       # process, retries a stalled or failed attempt with backoff, and logs
-      # the submission id. This limit covers those retries plus the build.
+      # the submission id. This limit covers those retries (about 97 minutes
+      # worst case) plus 8 for signing, the DMG smoke and the upload; the
+      # build ran in the step above.
       - name: Sign, notarize, staple, and upload macOS DMG
-        timeout-minutes: 115
+        timeout-minutes: 105
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # The publish gate expects the same asset set the build matrix produced.
@@ -502,6 +536,7 @@ jobs:
           SHIPYARD_NOTARIZE_APPLE_ID: ${{ secrets.MACOS_NOTARIZE_APPLE_ID }}
           SHIPYARD_NOTARIZE_APP_PASSWORD: ${{ secrets.MACOS_NOTARIZE_APP_PASSWORD }}
           SHIPYARD_NOTARIZE_TEAM_ID: ${{ secrets.MACOS_NOTARIZE_TEAM_ID }}
+          SHIPYARD_RELEASE_BUILD_MANIFEST: ${{ runner.temp }}/shipyard-build-manifest-${{ github.run_id }}-${{ github.run_attempt }}.sha256
         shell: bash
         run: |
           set -euo pipefail
@@ -512,6 +547,7 @@ jobs:
             --tag "${{ github.ref_name }}" \
             --upload \
             --defer-publish \
+            --skip-build \
             --ci-mode
 
       # Sigstore (fulcio/rekor) has transient TLS and 5xx failures. An attestation

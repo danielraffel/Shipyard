@@ -4,6 +4,10 @@ name: Release Heal
 # the DMG. When that run fails (for example a runner that cannot reach
 # static.rust-lang.org) nothing retried it. This workflow re-runs the failed
 # jobs of the current version's release run, bounded, or fails with the reason.
+# A run still in progress whose current step has run past its stall threshold
+# (scripts/release_draft_heal.py) is cancelled and re-run, inside the same
+# attempt cap. The schedule runs every 10 minutes so a stall is seen within
+# 10 minutes of crossing that threshold.
 # It lives apart from auto-release.yml because tooling reads that workflow's run
 # history as the tagging chain (doctor --release-chain, release-bot verify).
 
@@ -11,7 +15,7 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: "17,47 * * * *"
+    - cron: "7,17,27,37,47,57 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -25,18 +29,23 @@ jobs:
     runs-on: ubuntu-latest
     name: Recover a stuck draft release
     # contents: write only so draft releases are listed; this job never edits one.
+    # issues: write to comment on an open release-blocked issue after a stall.
     permissions:
       actions: write
       contents: write
+      issues: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
 
-      - name: Re-run a failed release run or fail with the reason
+      - name: Re-run a failed or stalled release run or fail with the reason
         env:
           GH_TOKEN: ${{ github.token }}
           CI_MACOS_SIGNING_ENABLED: ${{ vars.CI_MACOS_SIGNING_ENABLED }}
+          # Cancelling a stalled run is off unless this is 'true'; a stall is
+          # reported either way.
+          RELEASE_HEAL_CANCEL_STALLED: ${{ vars.RELEASE_HEAL_CANCEL_STALLED }}
           # Same focus release.yml builds for, so the expected asset set matches.
           CI_PLATFORM_FOCUS: ${{ vars.CI_PLATFORM_FOCUS || 'macos' }}
         run: python3 scripts/release_draft_heal.py

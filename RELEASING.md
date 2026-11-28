@@ -148,7 +148,7 @@ The script runs the full pipeline on the local Mac:
 1. Fails fast if any env var is missing (before the Rust release build).
 2. Builds `target/release/shipyard` and `target/release/shipyard-workstream-provider` unless both are supplied with `--skip-build --binary <path> --companion-binary <path>`.
 3. Signs both Mach-O binaries with `--options runtime --timestamp` (notarytool prerequisites).
-4. Packages both signed binaries into one `.dmg`, signs the DMG, submits it via `xcrun notarytool submit --wait --timeout 20m`, and staples the accepted ticket. `--timeout` bounds only the wait for Apple's verdict, not the upload or credential lookup, so every `notarytool` process also has a 25-minute wall-clock cap with stdin closed. A stalled or failed attempt is retried at most twice, after 60 s and 180 s. Once Apple has returned a submission id, a retry waits on that submission (`notarytool wait <id>`) instead of uploading a duplicate. The id is printed (and written to the step summary in CI) as soon as it arrives, so `xcrun notarytool info <id>` and `xcrun notarytool log <id>` can diagnose a run later. An `Invalid` or `Rejected` verdict fails at once and prints `notarytool log`. In CI the signing step has `timeout-minutes: 115` and the job `timeout-minutes: 210`, so a hang can no longer hold a release draft for the 6-hour default.
+4. Packages both signed binaries into one `.dmg`, signs the DMG, submits it via `xcrun notarytool submit --wait --timeout 20m`, and staples the accepted ticket. `--timeout` bounds only the wait for Apple's verdict, not the upload or credential lookup, so every `notarytool` process also has a 25-minute wall-clock cap with stdin closed. A stalled or failed attempt is retried at most twice, after 60 s and 180 s. Once Apple has returned a submission id, a retry waits on that submission (`notarytool wait <id>`) instead of uploading a duplicate. The id is printed (and written to the step summary in CI) as soon as it arrives, so `xcrun notarytool info <id>` and `xcrun notarytool log <id>` can diagnose a run later. An `Invalid` or `Rejected` verdict fails at once and prints `notarytool log`. In CI the signing step has `timeout-minutes: 105` and the job `timeout-minutes: 230`, so a hang can no longer hold a release draft for the 6-hour default. The CI build runs before it in its own step (see "Bounded release build").
 5. **Runs both binaries' `--version` from the mounted DMG locally.** If either fails, the script exits and does NOT upload. This is the whole point — the Mac running the script is the same Mac that will need to launch the binaries tomorrow. Each binary must also report exactly the tag's version (`shipyard 0.438.0` for `v0.438.0`), checked here (exit 3), by the `install.sh` E2E for every installed tag (exit 4, release back to draft), and by the Linux release build on every `v*` tag before upload.
 6. On launch success: uploads via `gh release upload --clobber`, updates `checksums.sha256`, verifies public asset visibility, and runs the `install.sh` E2E. In CI the release workflow splits this: the upload step runs with `--defer-publish` (the release stays a draft), the DMG is attested, and only then does a `--publish-only` step publish it and run the install E2E. A host never sees a published release without an attestation, because `fleet-update` refuses one. Every `actions/attest` step (DMG and non-macOS assets) gets three attempts with 30 s and 90 s backoff, since Sigstore has transient TLS and 5xx failures; the action cannot report why it failed, so a deterministic failure also uses all three attempts before it fails the job.
 7. With `--rollback-tag`, verifies baseline install, pair upgrade, and rollback in an isolated temp install directory; rollback before v0.127.0 must remove the provider companion.
@@ -352,15 +352,79 @@ The script:
    - Leaves macOS signing/upload to `scripts/release-macos-local.sh` unless CI macOS signing is explicitly enabled
    - Uses the configured runner provider, with GitHub-hosted as the safe default
 
+## Bounded release build
+
+`scripts/package_release.py` runs the release `cargo build` through
+`scripts/release_build_guard.py`, locally and in CI. The build:
+
+- stops after `SHIPYARD_RELEASE_BUILD_TIMEOUT_MINUTES` (default 20);
+- gets `CARGO_NET_RETRY=10`, `CARGO_HTTP_TIMEOUT=60` and
+  `CARGO_HTTP_LOW_SPEED_LIMIT=10` unless already set, so one slow crates.io
+  transfer is retried (v0.461.0 failed on "transfer too slow");
+- runs with stdin from /dev/null, `GIT_TERMINAL_PROMPT=0`, `cargo -v`, no
+  progress bar and a timestamp on every line.
+
+At the limit it writes, before killing the build, the build's own process tree
+(`ps` filtered to its descendants and process group, never the whole host),
+`lsof` for those processes, a 3-second `sample` of up to 4 of them (leaves
+first; `spindump` needs sudo and is not used), the last 200 output lines and
+`security show-keychain-info` for the default keychain. All of it is redacted,
+echoed to the log and saved in `SHIPYARD_RELEASE_BUILD_DIAGNOSTICS_DIR`
+(default `dist/build-diagnostics`). In CI the build is its own step, "Build
+release binaries under a hard time limit" (`timeout-minutes: 27`: the 20-minute
+limit, the diagnostics budget and 2 minutes of slack), before the signing
+identity is imported. Each report section is saved as soon as it is collected,
+and a failed or cancelled job uploads the directory as the
+`release-build-diagnostics-<run>-<attempt>` artifact. The build step records
+the SHA-256 of both binaries in `SHIPYARD_RELEASE_BUILD_MANIFEST`; the signing
+step packages them with `--skip-build` and refuses to sign unless both hashes
+match. At the limit the build's process group gets SIGTERM, then SIGKILL after
+5 seconds whether or not the leader exited. v0.464.0's build sat at 0% CPU
+with no sockets for over an hour inside the signing step, whose only bound was
+115 minutes.
+
 ## Stuck drafts heal automatically
 
 A release stays a draft until the last `release.yml` job attests and publishes
 the DMG. If that run fails (for example the self-hosted macOS runner cannot
 download the Rust toolchain), the `release-heal.yml` workflow runs on every
-push to `main` and every 30 minutes. For the current `Cargo.toml` version it
+push to `main` and every 10 minutes. For the current `Cargo.toml` version it
 re-runs the failed jobs of the release run (never a cancelled one) once the run has been finished for
 20 minutes, at most 3 attempts in total. When attempts are exhausted, or a
 successful run still left a draft, the job fails and prints the failing steps.
+A run still in progress is cancelled and re-run, inside the same 3 attempts,
+when the step it is on has run longer than the largest of 20 minutes, 3x that
+step's median over the last 10 green release runs, and the step's own
+`timeout-minutes` plus 5. The last term means heal never cuts short a step
+that bounds itself (a notarization retry may run 25 minutes); it backs up a
+runner that failed to enforce a limit and steps that have none. The current
+step's `started_at` is the progress signal, so a run moving through its steps
+is never cancelled, and a job with no step reported in progress is left alone.
+Step limits come from `release.yml` at the run's own commit, not main's; a
+step with neither a known `timeout-minutes` nor any green history is never
+cancelled (the job timeout still bounds it). Heal uses a normal cancel
+(force-cancel would skip the keychain restore), waits up to 8 minutes for the
+run to stop, re-runs it, confirms from the API that `run_attempt` increased,
+and comments on an open `release-blocked` issue. Heal records each cancel in two commit comments on the run's head
+commit, posted by `github-actions[bot]`: an intent marker before `POST /cancel`
+(if it cannot be written, heal does not cancel), and an accepted marker with
+the same nonce once GitHub accepts the cancel. A refused cancel, including a
+409 for a run already stopping, writes no accepted marker and re-runs nothing.
+If a pass dies or gives up after an accepted cancel, the next pass re-runs the
+run only when both markers name the exact run id, attempt and nonce and a
+cancelled step had run past its threshold. An intent marker alone, a run a
+maintainer or the concurrency group cancelled, and a run whose markers cannot
+be read are all left for a human. At attempt 3 it neither cancels nor re-runs; it
+fails with the reason. To keep a stalled run dead, unset the variable or
+delete the draft. If `release.yml` at the run's commit cannot be read, that
+pass judges no stall and cancels or resumes nothing.
+
+Cancelling is off until the repository variable `RELEASE_HEAL_CANCEL_STALLED`
+is `true`; until then a stall fails the heal run with the same reason and
+nothing is cancelled. Leave the variable unset until the resume, attempt and
+tag-timeout handling above is on main and one cancel has been exercised
+against the real repository with `--dry-run` and then once for real, as
+`docs/autonomy-contract.md` requires before a default-off recovery is enabled.
 It only acts when `CI_MACOS_SIGNING_ENABLED=true` and never publishes or edits
 a release itself. Run `python3 scripts/release_draft_heal.py --dry-run` locally
 (with `GH_TOKEN`) to see the decision. An exhausted draft keeps Release Heal

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -427,9 +428,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(package_release.NOTARY_WAIT_TIMEOUT, "20m")
         self.assertGreater(package_release.NOTARY_ATTEMPT_TIMEOUT_SECS, 20 * 60)
         # The Python retries must finish (and report the submission id) before
-        # the runner kills the step: leave at least 15 minutes for the build,
-        # signing, DMG smoke and upload.
-        self.assertLessEqual(worst_case + 15 * 60, limit_secs)
+        # the runner kills the step: leave at least 8 minutes for signing, the
+        # DMG smoke and upload. The build runs in its own bounded step.
+        self.assertLessEqual(worst_case + 8 * 60, limit_secs)
+        self.assertIn("--skip-build", step["run"])
         # ...yet the step must not be allowed to idle for hours.
         self.assertLessEqual(limit_secs, 2 * 60 * 60)
 
@@ -446,10 +448,62 @@ class ReleaseWorkflowTests(unittest.TestCase):
             elif name.startswith("Back off before"):
                 bounded += 3  # a fixed sleep of at most 90s
             elif name.startswith(
-                ("Sign, notarize", "Install pinned Rust", "Publish the", "Attest", "Import Developer ID")
+                ("Sign, notarize", "Install pinned Rust", "Publish the", "Attest", "Import Developer ID", "Build release")
             ):
                 self.fail(f"long-running step {name!r} has no timeout-minutes")
         self.assertLessEqual(bounded, job_limit)
+
+    def test_macos_build_is_its_own_bounded_step_before_signing(self) -> None:
+        import release_build_guard
+
+        job = self._macos_job()
+        names = [s.get("name", "") for s in job["steps"]]
+        build_index = names.index("Build release binaries under a hard time limit")
+        step = job["steps"][build_index]
+        # Before any signing secret or keychain is in play.
+        self.assertLess(build_index, names.index("Import Developer ID signing identity"))
+        self.assertNotIn("secrets.", json.dumps(step))
+        self.assertIn("--build-only", step["run"])
+        cap_secs = float(step["env"]["SHIPYARD_RELEASE_BUILD_TIMEOUT_MINUTES"]) * 60
+        self.assertLessEqual(cap_secs, 20 * 60)
+        # GitHub must never kill the step before the diagnostics are written.
+        self.assertGreaterEqual(
+            int(step["timeout-minutes"]) * 60,
+            cap_secs + release_build_guard.DIAGNOSTICS_BUDGET_SECS,
+        )
+        # The signing step checks the exact bytes the build step recorded.
+        sign = next(s for s in job["steps"] if s.get("name") == "Sign, notarize, staple, and upload macOS DMG")
+        self.assertEqual(step["env"]["SHIPYARD_RELEASE_BUILD_MANIFEST"],
+                         sign["env"]["SHIPYARD_RELEASE_BUILD_MANIFEST"])
+        diag_dir = step["env"]["SHIPYARD_RELEASE_BUILD_DIAGNOSTICS_DIR"]
+        upload = job["steps"][build_index + 1]
+        self.assertTrue(upload["uses"].startswith("actions/upload-artifact@"))
+        self.assertEqual(upload["if"], "failure() || cancelled()")
+        self.assertEqual(upload["with"]["path"], diag_dir)
+
+    def test_heal_runs_often_enough_to_catch_a_stall(self) -> None:
+        import yaml
+
+        workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-heal.yml").read_text(encoding="utf-8"))
+        triggers = workflow.get(True) or workflow.get("on")
+        minutes = sorted(int(m) for m in triggers["schedule"][0]["cron"].split()[0].split(","))
+        gaps = [b - a for a, b in zip(minutes, minutes[1:])] + [60 - minutes[-1] + minutes[0]]
+        self.assertLessEqual(max(gaps), 10)
+        heal_env = workflow["jobs"]["heal"]["steps"][-1]["env"]
+        self.assertEqual(heal_env["RELEASE_HEAL_CANCEL_STALLED"], "${{ vars.RELEASE_HEAL_CANCEL_STALLED }}")
+
+    def test_heal_step_timeout_parser_matches_yaml_for_release_workflow(self) -> None:
+        import yaml
+        import release_draft_heal
+
+        text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        expected: dict[str, int] = {}
+        for job in yaml.safe_load(text)["jobs"].values():
+            for step in job.get("steps", []):
+                if "name" in step and "timeout-minutes" in step:
+                    expected[step["name"]] = max(int(step["timeout-minutes"]), expected.get(step["name"], 0))
+        self.assertTrue(expected)
+        self.assertEqual(release_draft_heal.step_timeouts(text), expected)
 
     def test_heal_is_its_own_workflow_and_auto_release_is_untouched(self) -> None:
         import yaml
@@ -464,7 +518,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["concurrency"], {"group": "release-heal", "cancel-in-progress": False})
         self.assertEqual(workflow["permissions"], {})
         heal = workflow["jobs"]["heal"]
-        self.assertEqual(heal["permissions"], {"actions": "write", "contents": "write"})
+        self.assertEqual(heal["permissions"], {"actions": "write", "contents": "write", "issues": "write"})
         run_steps = [s["run"] for s in heal["steps"] if "run" in s]
         self.assertIn("python3 scripts/release_draft_heal.py", run_steps)
 

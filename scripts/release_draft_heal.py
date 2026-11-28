@@ -8,7 +8,9 @@ it and the draft sits forever. This script runs from `release-heal.yml` on a
 schedule and on every main push. For the release of the current Cargo version
 it either does nothing (the release is published with every expected asset, even
 when its run failed and the release was recovered by hand), re-runs the failed jobs of the release run (bounded by
-MAX_ATTEMPTS), or exits non-zero with the exact reason. The attempt cap means an exhausted run fails every scheduled pass until a
+MAX_ATTEMPTS), or exits non-zero with the exact reason. A run still in progress whose
+current step has run past its stall threshold (see STALL_FLOOR_MINUTES) is
+cancelled and re-run, within the same attempt cap. The attempt cap means an exhausted run fails every scheduled pass until a
 newer release run exists; that is deliberate, a stuck draft stays visible.
 It never edits the
 release itself: publication stays inside the pipeline that attests the DMG.
@@ -20,8 +22,10 @@ import argparse
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,11 +37,29 @@ RELEASE_PAGE_SIZE = 100
 # push the current release past the first page; scan until the tag is found.
 MAX_RELEASE_PAGES = 20
 FAILED = {"failure", "timed_out", "startup_failure"}
+# A run still in progress is cancelled and re-run when the step it is on has
+# run longer than the largest of: STALL_FLOOR_MINUTES; STALL_MEDIAN_FACTOR times
+# that step's median over the last STALL_HISTORY_RUNS green release runs; and
+# the step's own timeout-minutes plus STALL_TIMEOUT_GRACE_MINUTES. The last term
+# keeps heal from cutting short a step that bounds itself (a notarization retry
+# can legitimately run 25 minutes), so heal only backs up a runner that failed
+# to enforce a limit, or a step that has none. Step-level started_at is the
+# progress signal: a run moving through its steps is never cancelled.
+STALL_FLOOR_MINUTES = 20
+STALL_MEDIAN_FACTOR = 3
+STALL_TIMEOUT_GRACE_MINUTES = 5
+STALL_HISTORY_RUNS = 10
+CANCEL_SETTLE_SECS = 8 * 60
+CANCEL_POLL_SECS = 20
+RERUN_CONFIRM_SECS = 90
+BLOCKED_LABEL = "release-blocked"
+# Repository variable (passed as env) that lets heal cancel a stalled run.
+CANCEL_STALLED_ENV = "RELEASE_HEAL_CANCEL_STALLED"
 
 
 @dataclass(frozen=True)
 class Decision:
-    action: str  # "noop" | "rerun" | "fail"
+    action: str  # "noop" | "rerun" | "cancel-rerun" | "resume-rerun" | "fail"
     reason: str
     run_id: int | None = None
 
@@ -120,6 +142,201 @@ def decide(
     return Decision("noop", f"release run {run['id']} concluded {conclusion}")
 
 
+@dataclass(frozen=True)
+class Stall:
+    job_id: int
+    job_name: str
+    step_name: str
+    elapsed_secs: float
+    threshold_secs: float
+
+
+_ITEM_RE = re.compile(r"^(\s*)-\s+(.*)$")
+_KEY_RE = re.compile(r"^(\s*)(name|timeout-minutes):\s*(.+?)\s*$")
+
+
+def _scalar(value: str) -> str:
+    value = re.sub(r"\s+#.*$", "", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value
+
+
+def step_timeouts(workflow_text: str) -> dict[str, int]:
+    """Step name -> timeout-minutes for every named step that sets one.
+
+    A line scan, so heal needs no YAML library on the runner; a test checks it
+    against PyYAML for release.yml. A name used by several jobs keeps its
+    largest timeout, which only ever raises the stall threshold.
+    """
+    result: dict[str, int] = {}
+    item: dict[str, str] | None = None
+    item_indent = -1
+
+    def close() -> None:
+        if item and "name" in item and "timeout-minutes" in item:
+            try:
+                minutes = int(item["timeout-minutes"])
+            except ValueError:
+                return
+            result[item["name"]] = max(minutes, result.get(item["name"], 0))
+
+    for line in workflow_text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        start = _ITEM_RE.match(line)
+        if item is not None and indent <= item_indent:
+            close()
+            item = None
+        if start and item is None:
+            item = {}
+            item_indent = len(start.group(1))
+            first = _KEY_RE.match(" " * (item_indent + 2) + start.group(2))
+            if first:
+                item[first.group(2)] = _scalar(first.group(3))
+            continue
+        if start:
+            continue  # a list nested inside the current item
+        if item is not None and indent == item_indent + 2:
+            key = _KEY_RE.match(line)
+            if key:
+                item[key.group(2)] = _scalar(key.group(3))
+    close()
+    return result
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def stall_threshold_secs(
+    history_secs: list[float],
+    step_timeout_minutes: int | None,
+    *,
+    floor_minutes: int = STALL_FLOOR_MINUTES,
+    factor: int = STALL_MEDIAN_FACTOR,
+    timeout_grace_minutes: int = STALL_TIMEOUT_GRACE_MINUTES,
+) -> float:
+    terms = [floor_minutes * 60.0]
+    if history_secs:
+        terms.append(factor * _median(history_secs))
+    if step_timeout_minutes:
+        terms.append((step_timeout_minutes + timeout_grace_minutes) * 60.0)
+    return max(terms)
+
+
+def find_stall(
+    jobs: list[dict],
+    *,
+    now: datetime,
+    history,
+    timeouts: dict[str, int],
+    floor_minutes: int = STALL_FLOOR_MINUTES,
+) -> Stall | None:
+    """The first in-progress step that has run past its stall threshold.
+
+    ``history(job_name, step_name)`` returns that step's durations in recent
+    green runs; it is called only for a step already past the floor. A job
+    with no step reported in progress is skipped (fail closed): without a
+    step start there is no evidence it stopped moving.
+    """
+    for job in jobs:
+        if job.get("status") != "in_progress":
+            continue
+        current = [s for s in job.get("steps") or [] if s.get("status") == "in_progress" and s.get("started_at")]
+        if len(current) != 1:
+            continue
+        step = current[0]
+        elapsed = (now - _parse(step["started_at"])).total_seconds()
+        stall = _over_threshold(job, step, elapsed, history, timeouts, floor_minutes)
+        if stall:
+            return stall
+    return None
+
+
+def _over_threshold(job, step, elapsed, history, timeouts, floor_minutes) -> Stall | None:
+    """A Stall when ``step`` ran past its threshold; None otherwise.
+
+    Fail closed: a step with neither a known timeout-minutes nor any green
+    history (renamed since the tag, say) is never selected; the job timeout
+    still bounds it.
+    """
+    if elapsed <= floor_minutes * 60:
+        return None
+    durations = history(job["name"], step["name"])
+    timeout = timeouts.get(step["name"])
+    if not durations and not timeout:
+        return None
+    threshold = stall_threshold_secs(durations, timeout, floor_minutes=floor_minutes)
+    if elapsed > threshold:
+        return Stall(int(job["id"]), job["name"], step["name"], elapsed, threshold)
+    return None
+
+
+def find_cancelled_stall(
+    jobs: list[dict],
+    *,
+    history,
+    timeouts: dict[str, int],
+    floor_minutes: int = STALL_FLOOR_MINUTES,
+) -> Stall | None:
+    """In a cancelled run, a cancelled step that had run past its stall threshold.
+
+    That is the trace of a heal cancel whose re-run never happened (the pass
+    died, or the run settled after the pass gave up), so a later pass can
+    finish it. A run cancelled while its steps were moving shows no such step.
+    """
+    for job in jobs:
+        if job.get("conclusion") != "cancelled":
+            continue
+        for step in job.get("steps") or []:
+            if step.get("conclusion") != "cancelled" or not step.get("started_at") or not step.get("completed_at"):
+                continue
+            elapsed = (_parse(step["completed_at"]) - _parse(step["started_at"])).total_seconds()
+            stall = _over_threshold(job, step, elapsed, history, timeouts, floor_minutes)
+            if stall:
+                return stall
+    return None
+
+
+def decide_resume(run: dict, stall: Stall | None, *, max_attempts: int = MAX_ATTEMPTS) -> Decision | None:
+    """Re-run decision for a run a heal pass cancelled as stalled but never re-ran."""
+    if stall is None or run.get("status") != "completed" or run.get("conclusion") != "cancelled":
+        return None
+    attempt = int(run.get("run_attempt") or 1)
+    where = (f"job {stall.job_name!r} step {stall.step_name!r} ran "
+             f"{int(stall.elapsed_secs // 60)} min before it was cancelled "
+             f"(threshold {int(stall.threshold_secs // 60)} min)")
+    if attempt >= max_attempts:
+        return Decision("fail", f"release run {run['id']} was cancelled as stalled after {attempt} attempts; "
+                        f"not retrying: {where}", run["id"])
+    return Decision("resume-rerun", f"release run {run['id']} was cancelled as stalled and not re-run "
+                    f"(attempt {attempt}/{max_attempts}): {where}", run["id"])
+
+
+def decide_stall(run: dict, stall: Stall | None, *, max_attempts: int = MAX_ATTEMPTS) -> Decision | None:
+    """Cancel-and-re-run decision for an in-progress run, or None to leave it."""
+    if stall is None or run.get("status") != "in_progress":
+        return None
+    attempt = int(run.get("run_attempt") or 1)
+    where = (f"job {stall.job_name!r} step {stall.step_name!r} in progress "
+             f"{int(stall.elapsed_secs // 60)} min (threshold {int(stall.threshold_secs // 60)} min)")
+    if attempt >= max_attempts:
+        return Decision(
+            "fail",
+            f"release run {run['id']} stalled after {attempt} attempts; not cancelling: {where}",
+            run["id"],
+        )
+    return Decision(
+        "cancel-rerun",
+        f"release run {run['id']} stalled (attempt {attempt}/{max_attempts}): {where}",
+        run["id"],
+    )
+
+
 def cargo_version(cargo_toml: Path) -> str:
     text = cargo_toml.read_text(encoding="utf-8")
     m = re.search(r'(?ms)^\[package\].*?^\s*version\s*=\s*"([^"]+)"', text)
@@ -187,6 +404,290 @@ def _failed_steps(repo: str, run_id: int) -> str:
     return "; ".join(parts)
 
 
+def _green_step_history(repo: str):
+    """``history(job_name, step_name)`` over the last green release runs, fetched once."""
+    cache: list[list[dict]] = []
+
+    def history(job_name: str, step_name: str) -> list[float]:
+        if not cache:
+            runs = json.loads(_gh(
+                "api", f"repos/{repo}/actions/workflows/release.yml/runs"
+                f"?status=success&per_page={STALL_HISTORY_RUNS}")).get("workflow_runs", [])
+            cache.append([
+                job
+                for green in runs[:STALL_HISTORY_RUNS]
+                for job in json.loads(_gh(
+                    "api", f"repos/{repo}/actions/runs/{green['id']}/jobs?per_page=100")).get("jobs", [])
+            ])
+        durations = []
+        for job in cache[0]:
+            if job.get("name") != job_name:
+                continue
+            for step in job.get("steps") or []:
+                if (step.get("name") == step_name and step.get("conclusion") == "success"
+                        and step.get("started_at") and step.get("completed_at")):
+                    durations.append((_parse(step["completed_at"]) - _parse(step["started_at"])).total_seconds())
+        return durations
+
+    return history
+
+
+def _run(repo: str, run_id: int) -> dict:
+    return json.loads(_gh("api", f"repos/{repo}/actions/runs/{run_id}"))
+
+
+def _wait_for(predicate, *, timeout: float, poll: float, sleep=None, clock=None) -> bool:
+    # Resolved at call time, so a patched time.sleep reaches every caller.
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    deadline = clock() + timeout
+    while True:
+        if predicate():
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(poll)
+
+
+def _comment_on_blocked_issue(repo: str, body: str) -> None:
+    """Best effort: a heal action must not fail because the comment could not post."""
+    try:
+        issues = json.loads(_gh("api", f"repos/{repo}/issues?labels={BLOCKED_LABEL}&state=open&per_page=5"))
+        issues = [i for i in issues if "pull_request" not in i]
+        if not issues:
+            return
+        _gh("api", "-X", "POST", f"repos/{repo}/issues/{issues[0]['number']}/comments", "-f", f"body={body}")
+        print(f"commented on {BLOCKED_LABEL} issue #{issues[0]['number']}")
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as exc:
+        print(f"::warning::could not comment on the {BLOCKED_LABEL} issue: {exc}")
+
+
+def _try_run(repo: str, run_id: int) -> dict | None:
+    """The run, or None when the read fails; a poll must not abort the pass."""
+    try:
+        return _run(repo, run_id)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        print(f"::warning::could not read run {run_id}: {exc}")
+        return None
+
+
+def _post_rerun(endpoint: str) -> bool:
+    try:
+        _gh("api", "-X", "POST", endpoint)
+        return True
+    except subprocess.CalledProcessError as exc:
+        print(f"re-run via {endpoint} refused: {(exc.stderr or '').strip()}", file=sys.stderr)
+        return False
+
+
+def _attempt_of(run: dict | None) -> int | None:
+    """``run_attempt`` when it is a positive integer, else None (unknown).
+
+    A missing, null, zero or non-integer value proves nothing about whether a
+    re-run started, so it must never read as "still the same attempt".
+    """
+    if run is None:
+        return None
+    value = run.get("run_attempt")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Stall, *, what: str,
+                      sleep=None) -> int:
+    """Re-run a cancelled stalled run and confirm from the API that a new attempt exists.
+
+    Re-run failed jobs first; GitHub does not document whether that endpoint
+    includes cancelled jobs, so if no new attempt appears, re-run the stalled
+    job and its dependents directly. An increased run_attempt alone is the
+    proof: a new attempt that already failed fast is still a restart.
+
+    The fallback is a second mutating request, so it fails closed: it is sent
+    only after a successful fresh read shows the same attempt, the run
+    finished, and the attempt under MAX_ATTEMPTS. An unreadable run is an
+    unknown outcome, never "not restarted".
+    """
+    def restarted() -> bool:
+        latest = _try_run(repo, run_id)
+        current = _attempt_of(latest)
+        return current is not None and current > attempt
+
+    def stop(reason: str) -> int:
+        print(f"::error title=Release {tag} heal could not confirm a restart of run {run_id}::{reason}; "
+              "the next heal pass judges the run again")
+        return 1
+
+    first = f"repos/{repo}/actions/runs/{run_id}/rerun-failed-jobs"
+    accepted = _post_rerun(first)
+    confirmed = _wait_for(restarted, timeout=RERUN_CONFIRM_SECS, poll=10, sleep=sleep) if accepted else False
+    if not confirmed:
+        latest = _try_run(repo, run_id)
+        if latest is None:
+            return stop("the run could not be read after the re-run request, so its outcome is unknown")
+        current = _attempt_of(latest)
+        if current is None or current < attempt:
+            return stop(f"the run reports run_attempt {latest.get('run_attempt', '<missing>')!r} "
+                        f"after attempt {attempt}, so its outcome is unknown")
+        if current > attempt:
+            confirmed = True
+        elif latest.get("status") != "completed":
+            return stop(f"attempt {current} is {latest.get('status')} without a new attempt")
+        elif current >= MAX_ATTEMPTS:
+            return stop(f"attempt {current} reached the cap of {MAX_ATTEMPTS}")
+    if not confirmed:
+        fallback = f"repos/{repo}/actions/jobs/{stall.job_id}/rerun"
+        if not (_post_rerun(fallback) and _wait_for(restarted, timeout=RERUN_CONFIRM_SECS, poll=10, sleep=sleep)):
+            return stop("the stalled run is cancelled but no re-run was confirmed")
+    message = (f"release-heal: {what} release run {run_id} ({tag}): job "
+               f"`{stall.job_name}` step `{stall.step_name}` had run "
+               f"{int(stall.elapsed_secs // 60)} min, over its {int(stall.threshold_secs // 60)} min "
+               f"threshold. Re-ran it as attempt {attempt + 1}/{MAX_ATTEMPTS}.")
+    print(message)
+    _comment_on_blocked_issue(repo, message)
+    return 0
+
+
+# Durable proof that heal itself cancelled a run, in two phases, as commit
+# comments on the run's head commit written by the workflow token:
+# - intent, before POST /cancel;
+# - accepted, after GitHub accepted that POST, with the same nonce.
+# A later pass resumes a cancelled run only with an accepted marker whose
+# nonce matches an intent marker for that exact run id and attempt. An intent
+# alone (the cancel was refused, or the pass died before or after the POST)
+# proves nothing about who cancelled, so that run is left for a human, as is a
+# run a maintainer or the concurrency group cancelled.
+INTENT_KIND = "release-heal-cancel"
+ACCEPTED_KIND = "release-heal-cancel-accepted"
+MARKER_RE = re.compile(
+    r"<!-- (release-heal-cancel(?:-accepted)?) run=(\d+) attempt=(\d+) nonce=([0-9a-f]{16}) -->")
+MARKER_AUTHOR = "github-actions[bot]"
+MARKER_PAGES = 10
+
+
+def marker_line(kind: str, run_id: int, attempt: int, nonce: str) -> str:
+    return f"<!-- {kind} run={run_id} attempt={attempt} nonce={nonce} -->"
+
+
+def write_cancel_marker(repo: str, run: dict, kind: str, text: str, nonce: str) -> bool:
+    """Post one marker comment on the run's head commit; False when it could not be written."""
+    sha = run.get("head_sha")
+    if not sha:
+        return False
+    attempt = int(run.get("run_attempt") or 1)
+    body = f"{text}\n\n{marker_line(kind, run['id'], attempt, nonce)}"
+    try:
+        _gh("api", "-X", "POST", f"repos/{repo}/commits/{sha}/comments", "-f", f"body={body}")
+    except subprocess.CalledProcessError as exc:
+        print(f"::warning::could not record {kind} for run {run['id']}: {(exc.stderr or '').strip()}")
+        return False
+    print(f"recorded {kind} for run {run['id']} attempt {attempt} (nonce {nonce})")
+    return True
+
+
+def has_cancel_marker(repo: str, run: dict) -> bool | None:
+    """True when heal recorded an accepted cancel of this exact run id and attempt.
+
+    Needs an accepted marker whose nonce matches an intent marker, both for
+    this run id and attempt and both from the workflow token. None when the
+    markers cannot be read.
+    """
+    sha = run.get("head_sha")
+    if not sha:
+        return None
+    want = (str(run["id"]), str(run.get("run_attempt")))
+    nonces: dict[str, set[str]] = {INTENT_KIND: set(), ACCEPTED_KIND: set()}
+    try:
+        for page in range(1, MARKER_PAGES + 1):
+            comments = json.loads(_gh("api", f"repos/{repo}/commits/{sha}/comments?per_page=100&page={page}"))
+            for comment in comments:
+                if (comment.get("user") or {}).get("login") != MARKER_AUTHOR:
+                    continue
+                for match in MARKER_RE.finditer(comment.get("body") or ""):
+                    if (match.group(2), match.group(3)) == want:
+                        nonces[match.group(1)].add(match.group(4))
+            if len(comments) < 100:
+                return bool(nonces[INTENT_KIND] & nonces[ACCEPTED_KIND])
+    except (subprocess.CalledProcessError, json.JSONDecodeError, AttributeError, TypeError) as exc:
+        print(f"::warning::could not read the cancel markers on {sha}: {exc}")
+        return None
+    return None
+
+
+def cancel_and_rerun(repo: str, tag: str, run: dict, stall: Stall, *, sleep=None) -> int:
+    """Cancel a stalled run, wait for it to settle, then re-run it.
+
+    A normal cancel, never force-cancel: force-cancel skips the job's
+    ``if: always()`` keychain restore. The intent marker is written first (no
+    marker, no cancel) and the accepted marker only after GitHub accepted the
+    cancel. If this pass dies or gives up after that, the next pass finds both
+    markers and the cancelled stalled step (find_cancelled_stall) and re-runs
+    the run.
+    """
+    run_id = run["id"]
+    attempt = int(run.get("run_attempt") or 1)
+    nonce = secrets.token_hex(8)
+    summary = (f"`{stall.job_name}` step `{stall.step_name}` ran {int(stall.elapsed_secs // 60)} min, "
+               f"over its {int(stall.threshold_secs // 60)} min threshold")
+    if not write_cancel_marker(repo, run, INTENT_KIND,
+                               f"release-heal is about to cancel stalled release run {run_id} "
+                               f"(attempt {attempt}): job {summary}.", nonce):
+        print(f"::error title=Release {tag} heal did not cancel stalled run {run_id}::"
+              "could not record the cancel intent on the run's commit")
+        return 1
+    try:
+        _gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{run_id}/cancel")
+    except subprocess.CalledProcessError as exc:
+        # Refused, including 409 (already stopping, so not by heal): heal did
+        # not cancel it, so it writes no accepted marker and re-runs nothing.
+        print(f"::error title=Release {tag} heal could not cancel stalled run {run_id}::"
+              f"{(exc.stderr or '').strip() or 'no detail'}; left for a human")
+        return 1
+    print(f"cancel accepted for run {run_id}")
+    if not write_cancel_marker(repo, run, ACCEPTED_KIND,
+                               f"GitHub accepted release-heal's cancel of run {run_id} (attempt {attempt}). "
+                               "A later heal pass may re-run it.", nonce):
+        print(f"::warning::the cancel of run {run_id} is not recorded as accepted; "
+              "if this pass stops before the re-run, a human must re-run it")
+
+    def settled() -> bool:
+        latest = _try_run(repo, run_id)
+        return latest is not None and latest.get("status") == "completed"
+
+    if not _wait_for(settled, timeout=CANCEL_SETTLE_SECS, poll=CANCEL_POLL_SECS, sleep=sleep):
+        print(f"::error title=Release {tag} heal cancelled a stalled run that has not stopped::"
+              f"run {run_id} is not completed {CANCEL_SETTLE_SECS // 60} min after the cancel; "
+              "the next heal pass re-runs it once it stops")
+        return 1
+    latest = _try_run(repo, run_id) or {}
+    if latest.get("conclusion") != "cancelled":
+        print(f"run {run_id} finished {latest.get('conclusion')} before the cancel took effect; "
+              "the next heal pass judges it")
+        return 0
+    return rerun_and_confirm(repo, tag, run_id, attempt, stall, what="cancelled stalled", sleep=sleep)
+
+
+def workflow_timeouts_at(repo: str, ref: str | None) -> dict[str, int] | None:
+    """Step timeouts from release.yml at the run's own commit, or None if unreadable.
+
+    A tag runs its own commit's workflow, so main's copy can name steps or
+    limits the run does not have. None is not "no timeouts": without the
+    limits a self-bounded step (a 25-minute notarization attempt) would be
+    judged on the 20-minute floor alone, so the caller skips stall judgement.
+    """
+    if not ref:
+        print("::warning::release run has no head_sha; skipping stall judgement this pass")
+        return None
+    try:
+        text = _gh("api", f"repos/{repo}/contents/.github/workflows/release.yml?ref={ref}",
+                   "-H", "Accept: application/vnd.github.raw+json")
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"::warning::could not read release.yml at {ref}; skipping stall judgement this pass: "
+              f"{getattr(exc, 'stderr', '') or exc}")
+        return None
+    return step_timeouts(text)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
@@ -207,7 +708,49 @@ def main() -> int:
              if unpublished and run and run.get("conclusion") in FAILED else "")
     decision = decide(release, run, now=datetime.now(timezone.utc), signing_enabled=signing,
                       failed_steps=steps, expected_assets=expected_assets())
+    stall = None
+    cancel_enabled = os.environ.get(CANCEL_STALLED_ENV, "") == "true"
+    in_flight = run is not None and run.get("status") == "in_progress" and decision.action == "noop"
+    # Only a heal pass cancels as stalled, and only with the variable on.
+    cancelled = (run is not None and cancel_enabled and run.get("status") == "completed"
+                 and run.get("conclusion") == "cancelled")
+    if signing and unpublished and (in_flight or cancelled):
+        assert run is not None
+        jobs = json.loads(_gh("api", f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")).get("jobs", [])
+        timeouts = workflow_timeouts_at(repo, run.get("head_sha"))
+        history = _green_step_history(repo)
+        if timeouts is None:
+            pass  # unreadable limits: judge nothing, the next pass retries
+        elif in_flight:
+            stall = find_stall(jobs, now=datetime.now(timezone.utc), history=history, timeouts=timeouts)
+            decision = decide_stall(run, stall) or decision
+        else:
+            stall = find_cancelled_stall(jobs, history=history, timeouts=timeouts)
+            resume = decide_resume(run, stall)
+            if resume is not None and resume.action == "resume-rerun":
+                marker = has_cancel_marker(repo, run)
+                if marker is None:
+                    print(f"::warning::cancel markers for run {run['id']} are unreadable; not resuming this pass")
+                    resume = None
+                elif not marker:
+                    print(f"run {run['id']} attempt {run.get('run_attempt')} has no release-heal cancel marker; "
+                          "it was not cancelled by heal, so it is left for a human")
+                    resume = None
+            decision = resume or decision
     print(f"{tag}: {decision.action}: {decision.reason}")
+    if decision.action == "resume-rerun" and not args.dry_run:
+        assert stall is not None and run is not None
+        return rerun_and_confirm(repo, tag, run["id"], int(run.get("run_attempt") or 1), stall,
+                                 what="re-ran the cancelled stalled")
+    if decision.action == "cancel-rerun" and not args.dry_run:
+        assert stall is not None and run is not None
+        if not cancel_enabled:
+            # Default off until the cancel path has run against the real
+            # repository (docs/autonomy-contract.md); the stall is still loud.
+            print(f"::error title=Release {tag} run stalled::{decision.reason}. "
+                  f"Not cancelling: repository variable {CANCEL_STALLED_ENV} is not 'true'")
+            return 1
+        return cancel_and_rerun(repo, tag, run, stall)
     if decision.action == "rerun" and not args.dry_run:
         try:
             _gh("api", "-X", "POST", f"repos/{repo}/actions/runs/{decision.run_id}/rerun-failed-jobs")

@@ -1190,10 +1190,28 @@ and every host's fleet-update refused it ("no acceptable build-provenance
 attestation"). If a release is stuck as a draft, rerun the failed
 `sign-and-upload-macos` job; do not publish it by hand without an attestation.
 This recovery is automatic: the `release-heal.yml` workflow (every main
-push and every 30 minutes) re-runs the failed jobs of the current version's
+push and every 10 minutes) re-runs the failed jobs of the current version's
 release run once it has been finished for 20 minutes, up to 3 attempts
 (`scripts/release_draft_heal.py`), and fails with the failing step names when
-attempts are exhausted. It never publishes by itself and does nothing unless
+attempts are exhausted. A run still in progress is cancelled (a normal cancel,
+so the keychain restore runs) and re-run, inside the same 3 attempts, when its
+current step has run longer than the largest of 20 minutes, 3x that step's
+median over the last 10 green release runs, and the step's own
+`timeout-minutes` plus 5; it comments on an open `release-blocked` issue.
+Cancelling needs the repository variable `RELEASE_HEAL_CANCEL_STALLED=true`;
+without it a stall only fails the heal run with the reason. Do not set it
+until one cancel has been exercised (RELEASING.md). Step limits are read from
+the run's own commit, a step with no known limit and no green history is never
+cancelled, and a later pass re-runs a heal cancel whose re-run never happened
+only when heal's intent and accepted marker commit comments name that exact
+run id, attempt and nonce.
+The signing step refuses binaries whose SHA-256 differs from the build step's.
+The macOS release build runs in its own step, "Build release binaries under a
+hard time limit" (`scripts/release_build_guard.py`): cargo stops after
+`SHIPYARD_RELEASE_BUILD_TIMEOUT_MINUTES` (20), with network retries and closed
+stdin, and a stall first writes the process tree, `lsof`, `sample` output, the
+last 200 lines and the keychain state to the `release-build-diagnostics-*`
+artifact (v0.464.0's build sat at 0% CPU for over an hour). It never publishes by itself and does nothing unless
 `CI_MACOS_SIGNING_ENABLED=true`. The Rust install in that job retries 3 times
 (a self-hosted runner that cannot reach static.rust-lang.org stranded v0.381.0
 and v0.383.0 as drafts).

@@ -21,6 +21,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import release_build_guard  # noqa: E402
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DIST_DIR = ROOT / "dist" / "release"
@@ -351,7 +354,17 @@ def build_release(cargo_target: str | None) -> None:
     ]
     if cargo_target:
         args.extend(["--target", cargo_target])
-    run(args)
+    # A hard wall-clock limit, cargo network retries and closed stdin; a stall
+    # writes diagnostics before the build is killed (scripts/release_build_guard.py).
+    diagnostics = os.environ.get(release_build_guard.DIAGNOSTICS_ENV)
+    release_build_guard.run_bounded(
+        release_build_guard.with_verbose(args),
+        cwd=ROOT,
+        timeout=release_build_guard.timeout_seconds(),
+        diagnostics_dir=Path(diagnostics) if diagnostics else ROOT / "dist" / "build-diagnostics",
+        redact=redact_text,
+        env=release_build_guard.build_env(),
+    )
 
 
 class LaunchGateFailed(SystemExit):
@@ -981,6 +994,37 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+BUILD_MANIFEST_ENV = "SHIPYARD_RELEASE_BUILD_MANIFEST"
+
+
+def write_build_manifest(manifest: Path, binaries: list[Path]) -> None:
+    """Record the SHA-256 of each built binary, keyed by file name."""
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{sha256(path)}  {path.name}" for path in binaries]
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"build manifest={manifest}")
+
+
+def verify_build_manifest(manifest: Path, binaries: list[Path]) -> None:
+    """Refuse to package a binary that is not byte-for-byte the one the build step recorded."""
+    if not manifest.is_file():
+        raise SystemExit(f"{BUILD_MANIFEST_ENV} is set but {manifest} does not exist; refusing to sign")
+    recorded: dict[str, str] = {}
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        digest, _, name = line.partition("  ")
+        if digest and name:
+            recorded[name] = digest
+    for path in binaries:
+        expected = recorded.get(path.name)
+        actual = sha256(path)
+        if expected != actual:
+            raise SystemExit(
+                f"{path} sha256 {actual} does not match the build step's "
+                f"{expected or 'missing entry'} in {manifest}; refusing to sign"
+            )
+        print(f"verified {path.name} sha256={actual} matches the build step")
+
+
 def write_checksums(output_dir: Path, artifact: Path) -> Path:
     checksums = output_dir / "checksums.sha256"
     existing = []
@@ -1012,6 +1056,20 @@ def package(args: argparse.Namespace) -> list[Path]:
     if args.notarize:
         require_commands(["security", "xcrun"])
 
+    if getattr(args, "build_only", False):
+        if args.skip_build or args.binary or args.companion_binary:
+            raise SystemExit("--build-only cannot be combined with --skip-build or --binary")
+        build_release(args.cargo_target)
+        built = [
+            default_binary_path(target, args.cargo_target),
+            default_binary_path(target, args.cargo_target, COMPANION_BIN_NAME),
+        ]
+        for path in built:
+            print(f"built {path} sha256={sha256(path)}")
+        if manifest := os.environ.get(BUILD_MANIFEST_ENV):
+            write_build_manifest(Path(manifest), built)
+        return []
+
     if not args.skip_build:
         build_release(args.cargo_target)
 
@@ -1023,6 +1081,9 @@ def package(args: argparse.Namespace) -> list[Path]:
         raise SystemExit(f"Built binary not found: {binary}")
     if not companion_binary.exists():
         raise SystemExit(f"Built companion binary not found: {companion_binary}")
+    if args.skip_build and (manifest := os.environ.get(BUILD_MANIFEST_ENV)):
+        # The binaries were built in an earlier CI step: sign exactly those.
+        verify_build_manifest(Path(manifest), [binary, companion_binary])
     expected_tag = None
     if args.version_must_match_tag:
         if args.no_smoke:
@@ -1116,6 +1177,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--companion-binary", type=Path, help="Use an already-built provider binary"
     )
     parser.add_argument("--skip-build", action="store_true", help="Do not run cargo build")
+    parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="Run only the bounded release build, so CI can time it apart from signing",
+    )
     parser.add_argument("--tag", help="Release tag label for output layout")
     parser.add_argument("--dist-dir", type=Path, default=DEFAULT_DIST_DIR)
     parser.add_argument("--artifact-prefix", default=BIN_NAME)
