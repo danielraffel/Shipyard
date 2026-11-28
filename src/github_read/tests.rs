@@ -1898,12 +1898,16 @@ fn a_filter_without_paginate_reads_one_page_like_gh() {
     ));
     assert!(success);
     let first_page = serde_json::from_str::<Value>(&recording.pages[0]).expect("page");
-    let expected = first_page
-        .as_array()
-        .expect("array")
-        .iter()
-        .map(|commit| format!("{}\n", commit["sha"].as_str().expect("sha")))
-        .collect::<String>();
+    let expected =
+        first_page
+            .as_array()
+            .expect("array")
+            .iter()
+            .fold(String::new(), |mut text, commit| {
+                text.push_str(commit["sha"].as_str().expect("sha"));
+                text.push('\n');
+                text
+            });
     assert_eq!(
         printed, expected,
         "page 1 only: no --paginate, no Link followed"
@@ -2072,7 +2076,10 @@ fn a_paged_read_revalidates_each_page_and_keeps_its_link() {
         first, second,
         "every page came back as a 304 and still chained"
     );
-    assert_eq!(second, recording.slurp, "all pages, joined from cached bodies");
+    assert_eq!(
+        second, recording.slurp,
+        "all pages, joined from cached bodies"
+    );
 }
 
 /// The steward's reads of one Vellum pass that took the `gh` path before, by
@@ -2080,6 +2087,7 @@ fn a_paged_read_revalidates_each_page_and_keeps_its_link() {
 /// m3, 2026-11-28 03:39Z, `api_calls.sites`; argv from the code named in each
 /// comment). Every one was `gh`; the in-process client now answers them all.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_representative_pass_moves_its_shaped_reads_in_process() {
     let record_jq = |kind: &str| {
         // head_approval.rs REVIEW_RECORD_JQ / COMMENT_RECORD_JQ.

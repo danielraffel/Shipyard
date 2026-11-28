@@ -207,7 +207,7 @@ struct EtagCache {
     order: VecDeque<(u64, String)>,
 }
 
-/// A body kept for a conditional re-read: its ETag, bytes and `Link` header.
+/// A body kept for a conditional re-read: its `ETag`, bytes and `Link` header.
 struct CachedBody {
     etag: String,
     body: Vec<u8>,

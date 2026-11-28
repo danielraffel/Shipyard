@@ -222,7 +222,7 @@ impl Parser {
     fn term(&mut self) -> Option<Expr> {
         self.skip_space();
         let (mut expr, suffixes) = self.primary()?;
-        while suffixes {
+        while suffixes && self.at < self.chars.len() {
             if self.starts_with(".") && !self.starts_with("..") {
                 self.at += 1;
                 expr = Expr::Field(Box::new(expr), self.ident()?);
@@ -533,6 +533,13 @@ fn eval(expr: &Expr, input: &Value) -> Result<Vec<Value>, Fail> {
                 found
             }
         }
+        other => eval_rest(other, input)?,
+    })
+}
+
+/// The expression forms that build or test values rather than walk paths.
+fn eval_rest(expr: &Expr, input: &Value) -> Result<Vec<Value>, Fail> {
+    Ok(match expr {
         Expr::Equals {
             left,
             right,
@@ -583,6 +590,13 @@ fn eval(expr: &Expr, input: &Value) -> Result<Vec<Value>, Fail> {
             }
             out
         }
+        Expr::Identity
+        | Expr::Literal(_)
+        | Expr::Field(..)
+        | Expr::Element(..)
+        | Expr::Iterate(_)
+        | Expr::Pipe(..)
+        | Expr::Alternative(..) => eval(expr, input)?,
     })
 }
 
@@ -592,8 +606,7 @@ fn print(value: &Value, out: &mut Vec<u8>) -> Result<(), Unsupported> {
         Value::String(text) => out.extend_from_slice(text.as_bytes()),
         Value::Null => {}
         Value::Bool(flag) => out.extend_from_slice(if *flag { b"true" } else { b"false" }),
-        Value::Number(_) => encode(value, out)?,
-        Value::Array(_) | Value::Object(_) => encode(value, out)?,
+        Value::Number(_) | Value::Array(_) | Value::Object(_) => encode(value, out)?,
     }
     out.push(b'\n');
     Ok(())
