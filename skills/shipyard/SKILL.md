@@ -4867,6 +4867,14 @@ and stop landings that never pass through `ghapp`
 reviewer (the steward reads that as waiting, not `required_failed`; nothing for
 the author to do) and `failure` only for a counted HOLD or an unreadable review.
 
+`shipyard reviewer-dispatch observe` counts a trusted exact-head APPROVE as a
+finished review only when the head's newest `review-verdict` status agrees: a
+status still older than the APPROVE has not judged it yet, and a `pending`
+status reading `awaiting reviewer acceptance of review items` means the
+APPROVE left a base's review item unaccepted. Either way the review is not
+done, so the reviewer is dispatched again. A head with no `review-verdict`
+status is judged as before; an unreadable status listing fails closed.
+
 A HOLD makes its head un-approvable, so posting an APPROVE of a held head
 only makes the pull request look approved. The managed
 `verdict-contradiction-guard` refuses that APPROVE before it posts (same

@@ -201,7 +201,7 @@ fn authenticated_verdict(
         .clone()
         .unwrap_or_else(|| verdict.head.clone());
     let approval_at = direct_approval_time(&run_gh, args, &verdict)?;
-    let trusted = verdict.required
+    let mut trusted = verdict.required
         && verdict.allowed()
         && verdict
             .approval
@@ -209,6 +209,12 @@ fn authenticated_verdict(
             .is_some_and(|approval| direct_exact_approval(approval, &args.reviewer))
         && live_head.eq_ignore_ascii_case(&args.head)
         && approval_at.is_some();
+    if trusted && let Some(posted_at) = approval_at {
+        // `crate::review_verdict` does not read a base's review items; the
+        // `review-verdict` status does. An APPROVE that leaves an item
+        // unaccepted is a review not done, so the reviewer is dispatched again.
+        trusted = !status_withholds_review(&run_gh, &args.repo, &args.head, posted_at)?;
+    }
     let observed_verdict = approval_at.and_then(|posted_at| {
         trusted.then(|| ObservedVerdict::trusted_exact_head(verdict.head, posted_at))
     });
@@ -303,6 +309,72 @@ fn direct_approval_time(
     Ok(latest_comment_at)
 }
 
+/// The `review-verdict` status's description while an APPROVE leaves review
+/// items unaccepted (`scripts/review_verdict_status.py` `awaiting_description`).
+const UNACCEPTED_ITEMS_PREFIX: &str = "awaiting reviewer acceptance of review items";
+const REVIEW_VERDICT_CONTEXT: &str = "review-verdict";
+
+/// Whether the head's newest `review-verdict` status says the APPROVE posted
+/// at `approval_at` does not finish the review: it is `pending` awaiting
+/// acceptance of review items, or it predates the APPROVE (the status has
+/// not judged it yet, and the next observation reads its answer). A head with
+/// no `review-verdict` status at all is unchanged: nothing withholds it.
+fn status_withholds_review(
+    run_gh: &dyn Fn(&[String]) -> Result<String, String>,
+    repo: &str,
+    head: &str,
+    approval_at: DateTime<Utc>,
+) -> Result<bool, CliFailure> {
+    let rows = run_gh(&[
+        "api".to_owned(),
+        "--paginate".to_owned(),
+        format!("repos/{repo}/commits/{head}/statuses?per_page=100"),
+        "--jq".to_owned(),
+        ".[] | {context: .context, state: .state, description: .description, \
+         created_at: .created_at}"
+            .to_owned(),
+    ])
+    .map_err(|error| {
+        CliFailure::new(
+            2,
+            format!("review-verdict status observation failed: {error}"),
+        )
+    })?;
+    let mut newest: Option<(DateTime<Utc>, String, String)> = None;
+    for row in rows.lines().filter(|line| !line.trim().is_empty()) {
+        let row: Value = serde_json::from_str(row).map_err(|error| {
+            CliFailure::new(
+                2,
+                format!("malformed review-verdict status observation: {error}"),
+            )
+        })?;
+        if row.get("context").and_then(Value::as_str) != Some(REVIEW_VERDICT_CONTEXT) {
+            continue;
+        }
+        let at = row
+            .get("created_at")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CliFailure::new(2, "a review-verdict status carries no created_at"))?;
+        let at = parse_time("review-verdict status created_at", at)?;
+        let state = row
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let description = row
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if newest.as_ref().is_none_or(|(current, _, _)| at >= *current) {
+            newest = Some((at, state, description));
+        }
+    }
+    Ok(newest.is_some_and(|(at, state, description)| {
+        at < approval_at || (state == "pending" && description.starts_with(UNACCEPTED_ITEMS_PREFIX))
+    }))
+}
+
 fn direct_exact_approval(approval: &Approval, reviewer: &str) -> bool {
     match approval {
         Approval::Review { login, .. } | Approval::Marker { login, .. } => {
@@ -380,6 +452,117 @@ mod tests {
             error: None,
             store: Some(store.to_owned()),
         }
+    }
+
+    fn statuses(rows: &[(&str, &str, &str, &str)]) -> String {
+        rows.iter()
+            .map(|(context, state, description, at)| {
+                serde_json::json!({"context": context, "state": state,
+                                   "description": description, "created_at": at})
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn withholds(answer: &Result<String, String>) -> Result<bool, CliFailure> {
+        let approval_at = parse_time("approval", "2026-11-27T10:00:00Z").unwrap();
+        let run_gh = |gh_args: &[String]| {
+            assert!(gh_args.iter().any(|arg| arg
+                == &format!(
+                    "repos/owner/repo/commits/{}/statuses?per_page=100",
+                    "a".repeat(40)
+                )));
+            answer.clone()
+        };
+        status_withholds_review(&run_gh, "owner/repo", &"a".repeat(40), approval_at)
+    }
+
+    #[test]
+    fn an_approve_leaving_review_items_unaccepted_is_not_a_finished_review() {
+        let unaccepted = "awaiting reviewer acceptance of review items: hotspot:docs/x.json";
+        assert!(
+            withholds(&Ok(statuses(&[(
+                "review-verdict",
+                "pending",
+                unaccepted,
+                "2026-11-27T10:00:30Z"
+            )])))
+            .unwrap()
+        );
+        // Only the newest review-verdict status decides: a later success
+        // (a new APPROVE that accepts every item) finishes it.
+        assert!(
+            !withholds(&Ok(statuses(&[
+                (
+                    "review-verdict",
+                    "pending",
+                    unaccepted,
+                    "2026-11-27T10:00:30Z"
+                ),
+                (
+                    "review-verdict",
+                    "success",
+                    "approved: ...",
+                    "2026-11-27T10:01:00Z"
+                ),
+            ])))
+            .unwrap()
+        );
+        // Another context with the same text withholds nothing.
+        assert!(
+            !withholds(&Ok(statuses(&[
+                ("other", "pending", unaccepted, "2026-11-27T10:00:30Z"),
+                (
+                    "review-verdict",
+                    "success",
+                    "approved: ...",
+                    "2026-11-27T10:00:20Z"
+                ),
+            ])))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_status_older_than_the_approve_has_not_judged_it_yet() {
+        assert!(
+            withholds(&Ok(statuses(&[(
+                "review-verdict",
+                "success",
+                "approved: ...",
+                "2026-11-27T09:59:00Z"
+            )])))
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn other_pending_states_and_no_status_are_unchanged() {
+        assert!(
+            !withholds(&Ok(statuses(&[(
+                "review-verdict",
+                "pending",
+                "awaiting reviewer verdict for head aaaaaaaaaaaa",
+                "2026-11-27T10:00:30Z"
+            )])))
+            .unwrap()
+        );
+        assert!(!withholds(&Ok(String::new())).unwrap());
+    }
+
+    #[test]
+    fn an_unreadable_status_listing_fails_closed() {
+        assert_eq!(withholds(&Err("HTTP 502".to_owned())).unwrap_err().code, 2);
+        assert_eq!(withholds(&Ok("{not json".to_owned())).unwrap_err().code, 2);
+        assert_eq!(
+            withholds(&Ok(
+                r#"{"context":"review-verdict","state":"pending"}"#.to_owned()
+            ))
+            .unwrap_err()
+            .code,
+            2
+        );
     }
 
     #[test]
