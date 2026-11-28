@@ -2558,8 +2558,15 @@ class ApprovalVoidOnBaseChange(unittest.TestCase):
                 changes = guard.base_changes(case["answer"])
                 records = [self.record(entry) for entry in case["records"]]
                 kept = [record for _, record in records]
-                if changes:
-                    floor = guard._aware(changes[-1]["at"])
+
+                def safe(change: dict[str, Any], case: dict[str, Any] = case) -> bool:
+                    parent = (case.get("parents") or {}).get(change["from"])
+                    return (parent is not None
+                            and guard.merged_parent_head(parent["answer"], change) is not None
+                            and guard.ancestor_status(parent["compare"]))
+                floor_change = guard.floor_change(changes, safe)
+                if floor_change is not None:
+                    floor = guard._aware(floor_change["at"])
                     kept = []
                     for review, record in records:
                         kept += guard._approvals_through([record], review, floor)[0]
@@ -2570,12 +2577,14 @@ class ApprovalVoidOnBaseChange(unittest.TestCase):
             encoding="utf-8")
         rust = source.split('pub const BASE_CHANGE_QUERY: &str = "', 1)[1].split('";', 1)[0]
         self.assertEqual(rust, guard.BASE_CHANGE_QUERY)
+        parent = source.split('pub const MERGED_PARENT_QUERY: &str = "', 1)[1].split('";', 1)[0]
+        self.assertEqual(parent, guard.MERGED_PARENT_QUERY)
 
     def void_of(self, comments: list[dict[str, Any]], answer: Any) -> Any:
         policy = guard.review_policy(None, "danielraffel/Shipyard", True)
         with mock.patch.object(guard, "graphql", return_value=answer) as read:
             result = guard.without_voided_approvals(
-                "danielraffel/Shipyard", 7, "someone", comments, [], policy)
+                "danielraffel/Shipyard", 7, "a" * 40, "someone", comments, [], policy)
         return result, read.call_count
 
     def test_no_approve_reads_no_timeline(self) -> None:
@@ -3611,6 +3620,42 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.arm(784, "danielraffel/Shipyard", self.approved_784())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("BASE_REF_CHANGED_EVENT", self.calls())
+
+    def auto_retarget(self, merged: list[str], compare: dict[str, Any]
+                      ) -> list[tuple[str, dict[str, Any]]]:
+        # GitHub retargeted the child at 16:00 once its parent merged.
+        timeline = retargeted("2026-10-12T16:00:00Z")
+        timeline["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"] = [
+            {"__typename": "AutomaticBaseChangeSucceededEvent", "createdAt": "2026-10-12T16:00:00Z",
+             "oldBase": "parent", "newBase": "main"}]
+        nodes = [{"number": 40 + index, "mergedAt": at, "headRefOid": "b" * 40}
+                 for index, at in enumerate(merged)]
+        return self.approved_784(extra=[
+            ("BASE_REF_CHANGED_EVENT", {"json": timeline}),
+            ("pullRequests(headRefName", {"json": {"data": {"repository": {"pullRequests": {
+                "totalCount": len(nodes), "nodes": nodes}}}}}),
+            (f"compare/{'b' * 40}...{HEAD_784}", compare)])
+
+    def test_an_auto_retarget_onto_a_merged_ancestor_parent_keeps_the_approval(self) -> None:
+        for status in ("ahead", "identical"):
+            with self.subTest(status=status):
+                result = self.arm(784, "danielraffel/Shipyard", self.auto_retarget(
+                    ["2026-10-12T15:59:58Z"], {"json": {"status": status}}))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("pullRequests(headRefName", self.calls())
+
+    def test_an_auto_retarget_that_is_not_provably_safe_voids(self) -> None:
+        one = ["2026-10-12T15:59:58Z"]
+        for merged, compare in ((one, {"json": {"status": "diverged"}}),
+                                (one, {"error": "gh: HTTP 502"}),
+                                (["2026-10-11T10:00:00Z", "2026-10-12T15:59:58Z"],
+                                 {"json": {"status": "ahead"}}),
+                                (["2026-10-12T17:00:00Z"], {"json": {"status": "ahead"}}),
+                                ([], {"json": {"status": "ahead"}})):
+            with self.subTest(merged=merged, compare=compare):
+                result = self.arm(784, "danielraffel/Shipyard", self.auto_retarget(merged, compare))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("approval_void:base_changed", result.stderr)
 
     def test_an_incomplete_timeline_fails_closed(self) -> None:
         further = retargeted("2026-10-12T15:00:00Z")

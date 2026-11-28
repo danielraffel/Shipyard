@@ -911,9 +911,12 @@ queue-arm guard's `review_gate`, rollup members included, and the
 `review-verdict` status through that guard) reads the pull request's
 `BaseRefChangedEvent` and `AutomaticBaseChangeSucceededEvent` timeline
 (`BASE_CHANGE_QUERY`, byte-equal in both) and leaves out every APPROVE posted
-at or before the latest base change. GitHub's own retarget after a stacked
-parent merges counts too, so a stacked child needs a fresh verdict once its
-parent lands. HOLDs are never dropped. When that leaves the head unapproved
+at or before the newest base change that is not provably safe. A manual
+retarget always voids. GitHub's own retarget after a stacked parent merges
+keeps the approval only when exactly one pull request from the old base into
+the new base merged before it and its final head is an ancestor of, or equal
+to, the child's head (`MERGED_PARENT_QUERY`, then compare `ahead` or
+`identical`); anything unreadable or ambiguous voids. HOLDs are never dropped. When that leaves the head unapproved
 the steward reports `approval_void:base_changed` with the next action
 "re-review against the new base", and the status reads `pending`. An
 incomplete timeline (errors, a further page, a count that does not match its

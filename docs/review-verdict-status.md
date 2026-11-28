@@ -197,7 +197,12 @@ retargeted to the default branch with the same head, that APPROVE would land
 the parent's commits. The guard reads the pull request's base changes
 (`BaseRefChangedEvent`, and `AutomaticBaseChangeSucceededEvent` for GitHub's
 own retarget after a parent merges) and leaves out every APPROVE posted at or
-before the latest one. If that leaves the head unapproved the status is
+before the newest change that is not provably safe. A manual retarget is never
+safe. GitHub's own retarget is safe only when exactly one pull request from
+the old base into the new base merged before it and that pull request's final
+head is an ancestor of, or equal to, the child's head (compare `ahead` or
+`identical`): then the approved diff is exactly the child's own content on top
+of what landed. Anything unreadable or ambiguous voids. If that leaves the head unapproved the status is
 `pending` (cause `approval_void`, "re-review against the new base"); a new
 verdict posted after the change counts as usual. A timeline it cannot read in
 full is `failure`, never "no change". The Rust gate

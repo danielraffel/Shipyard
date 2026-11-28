@@ -13,10 +13,17 @@
 //! Base changes come from the pull request's GraphQL timeline:
 //! `BaseRefChangedEvent` (a retarget by hand or through the API) and
 //! `AutomaticBaseChangeSucceededEvent` (GitHub retargeting a stacked child
-//! after its parent merged and the parent's branch was deleted). Both void:
-//! the child may carry the parent's commits at a head other than the one that
-//! merged, so the approved diff is not the diff that would land. A stacked
-//! child therefore needs a fresh verdict after its parent lands.
+//! after its parent merged and the parent's branch was deleted). A manual
+//! change always voids. An automatic one voids too, because the child may
+//! carry the parent's commits at a head other than the one that merged,
+//! unless it is provably safe ([`automatic_change_safe`]): exactly one PR
+//! from the old base into the new base merged before the event, and its
+//! final head is an ancestor of (or equal to) the child's head (compare
+//! status `ahead` or `identical`). Then the diff the reviewer approved,
+//! against the parent's head, is exactly the child's own content on top of
+//! what landed, so the approval keeps counting across that change. Anything
+//! unreadable or ambiguous voids. The floor is the newest change that is not
+//! safe.
 //!
 //! The read is needed only when some APPROVE record exists, and it fails
 //! closed: an answer with errors, a further page, a count that does not match
@@ -35,6 +42,10 @@ use super::{RunGh, Verdict, at, marker_verdict};
 /// The timeline read. Kept byte-equal to `BASE_CHANGE_QUERY` in
 /// `scripts/ghapp_queue_arm_guard.py` (a test reads both).
 pub const BASE_CHANGE_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){baseRefName timelineItems(itemTypes:[BASE_REF_CHANGED_EVENT,AUTOMATIC_BASE_CHANGE_SUCCEEDED_EVENT],first:100){filteredCount pageInfo{hasNextPage} nodes{__typename ... on BaseRefChangedEvent{createdAt previousRefName currentRefName} ... on AutomaticBaseChangeSucceededEvent{createdAt oldBase newBase}}}}}}";
+
+/// The merged parent read for an automatic change. Kept byte-equal to
+/// `MERGED_PARENT_QUERY` in `scripts/ghapp_queue_arm_guard.py`.
+pub const MERGED_PARENT_QUERY: &str = "query($owner:String!,$name:String!,$head:String!,$base:String!){repository(owner:$owner,name:$name){pullRequests(headRefName:$head,baseRefName:$base,states:[MERGED],first:20){totalCount nodes{number mergedAt headRefOid}}}}";
 
 /// A [`BASE_CHANGE_QUERY`] answer with no base change, for test fakes.
 #[cfg(test)]
@@ -213,21 +224,117 @@ pub(super) fn without_approvals_through(
         .partition(|record| !is_approval(record) || at(record).is_some_and(|when| when > floor))
 }
 
+/// The final head of the one parent pull request whose merge made GitHub
+/// retarget `change` (head branch `change.from`, into `change.to`, merged at
+/// or before the change), from a [`MERGED_PARENT_QUERY`] answer. `None` when
+/// the answer has errors, is incomplete or malformed, or names no such pull
+/// request or several.
+#[must_use]
+pub fn merged_parent_head(answer: &Value, change: &BaseChange) -> Option<String> {
+    if answer.get("errors").is_some_and(|errors| !errors.is_null()) {
+        return None;
+    }
+    let pulls = answer.pointer("/data/repository/pullRequests")?;
+    let nodes = pulls.get("nodes")?.as_array()?;
+    if pulls.get("totalCount")?.as_u64()? != nodes.len() as u64 {
+        return None;
+    }
+    let event = DateTime::parse_from_rfc3339(&change.at).ok()?;
+    let mut candidates = Vec::new();
+    for node in nodes {
+        let merged = DateTime::parse_from_rfc3339(node.get("mergedAt")?.as_str()?).ok()?;
+        let head = node
+            .get("headRefOid")?
+            .as_str()
+            .filter(|head| super::is_api_sha(head))?;
+        if merged <= event {
+            candidates.push(head.to_ascii_lowercase());
+        }
+    }
+    match candidates.as_slice() {
+        [head] => Some(head.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a compare status of `parent...child` proves the parent's head is
+/// an ancestor of, or equal to, the child's head.
+#[must_use]
+pub fn ancestor_status(status: &str) -> bool {
+    matches!(status, "ahead" | "identical")
+}
+
+/// The newest change in `changes` that is not `safe`: the floor approvals
+/// must be newer than. A manual change is never safe.
+pub fn floor_change(
+    changes: &[BaseChange],
+    mut safe: impl FnMut(&BaseChange) -> bool,
+) -> Option<BaseChange> {
+    changes
+        .iter()
+        .rev()
+        .find(|change| !(change.automatic && safe(change)))
+        .cloned()
+}
+
+/// Whether the automatic `change` is provably safe for a child at `head`
+/// ([`merged_parent_head`], then `compare` [`ancestor_status`]). Any read
+/// that fails is not safe.
+pub fn automatic_change_safe(
+    run_gh: RunGh<'_>,
+    repo: &str,
+    head: &str,
+    change: &BaseChange,
+) -> bool {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return false;
+    };
+    let answer = run_gh(&[
+        "api".to_owned(),
+        "graphql".to_owned(),
+        "-f".to_owned(),
+        format!("query={MERGED_PARENT_QUERY}"),
+        "-f".to_owned(),
+        format!("owner={owner}"),
+        "-f".to_owned(),
+        format!("name={name}"),
+        "-f".to_owned(),
+        format!("head={}", change.from),
+        "-f".to_owned(),
+        format!("base={}", change.to),
+    ])
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(raw.trim()).ok());
+    let Some(parent) = answer.and_then(|answer| merged_parent_head(&answer, change)) else {
+        return false;
+    };
+    run_gh(&[
+        "api".to_owned(),
+        format!("repos/{repo}/compare/{parent}...{head}"),
+        "--jq".to_owned(),
+        ".status".to_owned(),
+    ])
+    .is_ok_and(|status| ancestor_status(status.trim()))
+}
+
 /// Reviews, comments, and the base change that voided an approval.
 pub(super) type Judged = (Vec<Value>, Vec<Value>, Option<BaseChange>);
 
 /// `(reviews, comments, voided)`: the records without every APPROVE posted
-/// at or before `repo#pr`'s latest base change, and that change when a
+/// at or before `repo#pr`'s newest base change that is not provably safe
+/// ([`floor_change`]), and that change when a
 /// counting APPROVE was among those dropped. The timeline is read only when
 /// some APPROVE exists.
 ///
 /// # Errors
 ///
 /// When the timeline cannot be read in full ([`base_changes`]).
+#[allow(clippy::too_many_arguments)] // The gate's records and identity, as `evaluate_events`.
 pub(super) fn void_approvals(
     run_gh: RunGh<'_>,
     repo: &str,
     pr: u64,
+    head: &str,
     reviews: Vec<Value>,
     comments: Vec<Value>,
     policy: &super::ApprovalPolicy,
@@ -236,10 +343,11 @@ pub(super) fn void_approvals(
     if !reviews.iter().chain(&comments).any(is_approval) {
         return Ok((reviews, comments, None));
     }
-    let Some(change) = read_base_changes(run_gh, repo, pr)
-        .map_err(|error| format!("PR #{pr}'s base changes are unreadable: {error}"))?
-        .pop()
-    else {
+    let changes = read_base_changes(run_gh, repo, pr)
+        .map_err(|error| format!("PR #{pr}'s base changes are unreadable: {error}"))?;
+    let Some(change) = floor_change(&changes, |change| {
+        automatic_change_safe(run_gh, repo, head, change)
+    }) else {
         return Ok((reviews, comments, None));
     };
     let (reviews, mut dropped) = without_approvals_through(reviews, &change);

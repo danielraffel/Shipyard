@@ -1,5 +1,5 @@
 {
- "_comment": "Shared by src/head_approval/base_change_tests.rs and scripts/test_ghapp_queue_arm_guard.py: both sides must judge every case the same.",
+ "_comment": "Shared by src/head_approval/base_change_tests.rs and scripts/test_ghapp_queue_arm_guard.py: both sides must judge every case the same. `parents` answers the merged-parent read per old base (answer, and the compare status of parent...child, null when unreadable); a missing entry is unreadable.",
  "cases": [
   {
    "name": "no_base_change_keeps_every_approval",
@@ -561,6 +561,638 @@
     }
    ],
    "error": true
+  },
+  {
+   "name": "an_auto_retarget_whose_merged_parent_head_is_an_ancestor_keeps_the_approval",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 1,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-20T10:59:58Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": "ahead"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 2,
+     "kind": "review",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    1,
+    2
+   ]
+  },
+  {
+   "name": "an_auto_retarget_onto_the_identical_parent_head_keeps_the_approval",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 1,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-20T11:00:00Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": "identical"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    1
+   ]
+  },
+  {
+   "name": "an_auto_retarget_whose_parent_head_is_not_an_ancestor_voids",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 1,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-20T10:59:58Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": "diverged"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "an_auto_retarget_whose_parent_is_unreadable_voids",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "errors": [
+       {
+        "message": "rate limited"
+       }
+      ],
+      "data": null
+     },
+     "compare": "ahead"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "an_auto_retarget_whose_compare_is_unreadable_voids",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 1,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-20T10:59:58Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": null
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "an_auto_retarget_with_several_candidate_parents_voids",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 2,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-19T10:00:00Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          },
+          {
+           "number": 42,
+           "mergedAt": "2026-11-20T10:59:58Z",
+           "headRefOid": "cccccccccccccccccccccccccccccccccccccccc"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": "ahead"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "an_auto_retarget_whose_parent_merged_after_it_voids",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 1,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-20T12:00:00Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": "ahead"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "an_auto_retarget_with_no_merged_parent_voids",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 0,
+         "nodes": []
+        }
+       }
+      }
+     },
+     "compare": "ahead"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "an_incomplete_parent_list_voids",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 2,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-20T10:59:58Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": "ahead"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "a_manual_retarget_voids_even_with_a_merged_ancestor_parent",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 1,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T11:00:00Z",
+          "previousRefName": "parent",
+          "currentRefName": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 1,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-20T10:59:58Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": "ahead"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T10:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": []
+  },
+  {
+   "name": "a_safe_auto_retarget_falls_back_to_the_earlier_manual_change",
+   "answer": {
+    "data": {
+     "repository": {
+      "pullRequest": {
+       "baseRefName": "main",
+       "timelineItems": {
+        "filteredCount": 2,
+        "pageInfo": {
+         "hasNextPage": false
+        },
+        "nodes": [
+         {
+          "__typename": "BaseRefChangedEvent",
+          "createdAt": "2026-11-20T10:00:00Z",
+          "previousRefName": "main",
+          "currentRefName": "parent"
+         },
+         {
+          "__typename": "AutomaticBaseChangeSucceededEvent",
+          "createdAt": "2026-11-20T12:00:00Z",
+          "oldBase": "parent",
+          "newBase": "main"
+         }
+        ]
+       }
+      }
+     }
+    }
+   },
+   "parents": {
+    "parent": {
+     "answer": {
+      "data": {
+       "repository": {
+        "pullRequests": {
+         "totalCount": 1,
+         "nodes": [
+          {
+           "number": 41,
+           "mergedAt": "2026-11-20T11:59:00Z",
+           "headRefOid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          }
+         ]
+        }
+       }
+      }
+     },
+     "compare": "ahead"
+    }
+   },
+   "records": [
+    {
+     "id": 1,
+     "kind": "comment",
+     "at": "2026-11-20T09:00:00Z",
+     "verdict": "APPROVE"
+    },
+    {
+     "id": 2,
+     "kind": "comment",
+     "at": "2026-11-20T11:00:00Z",
+     "verdict": "APPROVE"
+    }
+   ],
+   "kept": [
+    2
+   ]
   }
  ]
 }

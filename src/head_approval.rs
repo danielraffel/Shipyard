@@ -3094,7 +3094,7 @@ fn evaluate_events_by_source(
     let (judged_reviews, judged_comments) = (reviews.clone(), comments.clone());
     // An approval counts only for the base it was given against.
     let (reviews, comments, voided) =
-        base_change::void_approvals(run_gh, repo, pr, reviews, comments, policy, author)?;
+        base_change::void_approvals(run_gh, repo, pr, head, reviews, comments, policy, author)?;
     let gate = decide_for_author(policy, head, &reviews, &comments, queue, false, author);
     let carry = CarryInput {
         repo,
