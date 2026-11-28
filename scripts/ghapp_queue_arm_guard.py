@@ -2539,7 +2539,8 @@ def member_review(repo: str, number: int, head: str, policy: dict[str, Any],
     comments, reviews = verdict_listing(repo, number)
     # The same base-change rule as any landing (`without_voided_approvals`).
     comments, reviews, _ = without_voided_approvals(
-        repo, number, head, author, comments, reviews, policy)
+        repo, number, head, author, comments, reviews, policy,
+        (pull.get("base") or {}).get("ref"))
     allowed, why = review_verdict(head, author, comments, reviews, policy)
     approved = head
     if not allowed:
@@ -3780,11 +3781,20 @@ def base_changes(answer: Any) -> list[dict[str, Any]]:
     return [change for _, change in changes]
 
 
-def read_base_changes(repo: str, number: int) -> list[dict[str, Any]]:
-    """``repo#number``'s base changes (``base_changes``), or ``GuardError``."""
+def read_base_changes(repo: str, number: int, base: str | None = None) -> list[dict[str, Any]]:
+    """``repo#number``'s base changes (``base_changes``), or ``GuardError``.
+
+    ``base`` is the base the caller already checked: a timeline whose current
+    base (and so its latest change's new base) is another one means the pull
+    request was retargeted while the guard read it, and is refused."""
     owner, name = split_repo(repo)
-    return base_changes(graphql(BASE_CHANGE_QUERY,
-                                {"owner": owner, "name": name, "number": str(number)}))
+    answer = graphql(BASE_CHANGE_QUERY, {"owner": owner, "name": name, "number": str(number)})
+    changes = base_changes(answer)
+    current = answer["data"]["repository"]["pullRequest"]["baseRefName"]
+    if base is not None and current != base:
+        raise GuardError(f"its base moved while the guard read it ({base} -> {current}); "
+                         "read it again")
+    return changes
 
 
 def describe_base_change(change: dict[str, Any]) -> str:
@@ -3817,17 +3827,18 @@ def _approvals_through(records: list[dict[str, Any]], review: bool,
 
 def without_voided_approvals(
     repo: str, number: int, head: str, author: str | None, comments: list[dict[str, Any]],
-    reviews: list[dict[str, Any]], policy: dict[str, Any],
+    reviews: list[dict[str, Any]], policy: dict[str, Any], base: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
     """``(comments, reviews, void)``: the records without every APPROVE posted
     at or before the pull request's latest base change, and that change when
     a counting APPROVE of ``head`` was dropped. The timeline is read only when some
-    APPROVE exists; ``GuardError`` when it cannot be read in full. Same as
+    APPROVE exists; ``GuardError`` when it cannot be read in full, or when its
+    current base is not ``base``, the base the caller checked. Same as
     src/head_approval.rs ``evaluate_events_by_source``."""
     if not (any(_is_approval(c, False) for c in comments)
             or any(_is_approval(r, True) for r in reviews)):
         return comments, reviews, None
-    changes = read_base_changes(repo, number)
+    changes = read_base_changes(repo, number, base)
     if not changes:
         return comments, reviews, None
     change = changes[-1]
@@ -4001,7 +4012,7 @@ def _review_gate(classification: dict[str, Any], repo: str | None, dry_run: bool
         return admitted
     try:
         comments, reviews, void = without_voided_approvals(
-            repo, number, head, author, comments, reviews, policy)
+            repo, number, head, author, comments, reviews, policy, base)
     except GuardError as error:
         return False, (
             f"{label}: cannot read its base changes ({error}); refusing to land it unreviewed"

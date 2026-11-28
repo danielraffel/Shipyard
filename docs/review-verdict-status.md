@@ -204,7 +204,8 @@ diffed against. A sound exception would need that base oid, which the verdict
 line could carry later. If that leaves the head unapproved the status is
 `pending` (cause `approval_void`, "re-review against the new base"); a new
 verdict posted after the change counts as usual. A timeline it cannot read in
-full is `failure`, never "no change". The Rust gate
+full is `failure`, never "no change". So is a timeline whose current base is not the base the guard
+checked: the pull request was retargeted while the guard read it. The Rust gate
 (`src/head_approval/base_change.rs`) applies the same rule, so the steward
 reports `approval_void:base_changed` when a voided APPROVE named the current
 head (otherwise the normal awaiting-review token). Guard mode

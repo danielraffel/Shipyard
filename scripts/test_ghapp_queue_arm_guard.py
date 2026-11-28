@@ -88,6 +88,20 @@ def recent(minutes_ago: int) -> str:
     return at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# Defined before any test class: running this file directly calls
+# unittest.main() part-way down, before later module code runs.
+NO_BASE_CHANGES = {"data": {"repository": {"pullRequest": {"baseRefName": "main", "timelineItems": {
+    "filteredCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}}}}}
+
+
+def retargeted(at: str) -> dict[str, Any]:
+    """A base-change timeline: retargeted from ``parent`` to ``main`` at ``at``."""
+    return {"data": {"repository": {"pullRequest": {"baseRefName": "main", "timelineItems": {
+        "filteredCount": 1, "pageInfo": {"hasNextPage": False}, "nodes": [
+            {"__typename": "BaseRefChangedEvent", "createdAt": at,
+             "previousRefName": "parent", "currentRefName": "main"}]}}}}}
+
+
 def review_fixture(name: str) -> Any:
     return json.loads((FIXTURES / "review_before_arm" / name).read_text(encoding="utf-8"))
 
@@ -2591,18 +2605,6 @@ if __name__ == "__main__":
 REMOVAL = SCRIPT.with_name("ghapp_queue_removal_guard.py")
 
 
-NO_BASE_CHANGES = {"data": {"repository": {"pullRequest": {"baseRefName": "main", "timelineItems": {
-    "filteredCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}}}}}
-
-
-def retargeted(at: str) -> dict[str, Any]:
-    """A base-change timeline: retargeted from ``parent`` to ``main`` at ``at``."""
-    return {"data": {"repository": {"pullRequest": {"baseRefName": "main", "timelineItems": {
-        "filteredCount": 1, "pageInfo": {"hasNextPage": False}, "nodes": [
-            {"__typename": "BaseRefChangedEvent", "createdAt": at,
-             "previousRefName": "parent", "currentRefName": "main"}]}}}}}
-
-
 def opened(graphql_response: dict[str, Any]) -> dict[str, Any]:
     """A merged pull request's captured response, as it read while open."""
     response = copy.deepcopy(graphql_response)
@@ -3611,6 +3613,19 @@ class ReviewBeforeArm(unittest.TestCase):
         result = self.arm(784, "danielraffel/Shipyard", self.approved_784())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("BASE_REF_CHANGED_EVENT", self.calls())
+
+    def test_a_retarget_while_the_guard_reads_is_refused(self) -> None:
+        # The guard read the pull request into main, then the author retargeted
+        # it to `release` before the timeline read; an APPROVE posted after
+        # that retarget would otherwise count for a base the guard never checked.
+        moved = retargeted("2026-10-12T15:00:00Z")
+        pull = moved["data"]["repository"]["pullRequest"]
+        pull["baseRefName"] = "release"
+        pull["timelineItems"]["nodes"][0].update(previousRefName="main", currentRefName="release")
+        result = self.arm(784, "danielraffel/Shipyard", self.approved_784(
+            extra=[("BASE_REF_CHANGED_EVENT", {"json": moved})]))
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("its base moved while the guard read it (main -> release)", result.stderr)
 
     def test_an_automatic_retarget_after_the_approval_voids_it(self) -> None:
         # GitHub retargeted the child at 16:00 once its parent merged. The
