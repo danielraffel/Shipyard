@@ -2320,7 +2320,7 @@ fn paginate_asks_for_100_per_page_unless_the_query_names_a_size() {
     assert_eq!(get("repos/o/r/things?x=1", false), "repos/o/r/things?x=1");
 }
 
-/// Page 1 keeps its ETag while a page 2 appears behind it. A 304 on page 1
+/// Page 1 keeps its `ETag` while a page 2 appears behind it. A 304 on page 1
 /// must not end the listing.
 #[test]
 fn a_new_page_behind_an_unchanged_one_is_not_missed() {
