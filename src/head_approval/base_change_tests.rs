@@ -188,6 +188,7 @@ fn a_retarget_before_the_approval_leaves_it_counting() {
     )
     .expect("readable");
     assert!(gate.allows(), "{gate:?}");
+    assert_eq!(reads.get(), 1, "the decision read the timeline");
     assert_eq!(blocker, None);
     // A re-review after the change clears the void.
     let comments = [
@@ -201,6 +202,7 @@ fn a_retarget_before_the_approval_leaves_it_counting() {
     )
     .expect("readable");
     assert!(gate.allows(), "{gate:?}");
+    assert_eq!(reads.get(), 2, "each decision read the timeline");
 }
 
 /// No base change: the approval counts exactly as before, and a pull request

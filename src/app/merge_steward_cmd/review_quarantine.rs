@@ -34,7 +34,7 @@ fn waits_on_reviewer(report: &PrReport, policy: &StewardPolicy) -> bool {
     let token = report.blocked.blocked_on.as_str();
     let kind = token.split_once(':').map_or(token, |(kind, _)| kind);
     match kind {
-        "no_verdict" | "awaiting_review" | "waiting_head_approval" => true,
+        "no_verdict" | "awaiting_review" | "waiting_head_approval" | "approval_void" => true,
         // The approval status is `pending` while the head awaits its
         // reviewer: only when it is the sole pending context.
         "required_pending" => {

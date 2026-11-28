@@ -183,6 +183,7 @@ fn needs(input: &RankInput, tier: Tier) -> String {
             "required_pending" => "required checks to finish",
             "capacity_queued" => "a runner for the queued required checks",
             "no_verdict" => "an exact-head review verdict",
+            "approval_void" => "a re-review against the new base",
             "ejected_same_head" => "a new head",
             _ => "see next_action",
         },

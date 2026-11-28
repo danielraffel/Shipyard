@@ -3610,6 +3610,7 @@ class ReviewBeforeArm(unittest.TestCase):
     def test_no_retarget_leaves_it_counting(self) -> None:
         result = self.arm(784, "danielraffel/Shipyard", self.approved_784())
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("BASE_REF_CHANGED_EVENT", self.calls())
 
     def test_an_incomplete_timeline_fails_closed(self) -> None:
         further = retargeted("2026-10-12T15:00:00Z")

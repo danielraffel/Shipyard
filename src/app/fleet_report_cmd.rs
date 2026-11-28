@@ -127,6 +127,7 @@ fn count_rows(rows: &[Value], overdue: &BTreeSet<u64>) -> Value {
         "waiting_review": count(&|row| {
             matches!(row.get("tier").and_then(Value::as_str), Some("green_needs_review"))
                 || matches!(row.get("blocked_on").and_then(Value::as_str), Some("no_verdict" | "awaiting_review"))
+                || row.get("blocked_on").and_then(Value::as_str).is_some_and(|token| token.starts_with("approval_void:"))
         }),
         "red": count(&|row| {
             let token = row.get("blocked_on").and_then(Value::as_str).unwrap_or("");
