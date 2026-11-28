@@ -479,6 +479,20 @@ def _post_rerun(endpoint: str) -> bool:
         return False
 
 
+def _attempt_of(run: dict | None) -> int | None:
+    """``run_attempt`` when it is a positive integer, else None (unknown).
+
+    A missing, null, zero or non-integer value proves nothing about whether a
+    re-run started, so it must never read as "still the same attempt".
+    """
+    if run is None:
+        return None
+    value = run.get("run_attempt")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
 def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Stall, *, what: str,
                       sleep=None) -> int:
     """Re-run a cancelled stalled run and confirm from the API that a new attempt exists.
@@ -495,7 +509,8 @@ def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Sta
     """
     def restarted() -> bool:
         latest = _try_run(repo, run_id)
-        return latest is not None and int(latest.get("run_attempt") or 1) > attempt
+        current = _attempt_of(latest)
+        return current is not None and current > attempt
 
     def stop(reason: str) -> int:
         print(f"::error title=Release {tag} heal could not confirm a restart of run {run_id}::{reason}; "
@@ -509,7 +524,10 @@ def rerun_and_confirm(repo: str, tag: str, run_id: int, attempt: int, stall: Sta
         latest = _try_run(repo, run_id)
         if latest is None:
             return stop("the run could not be read after the re-run request, so its outcome is unknown")
-        current = int(latest.get("run_attempt") or 1)
+        current = _attempt_of(latest)
+        if current is None or current < attempt:
+            return stop(f"the run reports run_attempt {latest.get('run_attempt', '<missing>')!r} "
+                        f"after attempt {attempt}, so its outcome is unknown")
         if current > attempt:
             confirmed = True
         elif latest.get("status") != "completed":

@@ -296,7 +296,8 @@ class FakeGitHub:
                  issue: bool = True, workflow: str | None = None, history: bool = True,
                  status: str = "in_progress", conclusion: str | None = None, die_on_poll: int = 0,
                  poll_errors: int = 0, workflow_unreadable: bool = False,
-                 cancel_refusal: str | None = None, fail_reads_after_rerun: bool = False) -> None:
+                 cancel_refusal: str | None = None, fail_reads_after_rerun: bool = False,
+                 attempt_after_rerun=None) -> None:
         self.now = datetime.now(timezone.utc)
         self.step_minutes_ago = step_minutes_ago
         self.step = step
@@ -313,6 +314,9 @@ class FakeGitHub:
         self.cancel_refusal = cancel_refusal
         self.fail_reads_after_rerun = fail_reads_after_rerun
         self.rerun_requested = False
+        # What /runs/7 reports as run_attempt once a re-run was requested:
+        # None leaves it alone, MISSING drops the key, anything else replaces it.
+        self.attempt_after_rerun = attempt_after_rerun
         self.posts: list[str] = []
         self.reads: list[str] = []
         self.cancelled_at: str | None = None
@@ -362,7 +366,13 @@ class FakeGitHub:
             if self.poll_errors:
                 self.poll_errors -= 1
                 raise subprocess.CalledProcessError(1, ["gh"], stderr="Bad Gateway (HTTP 502)")
-            return json.dumps({"id": 7, "head_sha": "tagsha", **self.state})
+            body = {"id": 7, "head_sha": "tagsha", **self.state}
+            if self.rerun_requested and self.attempt_after_rerun is not None:
+                if self.attempt_after_rerun is MISSING:
+                    del body["run_attempt"]
+                else:
+                    body["run_attempt"] = None if self.attempt_after_rerun is NULL else self.attempt_after_rerun
+            return json.dumps(body)
         if "/runs/7/jobs" in url:
             step = {"name": self.step, "started_at": self.stamp(self.step_minutes_ago)}
             if self.state["status"] == "in_progress":
@@ -387,6 +397,8 @@ class FakeGitHub:
                                               "updated_at": self.stamp(age), **self.state}]})
 
 
+MISSING = object()
+NULL = object()
 RELEASE_YML = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
 
@@ -446,6 +458,22 @@ class StallMainTests(unittest.TestCase):
         self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["cancel", "rerun-failed-jobs"])
         self.assertEqual(fake.state["run_attempt"], 3)
         self.assertIn("outcome is unknown", out)
+
+    def test_fallback_needs_positive_proof_the_attempt_did_not_advance(self) -> None:
+        # Attempt 2; the first re-run request is refused, then the fresh read
+        # reports this run_attempt. Only an integer equal to 2 allows the fallback.
+        for reported in (MISSING, NULL, 0, 1, "2", 2.0, True):
+            with self.subTest(reported=reported):
+                fake = FakeGitHub(step_minutes_ago=45, attempt=2, failed_rerun_restarts=False,
+                                  attempt_after_rerun=reported, issue=False)
+                rc, out = heal_main(fake)
+                self.assertEqual(rc, 1, out)
+                self.assertEqual([p.rsplit("/", 1)[-1] for p in fake.posts], ["cancel", "rerun-failed-jobs"])
+                self.assertIn("outcome is unknown", out)
+        fake = FakeGitHub(step_minutes_ago=45, attempt=2, failed_rerun_restarts=False,
+                          attempt_after_rerun=2, issue=False)
+        rc, out = heal_main(fake)
+        self.assertIn("repos/o/r/actions/jobs/11/rerun", fake.posts)
 
     def test_an_api_error_after_the_cancel_does_not_abort_the_pass(self) -> None:
         fake = FakeGitHub(step_minutes_ago=45, poll_errors=2, issue=False)
