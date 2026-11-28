@@ -4693,13 +4693,15 @@ sibling taking the one free runner is a short label, not a stall. With
 `pr_stall_recover = "shadow"` it also reports approved pull request heads'
 required jobs (`pr_stall=`); those are report only, and `apply` there is read
 as `shadow`. Under `mq_stall_recover = "apply"` (default `off`) the steward
-cancels the head run once per run id after re-reading the entry and the job,
+cancels the head run once per run id after re-reading the entry and every job
+of the run (a sibling that started refuses it), with the intent saved first,
 at most one per repository per pass, one per pull request in six hours and
 `mq_stall_max_cancels_per_hour` (3) per hour; `shadow` reports `would_cancel`
 only. A cancel ejects the head and rebuilds every group behind it. A later
 pass proves it within an hour (the run cancelled and the entry re-enqueued or
 on a fresh merge-group run); otherwise it reports `mq_stall_unrecovered` and
-leaves that run alone. Run `shadow` for at least 48 hours and check each
+leaves that run alone. `stall_error=` (an unread detection, a failed cancel, an
+unsaved intent) is also a repository error. Run `shadow` for at least 48 hours and check each
 `would_cancel` against what happened before turning `apply` on. Do not cancel
 such a run by hand while the mode is `apply`. See `docs/automated-draining.md`
 "Jobs GitHub never gives a runner".

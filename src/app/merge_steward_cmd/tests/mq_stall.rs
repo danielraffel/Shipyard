@@ -531,20 +531,27 @@ fn a_pr_job_that_produces_no_required_check_is_not_a_stall() {
 
 struct FakeActs {
     entry: RefCell<Result<Entry, String>>,
-    job: RefCell<Option<Result<Job, String>>>,
+    /// The run's jobs on the final re-read; `None` is the stalled job alone.
+    jobs: RefCell<Option<Result<Vec<Job>, String>>>,
     cancel: Result<(), String>,
     run: RefCell<Result<RunState, String>>,
     cancels: RefCell<Vec<u64>>,
+    /// Save results, in order; empty means every save works.
+    saves: RefCell<Vec<Result<(), String>>>,
+    /// Each save: the receipt outcomes and how many cancels had run.
+    saved: RefCell<Vec<(Vec<String>, usize)>>,
 }
 
 impl FakeActs {
     fn ok(entry: Entry) -> Self {
         Self {
             entry: RefCell::new(Ok(entry)),
-            job: RefCell::new(None),
+            jobs: RefCell::new(None),
             cancel: Ok(()),
             run: RefCell::new(Ok(cancelled_run(1))),
             cancels: RefCell::default(),
+            saves: RefCell::default(),
+            saved: RefCell::default(),
         }
     }
 
@@ -583,15 +590,31 @@ impl Acts for FakeActs {
     fn reread_entry(&self, _pr: u64) -> Result<Entry, String> {
         self.entry.borrow().clone()
     }
-    fn reread_job(&self, job_id: u64) -> Result<Job, String> {
-        self.job
+    fn reread_jobs(&self, _run_id: u64) -> Result<Vec<Job>, String> {
+        self.jobs
             .borrow()
             .clone()
-            .unwrap_or_else(|| Ok(waiting_job(job_id)))
+            .unwrap_or_else(|| Ok(vec![waiting_job(JOB_825)]))
     }
     fn cancel(&self, run: &StewardRun) -> Result<(), String> {
         self.cancels.borrow_mut().push(run.id);
         self.cancel.clone()
+    }
+    fn persist(&self, ledger: &StewardLedger) -> Result<(), String> {
+        self.saved.borrow_mut().push((
+            ledger
+                .mq_stall_cancels
+                .values()
+                .map(|receipt| receipt.outcome.clone())
+                .collect(),
+            self.cancels.borrow().len(),
+        ));
+        let mut saves = self.saves.borrow_mut();
+        if saves.is_empty() {
+            Ok(())
+        } else {
+            saves.remove(0)
+        }
     }
     fn read_run(&self, _run_id: u64) -> Result<RunState, String> {
         self.run.borrow().clone()
@@ -748,7 +771,7 @@ fn a_moved_entry_or_a_job_that_got_a_runner_refuses_the_cancel() {
     let served = FakeActs::head_825();
     let mut job = waiting_job(JOB_825);
     job.runner_id = Some(35_831);
-    *served.job.borrow_mut() = Some(Ok(job));
+    *served.jobs.borrow_mut() = Some(Ok(vec![job]));
     assert_eq!(
         act(
             &detection,
@@ -1308,5 +1331,233 @@ fn the_policy_reads_from_the_base_config_on_a_merge_queue_base_only() {
     assert_eq!(
         EjectionGuards::for_base(true).mq_stall.mode,
         MqStallMode::Off
+    );
+}
+
+#[test]
+fn the_intent_is_saved_before_the_cancel_and_the_outcome_after() {
+    let (shape, observation, detection) = stalled_825();
+    let acts = FakeActs::head_825();
+    let mut ledger = StewardLedger::default();
+    let actions = act(
+        &detection,
+        &policy(MqStallMode::Apply, MqStallMode::Off),
+        true,
+        &observation,
+        &mut ledger,
+        &acts,
+        shape.now,
+    );
+    assert_eq!(actions[0].outcome, "cancelled");
+    assert_eq!(
+        *acts.saved.borrow(),
+        vec![
+            (vec![mq_stall::INTENT.to_owned()], 0),
+            (vec!["cancelled".to_owned()], 1),
+        ]
+    );
+}
+
+#[test]
+fn an_intent_that_cannot_be_saved_refuses_the_cancel_and_is_an_error() {
+    let (shape, observation, detection) = stalled_825();
+    let acts = FakeActs::head_825();
+    acts.saves.borrow_mut().push(Err("disk full".to_owned()));
+    let mut ledger = StewardLedger::default();
+    let apply = policy(MqStallMode::Apply, MqStallMode::Off);
+    let actions = act(
+        &detection,
+        &apply,
+        true,
+        &observation,
+        &mut ledger,
+        &acts,
+        shape.now,
+    );
+    assert_eq!(actions[0].outcome, "intent_not_saved", "{actions:?}");
+    assert!(acts.cancels.borrow().is_empty());
+    assert!(ledger.mq_stall_cancels.is_empty());
+    let status = mq_stall::status(
+        &apply,
+        detection,
+        actions,
+        Vec::new(),
+        Vec::new(),
+        &ledger,
+        REPO,
+    );
+    assert_eq!(
+        status.summary.errors,
+        vec!["intent_not_saved:#825:run:46104476461"]
+    );
+    assert_eq!(status.errors().len(), 1);
+}
+
+/// A pass that saved its intent and died: the next pass reads the attempt
+/// as `cancel_unknown`, and it counts against the per-PR limit.
+#[test]
+fn an_intent_with_no_outcome_is_cancel_unknown_and_counts() {
+    let (shape, observation, detection) = stalled_825();
+    let acts = FakeActs::head_825();
+    let mut ledger = StewardLedger::default();
+    prior_receipt(
+        &mut ledger,
+        825,
+        RUN_825 - 5,
+        shape.now - chrono::Duration::minutes(10),
+    );
+    if let Some(receipt) = ledger
+        .mq_stall_cancels
+        .get_mut(&mq_stall::receipt_key(REPO, RUN_825 - 5))
+    {
+        receipt.outcome = mq_stall::INTENT.to_owned();
+    }
+    let (_, lines) = mq_stall::progress(&acts, &observation, &[], &mut ledger, shape.now);
+    assert!(
+        lines.iter().any(|line| line.contains("cancel_unknown")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        receipt(&ledger, RUN_825 - 5).outcome,
+        mq_stall::CANCEL_UNKNOWN
+    );
+    let actions = act(
+        &detection,
+        &policy(MqStallMode::Apply, MqStallMode::Off),
+        true,
+        &observation,
+        &mut ledger,
+        &acts,
+        shape.now,
+    );
+    assert_eq!(actions[0].outcome, "refused", "{actions:?}");
+    assert!(acts.cancels.borrow().is_empty());
+}
+
+#[test]
+fn a_sibling_that_started_since_detection_refuses_the_cancel() {
+    let (shape, observation, detection) = stalled_825();
+    let acts = FakeActs::head_825();
+    let mut sibling = waiting_job(JOB_825 + 1);
+    sibling.status = "in_progress".to_owned();
+    sibling.runner_id = Some(35_831);
+    *acts.jobs.borrow_mut() = Some(Ok(vec![waiting_job(JOB_825), sibling]));
+    let mut ledger = StewardLedger::default();
+    let actions = act(
+        &detection,
+        &policy(MqStallMode::Apply, MqStallMode::Off),
+        true,
+        &observation,
+        &mut ledger,
+        &acts,
+        shape.now,
+    );
+    assert_eq!(actions[0].outcome, "refused", "{actions:?}");
+    assert!(
+        actions[0]
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("started"),
+        "{actions:?}"
+    );
+    assert!(acts.cancels.borrow().is_empty() && ledger.mq_stall_cancels.is_empty());
+}
+
+#[test]
+fn malformed_runner_fields_or_labels_are_unreadable_not_no_runner() {
+    let row = |patch: Value| {
+        let mut row = serde_json::json!({
+            "id": JOB_825, "run_id": RUN_825, "name": "gpu-macos-arm64", "status": "queued",
+            "created_at": "2026-11-28T03:46:57Z", "started_at": "2026-11-28T03:46:57Z",
+            "runner_id": 0, "runner_name": "", "labels": ["self-hosted", "macOS"],
+        });
+        if let (Some(row), Some(patch)) = (row.as_object_mut(), patch.as_object()) {
+            for (key, value) in patch {
+                row.insert(key.clone(), value.clone());
+            }
+        }
+        row
+    };
+    assert!(
+        mq_stall::parse_job(&row(serde_json::json!({})))
+            .expect("clean")
+            .waiting()
+    );
+    assert!(
+        mq_stall::parse_job(&row(
+            serde_json::json!({"runner_id": null, "runner_name": null})
+        ))
+        .is_ok()
+    );
+    for bad in [
+        serde_json::json!({"runner_id": "35831"}),
+        serde_json::json!({"runner_id": -1}),
+        serde_json::json!({"runner_name": 7}),
+        serde_json::json!({"labels": ["self-hosted", 1]}),
+        serde_json::json!({"labels": "self-hosted"}),
+    ] {
+        assert!(mq_stall::parse_job(&row(bad.clone())).is_err(), "{bad}");
+    }
+    // In a pass, the malformed stalled job decides nothing.
+    let mut shape = Shape::load("mq_stall_vellum_825.json");
+    shape.job_mut(JOB_825)["runner_id"] = "35831".into();
+    let detection = detect(&shape, &queue_825(&shape), shape.now);
+    assert!(
+        detection.stalls.is_empty() && detection.unread.is_some(),
+        "{detection:?}"
+    );
+}
+
+#[test]
+fn an_unread_detection_or_a_failed_cancel_is_a_repository_error() {
+    let (shape, observation, mut detection) = stalled_825();
+    let apply = policy(MqStallMode::Apply, MqStallMode::Off);
+    let mut acts = FakeActs::head_825();
+    acts.cancel = Err("HTTP 500".to_owned());
+    let mut ledger = StewardLedger::default();
+    let actions = act(
+        &detection,
+        &apply,
+        true,
+        &observation,
+        &mut ledger,
+        &acts,
+        shape.now,
+    );
+    assert_eq!(actions[0].outcome, "cancel_failed");
+    let status = mq_stall::status(
+        &apply,
+        detection.clone(),
+        actions,
+        Vec::new(),
+        Vec::new(),
+        &ledger,
+        REPO,
+    );
+    assert_eq!(
+        status.summary.errors,
+        vec!["cancel_failed:#825:run:46104476461"]
+    );
+    assert!(
+        status.errors()[0].contains("cancel_failed"),
+        "{:?}",
+        status.errors()
+    );
+    detection.unread = Some("run 1 jobs: HTTP 502".to_owned());
+    let unread = mq_stall::status(
+        &apply,
+        detection,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &ledger,
+        REPO,
+    );
+    assert_eq!(unread.summary.errors, vec!["unread"]);
+    assert!(
+        unread.errors()[0].contains("HTTP 502"),
+        "{:?}",
+        unread.errors()
     );
 }

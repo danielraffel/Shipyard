@@ -384,6 +384,7 @@ class StewardTickArchiveTests(unittest.TestCase):
             "act": ["cancelled:#825:run:46104476461", "deferred:#842:run:46111057074"],
             "mq_stall_unrecovered": [],
             "pr_stall_unrecovered": ["#833:run:46118730933"],
+            "errors": ["unread", "cancel_failed:#825:run:46104476461"],
         }}})
         self.run_tick()
         line = self.summary_line()
@@ -392,16 +393,17 @@ class StewardTickArchiveTests(unittest.TestCase):
         self.assertIn(" stall_act=cancelled:#825:run:46104476461,deferred:#842:run:46111057074", line)
         self.assertIn(" pr_stall_unrecovered=#833:run:46118730933", line)
         self.assertNotIn("mq_stall_unrecovered=", line)
+        self.assertIn(" stall_error=unread,cancel_failed:#825:run:46104476461", line)
 
     def test_no_stall_fields_from_an_older_binary_or_a_quiet_pass(self):
         self.steward_prints([], rc=0)
         self.run_tick()
-        for field in (" mq_stall=", " pr_stall=", " stall_act=", "_unrecovered="):
+        for field in (" mq_stall=", " pr_stall=", " stall_act=", "_unrecovered=", " stall_error="):
             self.assertNotIn(field, self.summary_line())
         self.steward_prints_repo({"mq_stall": {"summary": {
             "mq_stall": [], "pr_stall": [], "act": [], "mq_stall_unrecovered": [], "pr_stall_unrecovered": []}}})
         self.run_tick()
-        for field in (" mq_stall=", " pr_stall=", " stall_act=", "_unrecovered="):
+        for field in (" mq_stall=", " pr_stall=", " stall_act=", "_unrecovered=", " stall_error="):
             self.assertNotIn(field, self.summary_line())
 
     def test_clean_pass_reports_zero_for_both(self):

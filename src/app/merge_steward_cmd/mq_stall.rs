@@ -82,6 +82,11 @@ use crate::merge_steward::mq_stall::{MqStallMode, MqStallPolicy};
 pub(super) const MAX_TARGET_READS: usize = 15;
 /// The most job reads one pass spends looking for witnesses.
 pub(super) const MAX_WITNESS_READS: usize = 10;
+/// A receipt's outcome while its cancel is in flight; saved before the cancel.
+pub(super) const INTENT: &str = "pending";
+/// What a later pass reads an intent with no outcome as: the cancel may or
+/// may not have landed. It counts against every limit like any attempt.
+pub(super) const CANCEL_UNKNOWN: &str = "cancel_unknown";
 /// A witness must be created at least this long after the stalled job, so a
 /// batch sibling taking the one free runner never counts.
 pub(super) const WITNESS_MARGIN_SECS: i64 = 300;
@@ -182,8 +187,38 @@ fn time(value: Option<&Value>) -> Option<DateTime<Utc>> {
 }
 
 /// One job row.
+/// A field that is absent or `null`, or of its type; any other type makes the
+/// whole row unreadable, never a default.
+fn optional<'a, T>(
+    row: &'a Value,
+    key: &str,
+    read: impl Fn(&'a Value) -> Option<T>,
+) -> Result<Option<T>, String> {
+    match row.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => read(value)
+            .map(Some)
+            .ok_or_else(|| format!("a workflow job's `{key}` has the wrong type")),
+    }
+}
+
+/// One job row. A malformed runner field or label is unreadable: it must
+/// never read as "no runner" or narrow the labels.
 pub(super) fn parse_job(row: &Value) -> Result<Job, String> {
     let text = |key: &str| row.get(key).and_then(Value::as_str).map(str::to_owned);
+    let labels = match row.get("labels") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(labels)) => labels
+            .iter()
+            .map(|label| {
+                label
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "a workflow job has a label that is not a string".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err("a workflow job's `labels` is not a list".to_owned()),
+    };
     Ok(Job {
         id: row
             .get("id")
@@ -195,16 +230,11 @@ pub(super) fn parse_job(row: &Value) -> Result<Job, String> {
         status: text("status").ok_or_else(|| "a workflow job had no status".to_owned())?,
         created_at: time(row.get("created_at")),
         started_at: time(row.get("started_at")),
-        runner_id: row.get("runner_id").and_then(Value::as_u64),
-        runner_name: text("runner_name"),
-        labels: row
-            .get("labels")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_owned)
-            .collect(),
+        runner_id: optional(row, "runner_id", Value::as_u64)?,
+        runner_name: optional(row, "runner_name", |value| {
+            value.as_str().map(str::to_owned)
+        })?,
+        labels,
     })
 }
 
@@ -737,10 +767,12 @@ pub(super) struct RunState {
 pub(super) trait Acts {
     /// Re-read the pull request and its queue entry.
     fn reread_entry(&self, pr: u64) -> Result<Entry, String>;
-    /// Re-read one job.
-    fn reread_job(&self, job_id: u64) -> Result<Job, String>;
+    /// Re-read every job of the run's latest attempt, proved complete.
+    fn reread_jobs(&self, run_id: u64) -> Result<Vec<Job>, String>;
     /// Cancel the run under the run mutation guard; `Ok` once GitHub accepted.
     fn cancel(&self, run: &StewardRun) -> Result<(), String>;
+    /// Save the steward ledger now.
+    fn persist(&self, ledger: &StewardLedger) -> Result<(), String>;
     /// Read one run.
     fn read_run(&self, run_id: u64) -> Result<RunState, String>;
 }
@@ -794,10 +826,26 @@ fn still_stalled(stall: &Stall, acts: &dyn Acts) -> Result<(), String> {
             }
         }
     }
-    let job = acts
-        .reread_job(stall.job_id)
+    // Every job of the run, as detection judged them: a sibling that started
+    // since would be cancelled with the run.
+    let jobs = acts
+        .reread_jobs(stall.run_id)
         .map_err(|error| format!("job re-read failed: {error}"))?;
-    if job.id != stall.job_id || !job.waiting() {
+    if let Some(started) = jobs.iter().find(|job| {
+        job.id != stall.job_id
+            && !job.status.eq_ignore_ascii_case("completed")
+            && (job.status.eq_ignore_ascii_case("in_progress") || job.has_runner())
+    }) {
+        return Err(format!(
+            "job {} of the run started ({}) since detection",
+            started.id, started.status
+        ));
+    }
+    let job = jobs
+        .into_iter()
+        .find(|job| job.id == stall.job_id)
+        .ok_or_else(|| format!("job {} is no longer in the run", stall.job_id))?;
+    if !job.waiting() {
         return Err(format!(
             "job {} is now {} {}",
             stall.job_id,
@@ -921,12 +969,10 @@ pub(super) fn act(
             continue;
         }
         cancelled_this_pass = true;
-        let (outcome, result) = match acts.cancel(run) {
-            Ok(()) => ("cancelled".to_owned(), "cancelled"),
-            Err(error) => (format!("failed: {error}"), "cancel_failed"),
-        };
+        // The intent is durable before the cancel: a crash or a failed save
+        // after it can never lose the attempt from the limits or the proof.
         ledger.mq_stall_cancels.insert(
-            key,
+            key.clone(),
             Receipt {
                 repo: observation.repo.clone(),
                 kind: stall.kind,
@@ -935,12 +981,33 @@ pub(super) fn act(
                 job_id: stall.job_id,
                 head_sha: stall.head_sha.clone(),
                 at: now.to_rfc3339(),
-                outcome: outcome.clone(),
+                outcome: INTENT.to_owned(),
                 progress: None,
                 proved_at: None,
             },
         );
-        record(result, Some(format!("{}; {outcome}", stall.token())));
+        if let Err(error) = acts.persist(ledger) {
+            ledger.mq_stall_cancels.remove(&key);
+            record(
+                "intent_not_saved",
+                Some(format!("{}; not cancelled: {error}", stall.token())),
+            );
+            continue;
+        }
+        let (outcome, result) = match acts.cancel(run) {
+            Ok(()) => ("cancelled".to_owned(), "cancelled"),
+            Err(error) => (format!("failed: {error}"), "cancel_failed"),
+        };
+        if let Some(receipt) = ledger.mq_stall_cancels.get_mut(&key) {
+            receipt.outcome.clone_from(&outcome);
+        }
+        let saved = acts
+            .persist(ledger)
+            .err()
+            .map_or_else(String::new, |error| {
+                format!("; outcome not saved ({error}), the next pass reads {CANCEL_UNKNOWN}")
+            });
+        record(result, Some(format!("{}; {outcome}{saved}", stall.token())));
     }
     actions
 }
@@ -1051,6 +1118,14 @@ pub(super) fn progress(
         if !key.starts_with(&prefix) || receipt.progress.is_some() {
             continue;
         }
+        // An earlier pass saved the intent and never its outcome.
+        if receipt.outcome == INTENT {
+            CANCEL_UNKNOWN.clone_into(&mut receipt.outcome);
+            lines.push(format!(
+                "{}: the cancel's outcome was never saved; read as {CANCEL_UNKNOWN}",
+                receipt.token()
+            ));
+        }
         let Some(at) = receipt.at() else {
             receipt.progress = Some("unrecovered: receipt time unreadable".to_owned());
             receipt.proved_at = Some(now.to_rfc3339());
@@ -1103,7 +1178,14 @@ pub(super) struct Summary {
     pub(super) mq_stall_unrecovered: Vec<String>,
     /// Pull request receipts that are unrecovered.
     pub(super) pr_stall_unrecovered: Vec<String>,
+    /// What failed: `unread` when detection could not read, and
+    /// `<outcome>:#<pr>:run:<id>` for a cancel that failed or was refused for
+    /// an unsaved intent.
+    pub(super) errors: Vec<String>,
 }
+
+/// Outcomes that are failures of the recovery itself.
+const FAILED_OUTCOMES: [&str; 2] = ["cancel_failed", "intent_not_saved"];
 
 /// The repository report.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1149,10 +1231,14 @@ pub(super) fn status(
         }
     }
     for action in &actions {
-        summary.act.push(format!(
-            "{}:#{}:run:{}",
-            action.outcome, action.pr, action.run_id
-        ));
+        let token = format!("{}:#{}:run:{}", action.outcome, action.pr, action.run_id);
+        if FAILED_OUTCOMES.contains(&action.outcome.as_str()) {
+            summary.errors.push(token.clone());
+        }
+        summary.act.push(token);
+    }
+    if detection.unread.is_some() {
+        summary.errors.push("unread".to_owned());
     }
     for (kind, token) in unrecovered {
         let list = match kind {
@@ -1176,6 +1262,31 @@ pub(super) fn status(
     }
 }
 
+impl RepoStatus {
+    /// The repository errors this step adds to the pass: a detection that
+    /// could not read, and a cancel that failed or never saved its intent.
+    pub(super) fn errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(unread) = &self.detection.unread {
+            errors.push(format!(
+                "mq_stall: detection unread, nothing decided: {unread}"
+            ));
+        }
+        for action in &self.actions {
+            if FAILED_OUTCOMES.contains(&action.outcome.as_str()) {
+                errors.push(format!(
+                    "mq_stall: {} #{} run {}: {}",
+                    action.outcome,
+                    action.pr,
+                    action.run_id,
+                    action.detail.as_deref().unwrap_or_default()
+                ));
+            }
+        }
+        errors
+    }
+}
+
 /// No acts: a pass without mutation control decides, never acts.
 pub(super) struct NoActs;
 
@@ -1183,10 +1294,13 @@ impl Acts for NoActs {
     fn reread_entry(&self, _pr: u64) -> Result<Entry, String> {
         Err("no mutation control".to_owned())
     }
-    fn reread_job(&self, _job_id: u64) -> Result<Job, String> {
+    fn reread_jobs(&self, _run_id: u64) -> Result<Vec<Job>, String> {
         Err("no mutation control".to_owned())
     }
     fn cancel(&self, _run: &StewardRun) -> Result<(), String> {
+        Err("no mutation control".to_owned())
+    }
+    fn persist(&self, _ledger: &StewardLedger) -> Result<(), String> {
         Err("no mutation control".to_owned())
     }
     fn read_run(&self, _run_id: u64) -> Result<RunState, String> {
@@ -1199,6 +1313,8 @@ pub(super) struct GitHubActs<'a> {
     pub(super) actions: &'a crate::cloud::GitHubActions,
     pub(super) control: Option<&'a MutationControl>,
     pub(super) observation: &'a RepoObservation,
+    /// Where the steward ledger is saved.
+    pub(super) ledger_path: &'a std::path::Path,
 }
 
 impl GitHubActs<'_> {
@@ -1279,11 +1395,17 @@ impl Acts for GitHubActs<'_> {
         })
     }
 
-    fn reread_job(&self, job_id: u64) -> Result<Job, String> {
-        parse_job(&self.api(&format!(
-            "repos/{}/actions/jobs/{job_id}",
-            self.observation.repo
-        ))?)
+    fn persist(&self, ledger: &StewardLedger) -> Result<(), String> {
+        super::ledger::save_ledger(self.ledger_path, ledger)
+            .map_err(|error| error.message().to_owned())
+    }
+
+    fn reread_jobs(&self, run_id: u64) -> Result<Vec<Job>, String> {
+        read_jobs(
+            &|argv: &[String]| self.actions.run_gh(argv).map_err(|error| error.to_string()),
+            &self.observation.repo,
+            run_id,
+        )
     }
 
     fn cancel(&self, run: &StewardRun) -> Result<(), String> {

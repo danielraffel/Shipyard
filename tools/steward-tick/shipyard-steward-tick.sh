@@ -225,7 +225,8 @@ steward_one() {
     # Jobs GitHub never gave a runner (`mq_stall`): the queue head's
     # merge-group job (mq_stall=), approved PR heads' required jobs
     # (pr_stall=), what the recovery did (stall_act=) and cancels whose
-    # progress read failed (mq_stall_unrecovered=, pr_stall_unrecovered=).
+    # progress read failed (mq_stall_unrecovered=, pr_stall_unrecovered=),
+    # and recovery failures (stall_error=: unread, cancel_failed:...).
     # Each is printed only when non-empty; an older binary prints none.
     stall_field() {
       jq -r --arg key "$1" '[.repos[]?.mq_stall?.summary?[$key][]? | tostring | gsub("[[:space:];=]+";"_")] | join(",")' "$out" 2>/dev/null || true
@@ -235,10 +236,11 @@ steward_one() {
     stall_act=$(stall_field act)
     mq_stall_unrecovered=$(stall_field mq_stall_unrecovered)
     pr_stall_unrecovered=$(stall_field pr_stall_unrecovered)
+    stall_error=$(stall_field errors)
     # Heads merged over advisory checks that were red or pending (GitHub
     # UNSTABLE, [auto_merge] unstable_advisory_checks): logged, never a gate.
     advisory_not_green=$(jq -r '[.repos[]?.prs[]? | . as $pr | (.mutation // "" | tostring | split(",")[] | select(startswith("advisory_not_green:")) | "#\($pr.number):" + (ltrimstr("advisory_not_green:") | gsub("[[:space:][:cntrl:];=]+";"_")))] | join(",")' "$out" 2>/dev/null || true)
-    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver launcher=$launcher_path invariants=$invariants red_everywhere=$red_everywhere recovery_store=$recovery_store${oldest:+ oldest=$oldest}${mq_stall:+ mq_stall=$mq_stall}${pr_stall:+ pr_stall=$pr_stall}${stall_act:+ stall_act=$stall_act}${mq_stall_unrecovered:+ mq_stall_unrecovered=$mq_stall_unrecovered}${pr_stall_unrecovered:+ pr_stall_unrecovered=$pr_stall_unrecovered}${advisory_not_green:+ advisory_not_green=$advisory_not_green}" >> "$log_dir/summary.log"
+    echo "$stamp $repo rc=$rc $counts took=${took}s ver=$steward_ver launcher=$launcher_path invariants=$invariants red_everywhere=$red_everywhere recovery_store=$recovery_store${oldest:+ oldest=$oldest}${mq_stall:+ mq_stall=$mq_stall}${pr_stall:+ pr_stall=$pr_stall}${stall_act:+ stall_act=$stall_act}${mq_stall_unrecovered:+ mq_stall_unrecovered=$mq_stall_unrecovered}${pr_stall_unrecovered:+ pr_stall_unrecovered=$pr_stall_unrecovered}${stall_error:+ stall_error=$stall_error}${advisory_not_green:+ advisory_not_green=$advisory_not_green}" >> "$log_dir/summary.log"
   elif grep -q "another steward apply pass is already running" "$out.err" 2>/dev/null; then
     echo "$stamp $repo skipped=lock_busy" >> "$log_dir/summary.log"
   else

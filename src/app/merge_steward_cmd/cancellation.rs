@@ -686,6 +686,7 @@ pub(super) fn apply_repo_plan(
             actions,
             control: mutation_control,
             observation,
+            ledger_path,
         };
         let now = Utc::now();
         let applying = args.apply && mutation_control.is_some();
@@ -727,7 +728,9 @@ pub(super) fn apply_repo_plan(
             &observation.repo,
         )
     };
+    let mq_stall_errors = mq_stall_status.errors();
     let mut unhealthy = (args.preempt_capacity && observation.preemption_error.is_some())
+        || !mq_stall_errors.is_empty()
         || native_arm_failed
         || infra_rerun_failed
         || pr_mutation_failed
@@ -879,6 +882,7 @@ pub(super) fn apply_repo_plan(
                 .chain(wedge_reconcile_error)
                 .chain(wedge_observation_error)
                 .chain(superseded_rate_limit)
+                .chain(mq_stall_errors)
                 .collect(),
         },
         unhealthy,

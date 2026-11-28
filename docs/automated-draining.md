@@ -921,12 +921,16 @@ all of the stalled job's, that started on a runner. Witnesses come from the
 pass's run census and one listing of the stalled workflow's runs since the
 stalled job, so a witness run that already completed counts; at most 10 job
 reads, and the scan stops once every stall has one. Jobs are read once per
-pass. A failed or partial read decides nothing (`detection.unread`).
+pass. A failed or partial read, or a job whose runner fields or labels have
+the wrong type, decides nothing (`detection.unread`).
 
 The tick's summary line names each stall as
 `mq_stall=#<pr>:run:<id>:job:<id>:<age>m` (queue head) or `pr_stall=...`
 (pull request), what the recovery did as `stall_act=<outcome>:#<pr>:run:<id>`,
-and failed recoveries as `mq_stall_unrecovered=#<pr>:run:<id>`. Each field is
+failed recoveries as `mq_stall_unrecovered=#<pr>:run:<id>`, and failures of
+the step itself as `stall_error=` (`unread`, `cancel_failed:#<pr>:run:<id>`,
+`intent_not_saved:...`); those also go to the repository's `errors` and make
+the pass unhealthy. Each field is
 printed only when it has a value. The repository report's `mq_stall` section
 carries the detection, the actions and the progress lines.
 
@@ -946,12 +950,17 @@ does not apply, reports `would_cancel` and changes nothing.
 Under `mq_stall_recover = "apply"` the steward cancels the stalled head run,
 once per run id, under the run mutation guard, after a fresh read shows the
 entry is still the head on the same group and the job is still queued with no
-runner. It never cancels a run whose job has a runner, a non-head queue entry,
+runner, and every other job of the run is unstarted or done (all of the
+run's jobs are read again; a sibling that started since detection refuses
+the cancel). It never cancels a run whose job has a runner, a non-head queue entry,
 a pull request stall, a pull request carrying the opt-out label, or anything
 after an incomplete read. At most one cancel per repository per pass, one per
 pull request in six hours (a re-enqueued head gets a new run id), and
 `mq_stall_max_cancels_per_hour` per repository per hour. Each attempt is a
-receipt in the steward ledger (`mq_stall_cancels`).
+receipt in the steward ledger (`mq_stall_cancels`), saved as an intent
+before the cancel: when the save fails nothing is cancelled
+(`intent_not_saved`), and an intent a later pass finds with no outcome reads
+`cancel_unknown` and counts against every limit.
 
 A head cancel is not free. The cancelled required check ejects the entry,
 every group behind it is rebuilt (after the 04:56 hand cancel #769's finished
@@ -1007,7 +1016,7 @@ red_everywhere = "shadow"   # off | shadow (default) | enforce
 | row `next_action.action`, base tip unreadable | The cautious text: "Failing on N PRs with the same test: ... Likely a base-level cause; do not repair this PR, wait for the base fix or merge main once main is green. Base health could not be read, so this is the cautious reading." |
 | `summary.log` | `red_everywhere=<episodes>` on each repository line |
 | `summary.log` | `recovery_store=<active>/<limit>` on each repository line: the recovery store's fill after the pass retired requests for pull requests that closed, merged or moved head (or aged past 7 days). `!FULL` means it cannot take another request; `ERROR` means the prune failed; `off` means recovery publication is disabled |
-| `summary.log` | `mq_stall=`, `pr_stall=`, `stall_act=` and `mq_stall_unrecovered=` on a repository line only when set: jobs GitHub never gave a runner and what the recovery did. See [Jobs GitHub never gives a runner](#jobs-github-never-gives-a-runner) |
+| `summary.log` | `mq_stall=`, `pr_stall=`, `stall_act=`, `mq_stall_unrecovered=` and `stall_error=` on a repository line only when set: jobs GitHub never gave a runner and what the recovery did. See [Jobs GitHub never gives a runner](#jobs-github-never-gives-a-runner) |
 | enqueue (enforce only) | a member whose head has not changed since the episode began is not enqueued: `held_red_everywhere:<check>`. Nothing is dequeued or closed |
 
 A member that pushes a new head leaves the episode; the episode ends (and is
